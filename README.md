@@ -1,108 +1,221 @@
-# Google Sheets -> Transform -> QBO Pipeline
+# QBO Automation Bot 🤖💸
 
-This project runs a repeatable accounting pipeline:
+A robust **ETL (Extract, Transform, Load)** pipeline designed to automate accounting workflows for **cryptocurrency transactions**.
 
-1. Read **raw** data from Google Sheets (monthly tab).
-2. Transform in Python (Pandas) into 3 outputs:
-   - Journals
-   - Expenses
-   - Withdraw
-3. Write outputs back to Sheets.
-4. Push transformed records into QuickBooks Online (QBO).
-5. Run reconciliation checks on a schedule (e.g., every 5 minutes).
+This system fetches transaction data from **Cregis**, transforms and cleans it in **Google Sheets**, synchronizes it with **QuickBooks Online (QBO)**, and performs automated **Reconciliation** to ensure financial accuracy.
 
-## Folder Structure
+---
 
+## 🚀 Features
+
+### 🔹 Ingestion (ETL)
+- Fetches raw crypto transaction data from the **Cregis API**
+- Cleans, filters, and formats data (e.g. Unix timestamp conversion)
+- Uploads processed data to structured **Google Sheets**
+
+### 🔹 Transformation
+- Auto-categorizes transactions into:
+  - Journal Entries
+  - Expenses
+  - Transfers
+- Assigns **QBO Account IDs** automatically based on wallet mappings
+
+### 🔹 Syncing
+- Pushes validated data into **QuickBooks Online** via the Accounting API
+- Prevents duplicate records
+- Handles API rate limits safely
+
+### 🔹 Reconciliation
+- Compares **Google Sheets (source)** with **QBO (target)**
+- Detects mismatches in:
+  - Amount
+  - Date
+  - Memo
+  - Account
+- Updates the **Control Sheet** with pass/fail statuses
+
+### 🔹 Webhook Server
+- Flask-based server
+- Listens for external triggers to run the pipeline automatically
+
+---
+
+## 📂 Project Structure
+
+```text
+.
+├── config/
+│   ├── secrets.env         # API keys & secrets (NOT COMMITTED)
+│   ├── cregis_oa.json      # Google OAuth credentials
+│   └── token.json          # Google Sheets access token
+├── src/
+│   ├── connectors/         # API integration clients
+│   │   ├── gsheets_client.py
+│   │   └── qbo_client.py
+│   ├── logic/              # Core business logic
+│   │   ├── transformer.py  # Data cleaning & categorization
+│   │   ├── syncing.py      # QBO mapping & upload logic
+│   │   └── reconciler.py   # Comparison & verification logic
+│   └── utils/
+│       └── logger.py       # Logging configuration
+├── run_ingestion.py        # Cregis → Google Sheets
+├── run_syncing.py          # Google Sheets → QBO
+├── run_reconciliation.py   # Verify data accuracy
+├── server.py               # Flask webhook listener
+└── README.md
 ```
-config/
-  settings.py
-  secrets.env              # NOT committed
-  service_account.json     # optional
-  oauth_client_secret.json # optional
-  token.json               # optional
-logs/
-src/
-  connectors/
-    gsheets_client.py
-    qbo_client.py
-  logic/
-    transformer.py
-    reconciler.py
-  utils/
-    logger.py
-run_ingestion.py
-run_reconciliation.py
-```
 
-## Control Sheet (for users)
+---
 
-In your **Control** tab, users only fill these columns:
+## 🛠️ Setup & Installation
 
-- `Country`
-- `Spreadsheet_URL` (or spreadsheetId)
-- `Tab Name` (monthly raw tab name, e.g. `2025-10`)
-- `Month` (optional, for tracking)
-- `Active` = TRUE/FALSE
+### 1️⃣ Prerequisites
+- Python 3.8+
+- Google Cloud Project with Google Sheets API enabled
+- QuickBooks Online Developer Account
+- Git
 
-The pipeline automatically updates:
+### 2️⃣ Install Dependencies
 
-- `Last Run At`
-- `Last Processed Row` (based on `No.` column in raw data)
-
-### Monthly deployment (new month tab)
-Create a new row in Control sheet with:
-- same `Spreadsheet_URL`
-- new `Tab Name` (new month)
-- set `Last Processed Row` = 0
-- `Active` = TRUE
-
-No code change needed.
-
-## Setup
-
-### 1) Create venv & install
 ```bash
-python -m venv .venv
-source .venv/bin/activate   # (Windows: .venv\Scripts\activate)
-pip install -r requirements.txt
+pip install pandas flask requests python-dotenv \
+google-api-python-client google-auth-httplib2 \
+google-auth-oauthlib gspread pip-system-certs
 ```
 
-### 2) Configure secrets
-Copy `config/secrets.env` template and fill values.
+> **Note:** `pip-system-certs` fixes SSL certificate issues commonly found on corporate Windows networks.
 
-### 3) Google Sheets auth
-Recommended: OAuth (work account)
+### 3️⃣ Environment Configuration
 
-- Put your OAuth client secret JSON at: `config/oauth_client_secret.json`
-- First run will open a browser login (or you can generate token.json on your laptop and copy it to server).
-- Token is saved at `config/token.json`
+Create the following file:
 
-Alternative: service account
-- Put service account json at `config/service_account.json`
-- Share the spreadsheet with that service account email
+```
+config/secrets.env
+```
 
-### 4) Run ingestion
+⚠️ **Do NOT commit this file to GitHub**
+
+```env
+# --- Google Sheets Configuration ---
+GSHEET_URL=https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID
+CONTROL_SHEET_ID=YOUR_CONTROL_SHEET_ID
+CONTROL_TAB_NAME=Control Panel
+START_DATE=2025-01-01
+
+# --- Cregis API Projects ---
+PROJ1_NAME="Project Alpha"
+PROJ1_ID=123456789
+PROJ1_SECRET=abcdef123456
+
+PROJ2_NAME="Project Beta"
+PROJ2_ID=987654321
+PROJ2_SECRET=654321fedcba
+
+# --- QuickBooks Online (OAuth2) ---
+QBO_CLIENT_ID=...
+QBO_CLIENT_SECRET=...
+QBO_REALM_ID=...
+QBO_REFRESH_TOKEN=...
+QBO_ENV=sandbox   # Change to 'production' for live data
+
+# --- Webhook Security ---
+SECRET_TOKEN=your_secure_password_123
+```
+
+---
+
+## 🏃‍♂️ Usage
+
+### 🔹 Option A: Manual Execution
+
+#### Step 1: Fetch & Transform Data
+Fetches data from Cregis and populates Google Sheets.
+
 ```bash
 python run_ingestion.py
 ```
 
-### 5) Run reconciliation
+#### Step 2: Sync to QuickBooks
+Reads Google Sheets and pushes transactions into QBO.
+
+```bash
+python run_syncing.py
+```
+
+#### Step 3: Reconciliation
+Verifies that QBO data matches Google Sheets.
+
 ```bash
 python run_reconciliation.py
 ```
 
-## Scheduling (every 5 minutes)
+### 🔹 Option B: Background Server (Webhook)
 
-Use **cron** or **systemd timer**:
+#### Start the Webhook Server
 
-Cron example:
 ```bash
-*/5 * * * * /path/to/.venv/bin/python /path/to/run_reconciliation.py >> /path/to/logs/cron.log 2>&1
+python server.py
 ```
 
-## Where to plug your existing notebook logic
-- Copy your cleaning/splitting logic from `Accounting_Clean.ipynb` into:
-  - `src/logic/transformer.py :: transform_raw()`
-- Copy your QBO payload mapping/push logic (from `API_QBO_flow.ipynb`) into:
-  - a new module (recommended) `src/logic/qbo_mapper.py`
-  - call `qbo.create_journal_entry(...)` / `qbo.create_purchase(...)` / `qbo.create_deposit(...)` in `run_ingestion.py`
+#### Trigger Endpoint
+
+- **URL:** `http://localhost:5000/webhook`
+- **Method:** `POST`
+- **Headers:**
+  ```
+  X-My-Secret-Token: <your_secure_password_123>
+  ```
+- **Body (JSON):**
+  ```json
+  {
+    "event": "pipeline_trigger",
+    "country": "TH"
+  }
+  ```
+
+#### Supported Events
+- `pipeline_trigger` — Run ingestion
+- `sync_trigger` — Run QBO sync
+- `reconcile_trigger` — Run reconciliation
+
+---
+
+## 📊 Google Sheets Control Layout
+
+| Country | Last Processed Row | QBO Sync Status | Reconciliation Status | Last Run At          |
+|---------|-------------------|-----------------|----------------------|---------------------|
+| TH      | 150               | DONE            | Clean                | 2025-12-29 10:00    |
+| VN      | 200               | ERROR           | Mismatch Found       | 2025-12-29 10:05    |
+
+---
+
+## 🛡️ Security Best Practices
+
+- **Never commit secrets**
+  - `.env`, `*.json`, `*.csv` excluded via `.gitignore`
+- **Rotate keys immediately** if credentials are exposed
+- **Change webhook tokens regularly**
+
+---
+
+## 🐛 Troubleshooting
+
+### SSL Errors
+- Ensure `pip-system-certs` is installed
+
+### QBO Token Invalid
+- Tokens refresh automatically
+- If refresh fails:
+  1. Generate a new refresh token via QBO Playground
+  2. Update `config/secrets.env`
+
+### Google Authentication Error
+1. Delete `token.json`
+2. Re-run the script locally
+3. Complete browser-based OAuth authentication
+
+---
+
+## ✅ Status
+
+Production-ready, modular, and designed for secure, auditable financial automation with QuickBooks Online.
