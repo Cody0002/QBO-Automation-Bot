@@ -1,0 +1,19 @@
+# secrets
+config/secrets.env
+config/service_account.json
+config/oauth_client_secret.json
+config/token.json
+
+# python
+__pycache__/
+*.pyc
+venv/
+.env
+.sh/
+
+# logs
+logs/*.log
+
+# outputs
+*.csv
+*.parquet
