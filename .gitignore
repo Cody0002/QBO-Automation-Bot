@@ -3,6 +3,7 @@ config/secrets.env
 config/service_account.json
 config/oauth_client_secret.json
 config/token.json
+config/kz_account.json
 
 # python
 __pycache__/
