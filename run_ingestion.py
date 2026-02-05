@@ -191,6 +191,10 @@ def main():
             try:
                 raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=1, value_render_option='UNFORMATTED_VALUE')
                 print(raw_df.head(2))
+            # --- DEBUG STEP 1: VERIFY RAW READ ---
+                logger.info(f"DEBUG: Raw read shape: {raw_df.shape}")
+                logger.info(f"DEBUG: First 5 columns from GSheets: {raw_df.columns[:5].tolist()}")
+                logger.info(f"DEBUG: First row values: {raw_df.iloc[0].tolist()}")
             # 1. Manually assign columns to match the list you provided for the 2026 reporting transition
                 raw_df.columns = [
                     "CO", "COY", "Date", "Category", "Type", "Item Description", 
@@ -222,11 +226,29 @@ def main():
             # 3. ROBUST FILTERING: Ensure we can handle empty cells in the Check column
             # We force the column to string first so .str.contains works even on empty/null cells
             raw_df = raw_df[~raw_df["Check (Internal use)"].astype(str).str.contains("exclude", na=False, case=False)].copy()
+            
+            # --- DEBUG STEP 2: VERIFY 'No' COLUMN ---
+            logger.info(f"DEBUG: 'No' column stats -- Min: {raw_df['No'].min()}, Max: {raw_df['No'].max()}")
+            logger.info(f"DEBUG: 'No' column sample: {raw_df['No'].head(5).tolist()}")
+            logger.info(f"DEBUG: Value of last_processed variable: {last_processed}")
+
+            # Check if we are accidentally zeroing out IDs
+            zeros_count = (raw_df["No"] == 0).sum()
+            logger.info(f"DEBUG: Count of rows where 'No' became 0: {zeros_count} out of {len(raw_df)}")
+            # -------------------------------------
 
             # 4. Filter for only new or retried rows
             new_df = raw_df[raw_df["No"] > last_processed].copy()
             retry_df = raw_df[raw_df["No"].isin(retry_nos)].copy()
             processing_df = pd.concat([new_df, retry_df]).drop_duplicates(subset=["No"])
+
+            # --- DEBUG STEP 3: VERIFY FILTERING ---
+            logger.info(f"DEBUG: Rows in new_df: {len(new_df)}")
+            logger.info(f"DEBUG: Rows in retry_df: {len(retry_df)}")
+            logger.info(f"DEBUG: Final processing_df size: {len(processing_df)}")
+            if processing_df.empty:
+                logger.warning("🚨 processing_df is EMPTY! Transformer will not run.")
+            # --------------------------------------
 
             if processing_df.empty:
                 logger.info(f"[{country}] No new rows.")

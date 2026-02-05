@@ -10,7 +10,7 @@ __pycache__/
 *.pyc
 venv/
 .env
-.sh/
+.ssh/
 
 # logs
 logs/*.log

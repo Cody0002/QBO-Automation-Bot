@@ -66,19 +66,33 @@ class TransformResult:
 # 1. PROCESS JOURNALS
 # ==========================================
 def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> tuple[pd.DataFrame, int]:
-    if df.empty or COL_METHOD not in df.columns:
+    print(f"\n--- DEBUG: Processing JOURNALS (Input Rows: {len(df)}) ---")
+    
+    if df.empty:
+        print("   -> Input DF is empty. Skipping.")
+        return pd.DataFrame(), start_no
+        
+    if COL_METHOD not in df.columns:
+        print(f"   -> CRITICAL: Column '{COL_METHOD}' missing. Available: {df.columns.tolist()}")
         return pd.DataFrame(), start_no
 
-    # FIX: Initialize variables to prevent 'processed_reclass' UnboundLocalError
-    processed_std = pd.DataFrame()
-    processed_reclass = pd.DataFrame()
+    # DEBUG: Check what values we actually have in the Method column
+    method_counts = df[COL_METHOD].fillna("NAN").value_counts()
+    print(f"   -> 'Method' column breakdown:\n{method_counts}")
 
     mask_std = df[COL_METHOD].astype(str).str.contains("Journal", case=False, na=False)
     mask_reclass = df[COL_METHOD].astype(str).str.contains("Reclass", case=False, na=False)
     
     df_std = df[mask_std].copy()
     df_reclass = df[mask_reclass].copy()
+    
+    print(f"   -> Rows identified as Standard Journals: {len(df_std)}")
+    print(f"   -> Rows identified as Reclass Journals: {len(df_reclass)}")
+
     current_max = start_no
+
+    processed_std = pd.DataFrame()
+    processed_reclass = pd.DataFrame()
 
     # --- A. STANDARD JOURNALS ---
     if not df_std.empty:
@@ -130,27 +144,44 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         
         processed_reclass = df_reclass[["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class"]]
 
-        # Balancing logic
-        diffs = processed_reclass.groupby("Journal No")["Amount"].sum()
-        for journal_id, diff in diffs.items():
-            if not np.isclose(diff, 0, atol=1e-9):
-                mask = processed_reclass["Journal No"] == journal_id
-                if not mask.any(): continue
-                subset_indices = processed_reclass[mask].index
-                max_row_idx = processed_reclass.loc[subset_indices, "Amount"].abs().idxmax()
-                processed_reclass.loc[max_row_idx, "Amount"] -= diff
-
     # --- 3. Safe Combination ---
     total_journals = pd.concat([processed_std, processed_reclass], ignore_index=True)
 
     if total_journals.empty:
+        print("   -> Result: 0 Journals created.")
         return pd.DataFrame(), start_no
 
+    print(f"   -> Combined Rows (Debit+Credit): {len(total_journals)}")
+
+    # DEBUG: Filter check
+    zero_amts = total_journals[total_journals["Amount"].abs() <= 1e-9]
+    if not zero_amts.empty:
+        print(f"   -> WARNING: Dropping {len(zero_amts)} rows with 0.00 amount.")
+
+    total_journals = total_journals[total_journals["Amount"].abs() > 1e-9].copy()
+    
+    # ... (Rest of existing validation logic) ...
+    # (Abbreviated for clarity - keep your existing auto-balancing and validation code here)
+    
+    # Paste the rest of your existing function logic below this line:
     for col in total_journals.select_dtypes(include=['datetime64', 'datetimetz']).columns:
         total_journals[col] = total_journals[col].astype(str)
     
-    total_journals = total_journals[total_journals["Amount"].abs() > 1e-9].copy()
     total_journals["Account"] = total_journals["Account"].fillna("").astype(str).str.strip()
+
+    # =========================================================
+    # GLOBAL AUTO-BALANCING (Standard + Reclass)
+    # =========================================================
+    diffs = total_journals.groupby("Journal No")["Amount"].sum()
+    
+    for journal_id, diff in diffs.items():
+        if not np.isclose(diff, 0, atol=5e-9):
+            if abs(diff) <= 0.50:
+                mask = total_journals["Journal No"] == journal_id
+                if not mask.any(): continue
+                subset_indices = total_journals[mask].index
+                max_row_idx = total_journals.loc[subset_indices, "Amount"].abs().idxmax()
+                total_journals.loc[max_row_idx, "Amount"] -= diff
 
     # --- VALIDATION ---
     balance_map = total_journals.groupby("Journal No")["Amount"].sum()
@@ -163,15 +194,12 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         if row["Journal No"] in unbalanced_ids:
             diff = round(balance_map[row["Journal No"]], 2)
             return f"ERROR | Unbalanced ({diff})"
-        
         acc_name = row["Account"]
         if not acc_name: return "ERROR | Missing Account Name"
         if not find_id_in_map(map_acc, acc_name): return f"ERROR | Account not found in QBO: '{acc_name}'"
-        
         loc_name = row.get("Location")
         if loc_name and not find_id_in_map(map_loc, loc_name):
              return f"ERROR | Location not found in QBO: '{loc_name}'"
-        
         return "Ready to sync"
 
     total_journals["Remarks"] = total_journals.apply(validate_journal_row, axis=1)
@@ -187,31 +215,51 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
 # 2. PROCESS EXPENSES
 # ==========================================
 def process_expenses(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> Tuple[pd.DataFrame, int]:
+    print(f"\n--- DEBUG: Processing EXPENSES (Input Rows: {len(df)}) ---")
     if df is None or df.empty: return pd.DataFrame(), start_no
     if existing_ids is None: existing_ids = {}
 
-    # FIX: Robust numeric conversion to prevent NAType rounding error
+    # FIX: Robust numeric conversion
     df[COL_USD] = pd.to_numeric(df[COL_USD], errors='coerce').fillna(0.0)
+    
+    # DEBUG: Check Non-Zero
     d = df[df[COL_USD].round(2) != 0].copy()
+    print(f"   -> Rows with Non-Zero Amount: {len(d)}")
 
     if d.empty: return pd.DataFrame(), start_no
 
     d = d[[c for c in d.columns if "currency" not in c.lower()]]
 
+    # DEBUG: Check Method Filter
     if COL_METHOD in d.columns: 
         d = d[d[COL_METHOD].astype(str).str.contains("Expense", case=False, na=False)]
+        print(f"   -> Rows matching 'Expense' method: {len(d)}")
+    else:
+        print(f"   -> WARNING: '{COL_METHOD}' column not found. Skipping method filter.")
     
-    if COL_IN_OUT in d.columns: 
-        d = d[pd.to_numeric(d[COL_IN_OUT], errors="coerce").fillna(0) < 0]
+    # DEBUG: Check In/Out Filter (THE USUAL SUSPECT)
+    if COL_IN_OUT in d.columns:
+        print(f"   -> '{COL_IN_OUT}' column found. Sample values: {d[COL_IN_OUT].head(3).tolist()}")
+        
+        # Check how many are actually negative
+        numeric_vals = pd.to_numeric(d[COL_IN_OUT], errors="coerce").fillna(0)
+        neg_count = (numeric_vals < 0).sum()
+        print(f"   -> Rows with negative '{COL_IN_OUT}': {neg_count}")
+        
+        d = d[numeric_vals < 0]
+    else:
+        print(f"   -> WARNING: '{COL_IN_OUT}' column MISSING. Skipping Outflow filter.")
 
-    if d.empty: return pd.DataFrame(), start_no
+    if d.empty: 
+        print("   -> Result: 0 Expenses remaining after filters.")
+        return pd.DataFrame(), start_no
 
+    # ... (Rest of existing logic below is fine) ...
     d["Payee (Dummy)"] = "Dummy"
     d["Payment Method"] = "Cash"
     d["Currency Code"] = "USD"
     d["Account (Cr)"] = d.get(COL_BANK, "Payment Gateway - PH").fillna("Payment Gateway - PH")
     
-    # Expense amount is outgoing (negative)
     d["Expense Line Amount"] = d[COL_USD] * -1
     d["Payment Date"] = pd.to_datetime(d[COL_DATE], errors="coerce")
 
@@ -269,18 +317,23 @@ def process_expenses(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
 # 3. PROCESS TRANSFERS
 # ==========================================
 def process_transfers(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> tuple[pd.DataFrame, int]:
+    print(f"\n--- DEBUG: Processing TRANSFERS (Input Rows: {len(df)}) ---")
     if df.empty: return pd.DataFrame(), start_no
     if existing_ids is None: existing_ids = {}
 
-    # FIX: Robust numeric conversion
     df[COL_USD] = pd.to_numeric(df[COL_USD], errors='coerce').fillna(0.0)
     transfers = df[df[COL_USD].round(2) != 0].copy()
+    print(f"   -> Rows with Non-Zero Amount: {len(transfers)}")
 
     if COL_METHOD in transfers.columns:
         transfers = transfers[transfers[COL_METHOD].astype(str).str.contains("Transfer", case=False, na=False)]
+        print(f"   -> Rows matching 'Transfer' method: {len(transfers)}")
+    
+    if transfers.empty: 
+        print("   -> Result: 0 Transfers remaining.")
+        return pd.DataFrame(), start_no
 
-    if transfers.empty: return pd.DataFrame(), start_no
-
+    # ... (Rest of existing logic) ...
     transfers["Transfer Amount"] = transfers[COL_USD].abs()
     transfers["Currency"] = "USD"
     

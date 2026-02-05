@@ -127,7 +127,7 @@ class QBOSync:
         # EXECUTE POST
         # print(payload)
         # return
-        # return self.client.post("/v3/company/" + self.client.cfg.realm_id + "/journalentry", payload)
+        return self.client.post("/v3/company/" + self.client.cfg.realm_id + "/journalentry", payload)
 # ====================================================
     # 2. EXPENSES (API: Purchase)
     # ====================================================
@@ -189,7 +189,7 @@ class QBOSync:
             # REMOVED: "PaymentMethodRef" (Invalid for Purchase objects)
         }
 
-        # return self.client.post(f"/v3/company/{self.client.cfg.realm_id}/purchase", payload)
+        return self.client.post(f"/v3/company/{self.client.cfg.realm_id}/purchase", payload)
     
     # ====================================================
     # 3. TRANSFERS
@@ -229,4 +229,4 @@ class QBOSync:
             "DocNumber": ref_no, 
         }
 
-        # return self.client.post(f"/v3/company/{self.client.cfg.realm_id}/transfer", payload)
+        return self.client.post(f"/v3/company/{self.client.cfg.realm_id}/transfer", payload)
