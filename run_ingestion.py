@@ -21,8 +21,29 @@ from src.connectors.qbo_client import QBOClient
 from src.logic.syncing import QBOSync
 from src.logic.transformer import transform_raw
 from src.utils.logger import setup_logger
+import calendar # Add this to your imports
 
 logger = setup_logger("ingestion")
+
+def get_month_date_range(month_str: str) -> Tuple[datetime, datetime]:
+    """
+    Converts 'Oct 2025', '2025-10-01', etc. into Start and End datetime objects.
+    Returns (None, None) if invalid.
+    """
+    try:
+        # Parse the string to a date (defaults to 1st of month)
+        dt = pd.to_datetime(month_str)
+        
+        # Start Date = 1st of that month
+        start_date = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
+        # End Date = Last day of that month
+        _, last_day = calendar.monthrange(start_date.year, start_date.month)
+        end_date = start_date.replace(day=last_day, hour=23, minute=59, second=59, microsecond=999999)
+        
+        return start_date, end_date
+    except Exception:
+        return None, None
 
 def _now_iso_local() -> str:
     now = datetime.now().astimezone()
@@ -189,8 +210,9 @@ def main():
             # --- READ SOURCE & ALIGN COLUMNS ---
             logger.info(f"[{country}] Reading Source: {raw_tab_name}")
             try:
-                raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=1, value_render_option='UNFORMATTED_VALUE')
+                raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=3, value_render_option='UNFORMATTED_VALUE')
                 print(raw_df.head(2))
+                raw_df = raw_df.iloc[:, :25]   # keep only first 25 columns
             # --- DEBUG STEP 1: VERIFY RAW READ ---
                 logger.info(f"DEBUG: Raw read shape: {raw_df.shape}")
                 logger.info(f"DEBUG: First 5 columns from GSheets: {raw_df.columns[:5].tolist()}")
@@ -205,8 +227,54 @@ def main():
                     "Check (Internal use)", "No"
                 ]
 
+                raw_df["CO"] = raw_df["CO"].str.replace("GRP", "GROUP").str.strip()
+                # =========================================================
+                # NEW: FILTER BY TARGET MONTH (Strict Boundary)
+                # =========================================================
+                target_start, target_end = get_month_date_range(raw_month)
+                
+                if target_start and target_end:
+                    logger.info(f"[{country}] 📅 Filtering Source Data for Month: {target_start.strftime('%Y-%m')}")
+                    
+                    # A. Robust Date Parsing (Handle Excel Serials & Strings)
+                    # We reuse the logic from your transformer to ensure 'Date' is datetime objects
+                    numeric_dates = pd.to_numeric(raw_df["Date"], errors="coerce")
+                    date_objs = pd.to_datetime(numeric_dates, origin="1899-12-30", unit="D", errors="coerce")
+                    
+                    # Fill NaTs with string parsing attempt
+                    mask_nat = date_objs.isna()
+                    if mask_nat.any():
+                        date_objs[mask_nat] = pd.to_datetime(raw_df.loc[mask_nat, "Date"], errors="coerce")
+                    
+                    raw_df["_TempDate"] = date_objs
+
+                    # B. Apply Filter
+                    # We keep rows where Date is INSIDE the range OR Date is NULL (to be safe/warn later)
+                    # But typically strict filtering is better:
+                    month_mask = (raw_df["_TempDate"] >= target_start) & (raw_df["_TempDate"] <= target_end)
+                    
+                    # Optional: Log how many rows we are dropping
+                    dropped_count = len(raw_df) - month_mask.sum()
+                    if dropped_count > 0:
+                        logger.info(f"      ✂️  Ignoring {dropped_count} rows from other months.")
+
+                    raw_df = raw_df[month_mask].copy()
+                    
+                    # Clean up temp column
+                    raw_df.drop(columns=["_TempDate"], inplace=True)
+                    
+                    if raw_df.empty:
+                        logger.warning(f"[{country}] ⚠️ No rows found for {target_start.strftime('%b %Y')} in Source File!")
+                        _batch_update_control(gs, settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "DONE (No Data)"})
+                        continue
+                else:
+                    logger.warning(f"[{country}] ⚠️ Could not parse Month '{raw_month}'. Processing ALL rows.")
+
+            # =========================================================
+            # END MONTH FILTER
+            # =========================================================
+
                 # 2. TYPE SAFETY FIX: Convert strings to numeric objects immediately
-             # 2. THE CRITICAL FIX: Convert to Numeric Series immediately
                 # We use errors='coerce' to turn text into NaN, then fillna(0) works on the resulting Series
                 for col in ["No", "USD - QBO", "Amount Fr", "Amount To"]:
                     if col in raw_df.columns:
