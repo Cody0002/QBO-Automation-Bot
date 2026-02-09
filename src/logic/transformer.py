@@ -3,15 +3,17 @@ from dataclasses import dataclass
 from typing import Tuple, Dict, Any
 import pandas as pd
 import numpy as np
+import difflib  # <--- NEW IMPORT FOR FUZZY MATCHING
 from config import settings
+import re
 
 # --- CONSTANTS ---
 PREFIX = "KZO-JV" 
 
 COL_NO = "No"
 COL_DATE = "Date"
-COL_USD = "USD - QBO"             # Aligned with your manual list
-COL_METHOD = "QBO Method"         # Aligned with your manual list
+COL_USD = "USD - QBO"             
+COL_METHOD = "QBO Method"         
 COL_ACC_CR = "If Journal/Expense Method" 
 COL_TR_FROM = "QBO Transfer Fr"
 COL_TR_TO = "QBO Transfer To"
@@ -31,19 +33,57 @@ def _normalize_df_headers(df: pd.DataFrame) -> pd.DataFrame:
         "If Transfer method: Fund Transfer From": COL_TR_FROM,
         "Transfer to ((Can copy from column H )": COL_TR_TO,
         "Transfer to": COL_TR_TO,
-        "USD": COL_USD  # Ensure backward compatibility if 'USD' is present
+        "USD": COL_USD  
     }
     return df.rename(columns=mapping)
 
-# --- HELPER FUNCTIONS ---
+# --- UPDATED HELPER FUNCTION ---
 def find_id_in_map(mapping_dict: dict, search_name: str) -> str | None:
     if not search_name or pd.isna(search_name) or str(search_name).strip() == "":
         return None
-    search_name = str(search_name).strip().lower()
+    
+    # 1. Clean: Remove double spaces & trim
+    clean_name = re.sub(r'\s+', ' ', str(search_name)).strip()
+
+    # 2. Explicit Replacements (Hardcoded fixes)
+    # Dictionary mapping: { "Text to Find": "Target Account Name in QBO" }
+    replacements = {
+        "CBD Z Card":   "KZO CBD Z",  # Catch variations
+        "Leading Card MKT - 1238": "Leading Card - 1238"
+    }
+
+    # Check if we need to swap the name
+    for bad_text, target_text in replacements.items():
+        if bad_text.lower() in clean_name.lower():
+            clean_name = target_text
+            break
+
+    search_lower = clean_name.lower()
+
+    # 3. Exact Match (Case-insensitive)
     for qbo_name, qbo_id in mapping_dict.items():
-        if qbo_name.lower() == search_name: return qbo_id
+        if qbo_name.lower() == search_lower: 
+            return qbo_id
+    
+    # 4. Substring Match (Existing logic)
+    # Be careful: "Bank" matches "Bank of America"
     for qbo_name, qbo_id in mapping_dict.items():
-        if search_name in qbo_name.lower(): return qbo_id
+        if search_lower in qbo_name.lower(): 
+            return qbo_id
+
+    # 5. Fuzzy Match (New: ~85-90% Similarity)
+    # 'difflib' finds the best match from the list of QBO names
+    # cutoff=0.85 allows for small typos or extra characters (like "MKT")
+    qbo_names = list(mapping_dict.keys())
+    matches = difflib.get_close_matches(clean_name, qbo_names, n=1, cutoff=0.85)
+    
+    if matches:
+        best_match = matches[0]
+        # Optional: Print debug info to see what matched what
+        print(matches)
+        # print(f"   ✨ Fuzzy Matched: '{search_name}' -> '{best_match}'")
+        return mapping_dict[best_match]
+
     return None
 
 def _fix_grp_location(df: pd.DataFrame, col_name: str = "Location"):
@@ -69,16 +109,10 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     print(f"\n--- DEBUG: Processing JOURNALS (Input Rows: {len(df)}) ---")
     
     if df.empty:
-        print("   -> Input DF is empty. Skipping.")
         return pd.DataFrame(), start_no
         
     if COL_METHOD not in df.columns:
-        print(f"   -> CRITICAL: Column '{COL_METHOD}' missing. Available: {df.columns.tolist()}")
         return pd.DataFrame(), start_no
-
-    # DEBUG: Check what values we actually have in the Method column
-    method_counts = df[COL_METHOD].fillna("NAN").value_counts()
-    print(f"   -> 'Method' column breakdown:\n{method_counts}")
 
     mask_std = df[COL_METHOD].astype(str).str.contains("Journal", case=False, na=False)
     mask_reclass = df[COL_METHOD].astype(str).str.contains("Reclass", case=False, na=False)
@@ -86,11 +120,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     df_std = df[mask_std].copy()
     df_reclass = df[mask_reclass].copy()
     
-    print(f"   -> Rows identified as Standard Journals: {len(df_std)}")
-    print(f"   -> Rows identified as Reclass Journals: {len(df_reclass)}")
-
     current_max = start_no
-
     processed_std = pd.DataFrame()
     processed_reclass = pd.DataFrame()
 
@@ -148,40 +178,29 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     total_journals = pd.concat([processed_std, processed_reclass], ignore_index=True)
 
     if total_journals.empty:
-        print("   -> Result: 0 Journals created.")
         return pd.DataFrame(), start_no
-
-    print(f"   -> Combined Rows (Debit+Credit): {len(total_journals)}")
-
-    # DEBUG: Filter check
-    zero_amts = total_journals[total_journals["Amount"].abs() <= 1e-9]
-    if not zero_amts.empty:
-        print(f"   -> WARNING: Dropping {len(zero_amts)} rows with 0.00 amount.")
 
     total_journals = total_journals[total_journals["Amount"].abs() > 1e-9].copy()
     
-    # ... (Rest of existing validation logic) ...
-    # (Abbreviated for clarity - keep your existing auto-balancing and validation code here)
-    
-    # Paste the rest of your existing function logic below this line:
     for col in total_journals.select_dtypes(include=['datetime64', 'datetimetz']).columns:
         total_journals[col] = total_journals[col].astype(str)
     
-    total_journals["Account"] = total_journals["Account"].fillna("").astype(str).str.strip()
+    # 1. Round everything to 2 decimals FIRST
+    total_journals["Amount"] = total_journals["Amount"].astype(float).round(2)
 
-    # =========================================================
-    # GLOBAL AUTO-BALANCING (Standard + Reclass)
-    # =========================================================
+    # 2. Recalculate diffs based on the rounded numbers
     diffs = total_journals.groupby("Journal No")["Amount"].sum()
-    
+
     for journal_id, diff in diffs.items():
-        if not np.isclose(diff, 0, atol=5e-9):
+        if not np.isclose(diff, 0, atol=1e-3): # If sum is not zero
             if abs(diff) <= 0.50:
                 mask = total_journals["Journal No"] == journal_id
                 if not mask.any(): continue
-                subset_indices = total_journals[mask].index
-                max_row_idx = total_journals.loc[subset_indices, "Amount"].abs().idxmax()
-                total_journals.loc[max_row_idx, "Amount"] -= diff
+                
+                # 3. Find the last index of that journal to apply the fix
+                target_idx = total_journals[mask].index[-1]
+                # Subtract the diff (e.g., if sum is 0.01, subtract 0.01 from the last row)
+                total_journals.loc[target_idx, "Amount"] -= diff
 
     # --- VALIDATION ---
     balance_map = total_journals.groupby("Journal No")["Amount"].sum()
@@ -196,10 +215,16 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
             return f"ERROR | Unbalanced ({diff})"
         acc_name = row["Account"]
         if not acc_name: return "ERROR | Missing Account Name"
-        if not find_id_in_map(map_acc, acc_name): return f"ERROR | Account not found in QBO: '{acc_name}'"
+        
+        # --- NEW FIND LOGIC ---
+        if not find_id_in_map(map_acc, acc_name): 
+            return f"ERROR | Account not found: '{acc_name}'"
+            
         loc_name = row.get("Location")
         if loc_name and not find_id_in_map(map_loc, loc_name):
-             return f"ERROR | Location not found in QBO: '{loc_name}'"
+             return f"ERROR | Location not found: '{loc_name}'"
+        
+        
         return "Ready to sync"
 
     total_journals["Remarks"] = total_journals.apply(validate_journal_row, axis=1)
@@ -219,48 +244,29 @@ def process_expenses(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     if df is None or df.empty: return pd.DataFrame(), start_no
     if existing_ids is None: existing_ids = {}
 
-    # FIX: Robust numeric conversion
     df[COL_USD] = pd.to_numeric(df[COL_USD], errors='coerce').fillna(0.0)
-    
-    # DEBUG: Check Non-Zero
     d = df[df[COL_USD].round(2) != 0].copy()
-    print(f"   -> Rows with Non-Zero Amount: {len(d)}")
 
     if d.empty: return pd.DataFrame(), start_no
 
     d = d[[c for c in d.columns if "currency" not in c.lower()]]
 
-    # DEBUG: Check Method Filter
     if COL_METHOD in d.columns: 
         d = d[d[COL_METHOD].astype(str).str.contains("Expense", case=False, na=False)]
-        print(f"   -> Rows matching 'Expense' method: {len(d)}")
-    else:
-        print(f"   -> WARNING: '{COL_METHOD}' column not found. Skipping method filter.")
     
-    # DEBUG: Check In/Out Filter (THE USUAL SUSPECT)
     if COL_IN_OUT in d.columns:
-        print(f"   -> '{COL_IN_OUT}' column found. Sample values: {d[COL_IN_OUT].head(3).tolist()}")
-        
-        # Check how many are actually negative
         numeric_vals = pd.to_numeric(d[COL_IN_OUT], errors="coerce").fillna(0)
-        neg_count = (numeric_vals < 0).sum()
-        print(f"   -> Rows with negative '{COL_IN_OUT}': {neg_count}")
-        
         d = d[numeric_vals < 0]
-    else:
-        print(f"   -> WARNING: '{COL_IN_OUT}' column MISSING. Skipping Outflow filter.")
 
     if d.empty: 
-        print("   -> Result: 0 Expenses remaining after filters.")
         return pd.DataFrame(), start_no
 
-    # ... (Rest of existing logic below is fine) ...
     d["Payee (Dummy)"] = "Dummy"
     d["Payment Method"] = "Cash"
     d["Currency Code"] = "USD"
     d["Account (Cr)"] = d.get(COL_BANK, "Payment Gateway - PH").fillna("Payment Gateway - PH")
     
-    d["Expense Line Amount"] = d[COL_USD] * -1
+    d["Expense Line Amount"] = d[COL_USD].astype(float) * -1
     d["Payment Date"] = pd.to_datetime(d[COL_DATE], errors="coerce")
 
     # ID GENERATION
@@ -295,10 +301,17 @@ def process_expenses(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         if not row["Account (Cr)"]: return "ERROR | Missing Source Account"
         if not row["Expense Account (Dr)"]: return "ERROR | Missing Expense Account"
         if pd.isna(row["Payment Date"]): return "ERROR | Missing Date"
-        if not find_id_in_map(map_acc, row["Account (Cr)"]): return f"ERROR | Source Account not in QBO: '{row['Account (Cr)']}'"
-        if not find_id_in_map(map_acc, row["Expense Account (Dr)"]): return f"ERROR | Expense Account not in QBO: '{row['Expense Account (Dr)']}'"
+        
+        # --- NEW FIND LOGIC ---
+        if not find_id_in_map(map_acc, row["Account (Cr)"]): 
+            return f"ERROR | Source Account not in QBO: '{row['Account (Cr)']}'"
+            
+        if not find_id_in_map(map_acc, row["Expense Account (Dr)"]): 
+            return f"ERROR | Expense Account not in QBO: '{row['Expense Account (Dr)']}'"
+            
         loc_name = row.get("Location")
-        if loc_name and not find_id_in_map(map_loc, loc_name): return f"ERROR | Location not in QBO: '{loc_name}'"
+        if loc_name and not find_id_in_map(map_loc, loc_name): 
+            return f"ERROR | Location not in QBO: '{loc_name}'"
         return "Ready to sync"
 
     d["Remarks"] = d.apply(validate_expense_row, axis=1)
@@ -323,17 +336,13 @@ def process_transfers(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, d
 
     df[COL_USD] = pd.to_numeric(df[COL_USD], errors='coerce').fillna(0.0)
     transfers = df[df[COL_USD].round(2) != 0].copy()
-    print(f"   -> Rows with Non-Zero Amount: {len(transfers)}")
 
     if COL_METHOD in transfers.columns:
         transfers = transfers[transfers[COL_METHOD].astype(str).str.contains("Transfer", case=False, na=False)]
-        print(f"   -> Rows matching 'Transfer' method: {len(transfers)}")
     
     if transfers.empty: 
-        print("   -> Result: 0 Transfers remaining.")
         return pd.DataFrame(), start_no
 
-    # ... (Rest of existing logic) ...
     transfers["Transfer Amount"] = transfers[COL_USD].abs()
     transfers["Currency"] = "USD"
     
@@ -369,11 +378,20 @@ def process_transfers(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, d
     def validate_transfer_row(row):
         if not row["Transfer Funds From"]: return "ERROR | Missing From Account"
         if not row["Transfer Funds To"]: return "ERROR | Missing To Account"
-        if not find_id_in_map(map_acc, row["Transfer Funds From"]): return f"ERROR | 'From' Account not in QBO: '{row['Transfer Funds From']}'"
-        if not find_id_in_map(map_acc, row["Transfer Funds To"]): return f"ERROR | 'To' Account not in QBO: '{row['Transfer Funds To']}'"
-        if row["Transfer Funds From"] == row["Transfer Funds To"]: return "ERROR | 'From' and 'To' Accounts cannot be the same"
+        
+        # --- NEW FIND LOGIC ---
+        if not find_id_in_map(map_acc, row["Transfer Funds From"]): 
+            return f"ERROR | 'From' Account not in QBO: '{row['Transfer Funds From']}'"
+            
+        if not find_id_in_map(map_acc, row["Transfer Funds To"]): 
+            return f"ERROR | 'To' Account not in QBO: '{row['Transfer Funds To']}'"
+            
+        if row["Transfer Funds From"] == row["Transfer Funds To"]: 
+            return "ERROR | 'From' and 'To' Accounts cannot be the same"
+            
         loc_name = row.get("Location")
-        if loc_name and not find_id_in_map(map_loc, loc_name): return f"ERROR | Location not in QBO: '{loc_name}'"
+        if loc_name and not find_id_in_map(map_loc, loc_name): 
+            return f"ERROR | Location not in QBO: '{loc_name}'"
         return "Ready to sync"
 
     transfers["Remarks"] = transfers.apply(validate_transfer_row, axis=1)
@@ -392,7 +410,6 @@ def transform_raw(raw_df: pd.DataFrame, last_jv: int, last_exp: int, last_tr: in
         return TransformResult(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), last_jv, last_exp, last_tr, None)
 
     df = _normalize_df_headers(raw_df.copy())
-    print('Transforming 1:', df.head())
 
     # Shared Cleaning
     if COL_NO in df.columns:
@@ -401,11 +418,9 @@ def transform_raw(raw_df: pd.DataFrame, last_jv: int, last_exp: int, last_tr: in
     if "Category" in df.columns: 
         df = df[df["Category"].fillna("").astype(str).str.strip() != ""]
 
-    # --- ROBUST DATE PARSING ---
     if COL_DATE in df.columns:
         numeric_dates = pd.to_numeric(df[COL_DATE], errors="coerce")
         date_results = pd.to_datetime(numeric_dates, origin="1899-12-30", unit="D", errors="coerce")
-        
         mask_nan = date_results.isna()
         if mask_nan.any():
             date_results[mask_nan] = pd.to_datetime(df.loc[mask_nan, COL_DATE], errors="coerce")
@@ -414,18 +429,13 @@ def transform_raw(raw_df: pd.DataFrame, last_jv: int, last_exp: int, last_tr: in
     if COL_IN_OUT in df.columns: 
         df[COL_IN_OUT] = pd.to_numeric(df[COL_IN_OUT], errors="coerce").fillna(0)
 
-    # FIX: Robust amount cleaning for the whole dataframe to prevent KEYERROR and NAType error
     if COL_USD in df.columns:
         df[COL_USD] = pd.to_numeric(df[COL_USD], errors="coerce").fillna(0.0)
         df = df[~df[COL_USD].isna()]
-    print('Transforming --> JV / EXP / TR')
-    # PASS MAPS DOWN
+
     final_jv, new_jv_no = process_journals(df, last_jv, qbo_mappings, existing_ids.get('journals') if existing_ids else None)
-    print('Done JR')
     final_exp, new_exp_no = process_expenses(df, last_exp, qbo_mappings, existing_ids.get('expenses') if existing_ids else None)
-    print('Done EXP')
     final_tr, new_tr_no = process_transfers(df, last_tr, qbo_mappings, existing_ids.get('transfers') if existing_ids else None)
-    print('Done TR')
 
     max_row = int(df[COL_NO].max()) if not df.empty else None
 

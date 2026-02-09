@@ -47,6 +47,19 @@ QBO_MINOR_VERSION = os.getenv("QBO_MINOR_VERSION", "65")
 # - oauth: uses OAuth client secret + token.json (recommended for work account flow)
 GSHEETS_AUTH_MODE = os.getenv("GSHEETS_AUTH_MODE", "oauth")
 
+# ---- Master Sheet Configuration ----
+# Replace with the ID of the sheet from your screenshot
+MASTER_SHEET_ID = os.getenv("MASTER_SHEET_ID", "1fVAVZXosAIz-Je-04vJe80Ggr1iAYNqBxMM84-FVWlU") 
+MASTER_TAB_NAME = os.getenv("MASTER_TAB_NAME", "Sheet1")
+
+# Master Sheet Columns
+MST_COL_CLIENT = "Client Name"
+MST_COL_SHEET_ID = "Spreadsheet ID"
+MST_COL_REALM_ID = "Realm ID"
+MST_COL_STATUS = "Status"
+MST_COL_OUTPUT = "Output Folder"
+MST_COL_REFRESH_TOKEN = "Refresh Token"  # <--- NEW COLUMN
+
 @dataclass(frozen=True)
 class ControlRow:
     country: str

@@ -4,16 +4,16 @@ import os
 import re
 import time
 import random
+import json
+import requests
 import pandas as pd
 from config import settings
 from gspread.utils import rowcol_to_a1
 from gspread.exceptions import APIError
 
-# --- NEW IMPORTS FOR OAUTH REFRESHING ---
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 import gspread
-# ----------------------------------------
 
 def _extract_sheet_id(url_or_id: str) -> str:
     if "docs.google.com" not in (url_or_id or ""):
@@ -33,9 +33,7 @@ def retry_with_backoff(retries=5, initial_delay=2.0):
                 except APIError as e:
                     if e.response.status_code in [429, 500, 502, 503]:
                         if i == retries - 1: raise e
-                        sleep_time = delay + random.uniform(0, 1)
-                        print(f"⚠️ Quota hit (429). Retrying in {sleep_time:.2f}s... (Attempt {i+1}/{retries})")
-                        time.sleep(sleep_time)
+                        time.sleep(delay + random.uniform(0, 1))
                         delay *= 2
                     else:
                         raise e
@@ -50,13 +48,13 @@ def retry_with_backoff(retries=5, initial_delay=2.0):
     return decorator
 
 class GSheetsClient:
-    """Google Sheets wrapper with Auto-Refresh OAuth."""
+    """Google Sheets wrapper with Drive Folder support."""
 
     def __init__(self):
         mode = (settings.GSHEETS_AUTH_MODE or "oauth").lower().strip()
         SCOPES = [
             "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
+            "https://www.googleapis.com/auth/drive" # Required for folder ops
         ]
 
         if mode == "service_account":
@@ -65,7 +63,6 @@ class GSheetsClient:
                 os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH", "config/service_account.json"),
                 scopes=SCOPES,
             )
-            self.gc = gspread.authorize(creds)
         else:
             token_path = os.getenv("GOOGLE_OAUTH_TOKEN_PATH", "config/token.json")
             if not os.path.exists(token_path):
@@ -75,18 +72,77 @@ class GSheetsClient:
             if not creds.valid:
                 if creds.expired and creds.refresh_token:
                     print("🔄 OAuth Token expired. Refreshing now...")
-                    try:
-                        creds.refresh(Request())
-                        with open(token_path, 'w') as token:
-                            token.write(creds.to_json())
-                        print("✅ Token refreshed and saved.")
-                    except Exception as e:
-                        print(f"❌ Failed to refresh token: {e}")
-                        raise e
+                    creds.refresh(Request())
+                    with open(token_path, 'w') as token:
+                        token.write(creds.to_json())
                 else:
                     raise Exception("❌ Token is invalid. Re-generate token.json.")
-            self.gc = gspread.authorize(creds)
+        
+        self.creds = creds
+        self.gc = gspread.authorize(creds)
 
+    # --- DRIVE API HELPERS ---
+    def _get_drive_headers(self):
+        """Refreshes token if needed and returns headers."""
+        if self.creds.expired:
+            self.creds.refresh(Request())
+        return {
+            "Authorization": f"Bearer {self.creds.token}",
+            "Content-Type": "application/json"
+        }
+
+    def ensure_folder_exists(self, parent_id: str, folder_name: str) -> str:
+        """
+        Checks if 'folder_name' exists inside 'parent_id'.
+        If yes, returns its ID. If no, creates it and returns new ID.
+        """
+        headers = self._get_drive_headers()
+        
+        # 1. Search for existing folder
+        query = f"'{parent_id}' in parents and name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        url = f"https://www.googleapis.com/drive/v3/files?q={query}"
+        
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 200:
+            files = resp.json().get('files', [])
+            if files:
+                print(f"   📂 Found existing folder '{folder_name}' ({files[0]['id']})")
+                return files[0]['id']
+        
+        # 2. Create if not found
+        print(f"   Ez Creating new folder '{folder_name}' inside {parent_id}...")
+        create_url = "https://www.googleapis.com/drive/v3/files"
+        payload = {
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id]
+        }
+        resp = requests.post(create_url, headers=headers, json=payload)
+        if resp.status_code == 200:
+            new_id = resp.json().get('id')
+            return new_id
+        else:
+            raise Exception(f"Failed to create folder: {resp.text}")
+
+    def move_file_to_folder(self, file_id: str, folder_id: str):
+        """Moves a file into a specific folder (by adding parent, removing old parents)."""
+        headers = self._get_drive_headers()
+        
+        # 1. Get current parents
+        get_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=parents"
+        resp = requests.get(get_url, headers=headers)
+        current_parents = ",".join(resp.json().get('parents', []))
+        
+        # 2. Move
+        move_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?addParents={folder_id}&removeParents={current_parents}"
+        resp = requests.patch(move_url, headers=headers)
+        
+        if resp.status_code == 200:
+            print(f"   🚚 Moved file {file_id} -> Folder {folder_id}")
+        else:
+            print(f"   ⚠️ Failed to move file: {resp.text}")
+
+    # --- EXISTING METHODS ---
     @retry_with_backoff()
     def open(self, spreadsheet_url_or_id: str):
         sid = _extract_sheet_id(spreadsheet_url_or_id)
@@ -120,7 +176,6 @@ class GSheetsClient:
         try:
             ws = sh.worksheet(tab_name)
         except Exception:
-            print(f"⚠️ Warning: Tab '{tab_name}' not found. Returning empty DataFrame.")
             return pd.DataFrame()
         values = ws.get_all_records()
         return pd.DataFrame(values)
@@ -145,13 +200,10 @@ class GSheetsClient:
                 role = p.get('role')
                 if not email or "iam.gserviceaccount.com" in email: continue
                 if role == 'owner': role = 'writer'
-                print(f"   Sharing with {email} ({role})...")
                 try:
                     target_sh.share(email, perm_type='user', role=role, notify=False)
-                except Exception as share_err:
-                    print(f"   ⚠️ Could not share with {email}: {share_err}")
-        except Exception as e:
-            print(f"⚠️ Warning: Could not copy permissions: {e}")
+                except Exception: pass
+        except Exception: pass
         
     @retry_with_backoff()
     def update_cell(self, spreadsheet_url_or_id: str, tab_name: str, row: int, col: int, value: str):
@@ -175,39 +227,30 @@ class GSheetsClient:
     def delete_rows(self, spreadsheet_url_or_id: str, tab_name: str, row_indices: list[int]):
         if not row_indices: return
         sh = self.open(spreadsheet_url_or_id)
-        try:
-            ws = sh.worksheet(tab_name)
+        try: ws = sh.worksheet(tab_name)
         except Exception: return
         sorted_rows = sorted(list(set(row_indices)), reverse=True)
         for row_num in sorted_rows:
             try: ws.delete_rows(row_num)
             except Exception: pass
 
-    # --- NEW: Delete "Sheet1" Helper ---
     @retry_with_backoff()
     def cleanup_default_sheet(self, spreadsheet_url_or_id: str):
-        """Deletes 'Sheet1' if other tabs exist."""
         sh = self.open(spreadsheet_url_or_id)
         worksheets = sh.worksheets()
         if len(worksheets) > 1:
             try:
                 ws = sh.worksheet("Sheet1")
                 sh.del_worksheet(ws)
-                print("   🗑️ Deleted default 'Sheet1'")
-            except Exception:
-                pass # Sheet1 probably doesn't exist
+            except Exception: pass
 
-    # --- UPDATED: COPY TEMPLATE FROM OTHER FILE ---
     @retry_with_backoff()
     def append_or_create_df(self, spreadsheet_url_or_id: str, tab_name: str, df: pd.DataFrame, 
                             template_tab_name: str | None = None, 
                             template_spreadsheet_id: str | None = None) -> None:
         if df is None or df.empty: return
-        
         target_sh = self.open(spreadsheet_url_or_id)
         target_sid = target_sh.id
-
-        # 1. Check if tab exists
         try:
             ws = target_sh.worksheet(tab_name)
             tab_exists = True
@@ -217,39 +260,25 @@ class GSheetsClient:
         df_export = df.astype(object).where(pd.notnull(df), None)
         data_values = df_export.values.tolist()
 
-        # 2. If tab missing, create it (Using Template if provided)
         if not tab_exists:
             created_from_template = False
-            
             if template_tab_name and template_spreadsheet_id:
                 try:
-                    # Open the Source (Control Sheet)
                     source_sh = self.open(template_spreadsheet_id)
                     source_ws = source_sh.worksheet(template_tab_name)
-                    
-                    # Copy to Target
-                    print(f"   📋 Copying template '{template_tab_name}'...")
                     copy_res = source_ws.copy_to(target_sid)
-                    
-                    # Find the new sheet (it comes in as "Copy of...") and Rename it
                     new_sheet_id = copy_res['sheetId']
                     ws = target_sh.get_worksheet_by_id(new_sheet_id)
                     ws.update_title(tab_name)
-                    
                     created_from_template = True
-                    print(f"   ✅ Created '{tab_name}' from template.")
-                except Exception as e:
-                    print(f"   ⚠️ Template Copy Failed ({e}). Falling back to blank.")
+                except Exception: pass
 
             if not created_from_template:
-                # Fallback: Create Blank
                 rows = max(len(df) + 1, 100)
                 cols = max(len(df.columns), 26)
                 ws = target_sh.add_worksheet(title=tab_name, rows=rows, cols=cols)
-                # Write Headers for blank sheet
                 values = [df.columns.tolist()] + data_values
                 ws.update("A1", values)
                 return
 
-        # 3. Append Data (Whether created from template or existing)
         ws.append_rows(data_values, value_input_option="USER_ENTERED")

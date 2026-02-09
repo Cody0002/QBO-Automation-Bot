@@ -1,27 +1,41 @@
 from __future__ import annotations
 import pandas as pd
+import re
+import difflib
 from datetime import datetime
 from src.utils.logger import setup_logger
 from src.connectors.qbo_client import QBOClient
 
+from dotenv import load_dotenv
+load_dotenv("config/secrets.env")
+
 logger = setup_logger("syncing_logic")
 
-# --- MISSING HELPER FUNCTIONS ADDED HERE ---
 def _parse_date_yyyy_mm_dd(val) -> str:
-    """Safely converts input (str or datetime) to 'YYYY-MM-DD' string for QBO."""
     if pd.isna(val) or val == "":
         return datetime.today().strftime("%Y-%m-%d")
-    
     try:
-        # Attempt to convert to datetime then format
-        dt = pd.to_datetime(val, errors='raise')
+        dt = pd.to_datetime(val)
         return dt.strftime("%Y-%m-%d")
     except:
-        # Fallback if parsing fails
         return datetime.today().strftime("%Y-%m-%d")
 
 def _parse_amount(val) -> float:
-    """Safely converts input to float."""
+    try:
+        return float(pd.to_numeric(val))
+    except:
+        return 0.0
+
+def _parse_date_yyyy_mm_dd(val) -> str:
+    if pd.isna(val) or val == "":
+        return datetime.today().strftime("%Y-%m-%d")
+    try:
+        dt = pd.to_datetime(val)
+        return dt.strftime("%Y-%m-%d")
+    except:
+        return datetime.today().strftime("%Y-%m-%d")
+
+def _parse_amount(val) -> float:
     try:
         return float(pd.to_numeric(val))
     except:
@@ -33,200 +47,187 @@ class QBOSync:
         self.mappings = self._get_qbo_mappings()
 
     def _get_qbo_mappings(self) -> dict:
-        """Fetches Mapping IDs using QBOClient's built-in pagination."""
-        logger.info("🔍 Fetching QBO Mappings...")
+        """Fetches Accounts, Locations, Classes, and Vendors for lookups."""
+        logger.info(f"🔍 Fetching QBO Mappings for Realm: {self.client.realm_id}...")
+        mappings = {"accounts": {}, "locations": {}, "classes": {}, "vendors": {}}
         
-        mappings = {"accounts": {}, "locations": {}, "classes": {}}
-        queries = {
-            "Account": "accounts", 
-            "Department": "locations", 
-            "Class": "classes"
-        }
+        entities = [
+            ("Account", "accounts", "Name, FullyQualifiedName, Id"),
+            ("Department", "locations", "Name, FullyQualifiedName, Id"),
+            ("Class", "classes", "Name, FullyQualifiedName, Id"),
+            ("Vendor", "vendors", "DisplayName, Id") 
+        ]
 
-        for entity, key in queries.items():
-            select_stmt = f"SELECT FullyQualifiedName, Id FROM {entity}"
+        for table, key, fields in entities:
             try:
-                all_items = self.client.query(select_stmt)
-                mappings[key] = {
-                    item.get("FullyQualifiedName", item.get("Name")): item["Id"] 
-                    for item in all_items
-                }
+                data = self.client.query(f"SELECT {fields} FROM {table} MAXRESULTS 1000")
+                for item in data:
+                    name = item.get("FullyQualifiedName", item.get("Name", item.get("DisplayName")))
+                    mappings[key][name] = item["Id"]
             except Exception as e:
-                logger.error(f"❌ Failed to fetch {entity}: {e}")
-                
+                logger.error(f"❌ Failed to fetch {table}: {e}")
+
         return mappings
 
     def find_id(self, mapping_key: str, search_name: str) -> str | None:
-        """Partial match logic for QBO names."""
-        if not search_name: return None
-        search_name = str(search_name).strip().lower()
+        if not search_name or pd.isna(search_name) or str(search_name).strip() == "": return None
         mapping_dict = self.mappings.get(mapping_key, {})
+        clean_name = re.sub(r'\s+', ' ', str(search_name)).strip()
         
-        # 1. Exact match
-        for qbo_name, qbo_id in mapping_dict.items():
-            if qbo_name.lower() == search_name: return qbo_id
-            
-        # 2. Partial match
-        for qbo_name, qbo_id in mapping_dict.items():
-            if search_name in qbo_name.lower(): return qbo_id
-            
+        # Replacements
+        replacements = { "CBD Z Card": "KZO CBD Z", "Leading Card MKT - 1238": "Leading Card - 1238" }
+        for k, v in replacements.items():
+            if k.lower() in clean_name.lower(): clean_name = v; break
+
+        search_lower = clean_name.lower()
+        # Exact & Substring
+        for name, qbo_id in mapping_dict.items():
+            if name.lower() == search_lower: return qbo_id
+        for name, qbo_id in mapping_dict.items():
+            if search_lower in name.lower(): return qbo_id
+        # Fuzzy
+        matches = difflib.get_close_matches(clean_name, list(mapping_dict.keys()), n=1, cutoff=0.85)
+        if matches: return mapping_dict[matches[0]]
         return None
 
-    # ====================================================
-    # 1. JOURNALS
-    # ====================================================
-    def push_journal(self, journal_no: str, group: pd.DataFrame):
-        """Creates a Journal Entry in QBO."""
+    # --- UPDATED: DUPLICATE CHECKER ---
+    def get_existing_duplicates(self, entity_type: str, doc_nums: list) -> set:
+        """
+        Queries QBO to see which IDs already exist.
+        - For Journal/Expense: Checks 'DocNumber'.
+        - For Transfer: Checks if 'PrivateNote' CONTAINS the Ref No.
+        """
+        if not doc_nums: return set()
+        existing = set()
+        clean_docs = list(set([str(d).strip() for d in doc_nums if str(d).strip()]))
         
-        # Determine Header Info from First Row
-        first_row = group.iloc[0]
-        currency_code = str(first_row.get('Currency Code', 'USD'))
-        txn_date = _parse_date_yyyy_mm_dd(first_row.get('Date'))
-        private_note = str(first_row.get('Memo', ''))
+        # ---------------------------------------------------------
+        # CASE A: Journals & Expenses (Check DocNumber)
+        # ---------------------------------------------------------
+        if entity_type in ["JournalEntry", "Purchase"]:
+            chunk_size = 50 
+            for i in range(0, len(clean_docs), chunk_size):
+                chunk = clean_docs[i:i+chunk_size]
+                safe_chunk = [d.replace("'", "\\'") for d in chunk]
+                formatted_list = "', '".join(safe_chunk)
+                
+                query = f"SELECT DocNumber FROM {entity_type} WHERE DocNumber IN ('{formatted_list}')"
+                try:
+                    results = self.client.query(query)
+                    for item in results:
+                        existing.add(item.get("DocNumber"))
+                except Exception as e:
+                    logger.error(f"⚠️ Failed duplicate check {entity_type}: {e}")
 
+        # ---------------------------------------------------------
+        # CASE B: Transfers (Check PrivateNote)
+        # ---------------------------------------------------------
+        elif entity_type == "Transfer":
+            # QBO doesn't support "PrivateNote IN (...)" efficiently.
+            # We must fetch recent transfers and check Python-side.
+            # Fetching last 1000 transfers (or filter by date if you pass date range)
+            try:
+                # Optimized: We only need PrivateNote
+                query = "SELECT PrivateNote FROM Transfer ORDERBY TxnDate DESC MAXRESULTS 500"
+                results = self.client.query(query)
+                
+                # Check if any of our clean_docs exist inside the PrivateNotes
+                qbo_notes = [str(item.get("PrivateNote", "")) for item in results]
+                
+                for doc_ref in clean_docs:
+                    # If the Doc Ref is found inside ANY existing PrivateNote
+                    if any(doc_ref in note for note in qbo_notes):
+                        existing.add(doc_ref)
+                        
+            except Exception as e:
+                logger.error(f"⚠️ Failed duplicate check Transfer: {e}")
+
+        return existing
+
+    def push_journal(self, journal_no: str, group: pd.DataFrame):
+        first_row = group.iloc[0]
         line_items = []
-        
         for _, row in group.iterrows():
             amt = _parse_amount(row['Amount'])
-            
-            # --- Map IDs ---
             acc_id = self.find_id('accounts', row['Account'])
-            loc_id = self.find_id('locations', row.get('Location'))
-            class_id = self.find_id('classes', row.get('Class'))
+            if not acc_id: raise ValueError(f"Account '{row['Account']}' not found.")
+            
+            entity_ref = None
+            if row.get('Name'):
+                ven_id = self.find_id('vendors', row['Name'])
+                if ven_id: entity_ref = {"Type": "Vendor", "EntityRef": {"value": ven_id}}
 
-            if not acc_id: 
-                raise ValueError(f"Account '{row['Account']}' not found in QBO Mappings.")
+            line_detail = {
+                "PostingType": "Debit" if amt > 0 else "Credit",
+                "AccountRef": {"value": acc_id},
+                "DepartmentRef": {"value": self.find_id('locations', row.get('Location'))},
+                "ClassRef": {"value": self.find_id('classes', row.get('Class'))}
+            }
+            if entity_ref: line_detail["Entity"] = entity_ref
 
-            # --- Construct Line Item ---
-            line_item = {
-                "Description": str(row.get('Memo')),
+            line_items.append({
+                "Description": str(row.get('Memo') or ""),
                 "Amount": abs(amt),
                 "DetailType": "JournalEntryLineDetail",
-                "JournalEntryLineDetail": {
-                    "PostingType": "Debit" if amt > 0 else "Credit",
-                    "AccountRef": {"value": acc_id},
-                }
-            }
-            
-            if loc_id:
-                line_item["JournalEntryLineDetail"]["DepartmentRef"] = {"value": loc_id}
-            if class_id:
-                line_item["JournalEntryLineDetail"]["ClassRef"] = {"value": class_id}
+                "JournalEntryLineDetail": line_detail
+            })
 
-            line_items.append(line_item)
-
-        # --- Construct Payload ---
         payload = {
             "Line": line_items,
             "DocNumber": str(journal_no),
-            "TxnDate": txn_date,
-            "PrivateNote": private_note,
-            "CurrencyRef": {"value": currency_code}
+            "TxnDate": _parse_date_yyyy_mm_dd(first_row.get('Date')),
+            "PrivateNote": str(first_row.get('Memo', '')),
+            "CurrencyRef": {"value": str(first_row.get('Currency Code', 'USD'))}
         }
-        
-        # EXECUTE POST
-        # print(payload)
-        # return
-        return self.client.post("/v3/company/" + self.client.cfg.realm_id + "/journalentry", payload)
-# ====================================================
-    # 2. EXPENSES (API: Purchase)
-    # ====================================================
+        # return self.client.post(f"/v3/company/{self.client.realm_id}/journalentry", payload)
+
     def push_expense(self, exp_ref_no: str, row: pd.Series):
-        """Create an Expense (Purchase) in QBO."""
-
-        txn_date = _parse_date_yyyy_mm_dd(row.get("Payment Date"))
-        amount = abs(_parse_amount(row.get("Expense Line Amount")))
+        pay_acc_id = self.find_id("accounts", row.get("Account (Cr)"))
+        exp_acc_id = self.find_id("accounts", row.get("Expense Account (Dr)"))
         
-        currency_code = str(row.get("Currency", "USD")).strip() or "USD"
-        memo = str(row.get("Memo") or row.get("Expense Description") or "").strip()
-
-        # --- 1. Map Accounts ---
-        pay_account_name = row.get("Account (Cr)")
-        pay_account_id = self.find_id("accounts", pay_account_name)
-        if not pay_account_id:
-            raise ValueError(f"Payment Account (Cr) not found: '{pay_account_name}'")
-
-        exp_account_name = row.get("Expense Account (Dr)")
-        exp_account_id = self.find_id("accounts", exp_account_name)
-        if not exp_account_id:
-            raise ValueError(f"Expense Account (Dr) not found: '{exp_account_name}'")
-            
-        if pay_account_id == exp_account_id:
-            raise ValueError(f"Invalid Expense: Payment Account and Expense Category are identical (ID: {pay_account_id}).")
-
-        loc_id = self.find_id("locations", row.get("Location"))
+        if not pay_acc_id: raise ValueError(f"Payment Account '{row.get('Account (Cr)')}' missing.")
+        if not exp_acc_id: raise ValueError(f"Expense Account '{row.get('Expense Account (Dr)')}' missing.")
         
-        # --- 2. HARDCODED PAYEE: "Dummy" ---
-        # We explicitly look for "Dummy" in the vendors list.
-        # --- 4. Build Payload ---
-        # FIX: DepartmentRef is NOT allowed inside AccountBasedExpenseLineDetail for Purchases.
-        # 1. Build the Detail Object (Where AccountRef BELONGS)
-        line_detail = {
-            "AccountRef": {"value": exp_account_id}  # <--- Correct location
-        }
-        
-        # 2. Build the Line Item (Remove AccountRef from here)
-        line = {
-            "DetailType": "AccountBasedExpenseLineDetail",
-            "Amount": amount,
-            "AccountBasedExpenseLineDetail": line_detail,
-            "Description": memo
-            # REMOVED: "AccountRef" (Invalid at this level)
-        }
+        payee = str(row.get("Payee (Dummy)") or "Dummy")
+        vendor_id = self.find_id("vendors", payee)
+        entity_ref = {'value': vendor_id, 'name': payee, 'type': 'Vendor'} if vendor_id else {}
 
-        # 3. Build the Payload (Remove PaymentMethodRef)
         payload = {
-            "AccountRef": {"value": pay_account_id},
-            "PaymentMethodRef": {"value": "1"},  # Placeholder if needed
+            "AccountRef": {"value": pay_acc_id},
             "PaymentType": "Cash",
-            "EntityRef": {'value': '1', 'name': 'Dummy', 'type': 'Vendor'},
+            "EntityRef": entity_ref,
             "DocNumber": str(exp_ref_no),
-            "TxnDate": txn_date,
-            "CurrencyRef": {"value": currency_code},
-            "DepartmentRef": {"value": loc_id} if loc_id else None,
-            "PrivateNote": memo,
-            "Line": [line]
-            # REMOVED: "PaymentMethodRef" (Invalid for Purchase objects)
+            "TxnDate": _parse_date_yyyy_mm_dd(row.get("Payment Date")),
+            "CurrencyRef": {"value": str(row.get("Currency", "USD"))},
+            "DepartmentRef": {"value": self.find_id('locations', row.get('Location'))},
+            "Line": [{
+                "DetailType": "AccountBasedExpenseLineDetail",
+                "Amount": abs(_parse_amount(row.get("Expense Line Amount"))),
+                "AccountBasedExpenseLineDetail": {
+                    "AccountRef": {"value": exp_acc_id},
+                    "ClassRef": {"value": self.find_id('classes', row.get('Class'))}
+                },
+                "Description": str(row.get("Memo") or "")
+            }]
         }
+        # return self.client.post(f"/v3/company/{self.client.realm_id}/purchase", payload)
 
-        return self.client.post(f"/v3/company/{self.client.cfg.realm_id}/purchase", payload)
-    
-    # ====================================================
-    # 3. TRANSFERS
-    # ====================================================
     def push_transfer(self, row: pd.Series):
-        """Create a Transfer in QBO."""
+        from_id = self.find_id("accounts", row.get("Transfer Funds From"))
+        to_id = self.find_id("accounts", row.get("Transfer Funds To"))
         
-        ref_no = str(row.get("Ref No", "")).strip()
-        txn_date = _parse_date_yyyy_mm_dd(row.get("Date"))
-        currency_code = str(row.get("Currency", "USD")).strip()
-        memo = str(row.get("Memo", "")).strip()
-        amt = _parse_amount(row.get("Transfer Amount"))
-
-        from_name = row.get("Transfer Funds From")
-        to_name = row.get("Transfer Funds To")
-
-        from_id = self.find_id("accounts", from_name)
-        to_id = self.find_id("accounts", to_name)
-
-        if not from_id:
-            raise ValueError(f"From account not found: '{from_name}'")
-        if not to_id:
-            raise ValueError(f"To account not found: '{to_name}'")
-
-        # --- NEW CHECK: Prevent Self-Transfer ---
-        # This is what caused your 400 Bad Request error
-        if from_id == to_id:
-            raise ValueError(f"Invalid Transfer: 'From' and 'To' accounts are identical (ID: {from_id}). QBO does not allow self-transfers.")
+        if not from_id or not to_id: raise ValueError("Source or Destination Account missing.")
+        
+        # Note: We put Ref No in PrivateNote because QBO Transfer doesn't support DocNumber well
+        ref_no = str(row.get("Ref No", ""))
+        memo = str(row.get("Memo", ""))
+        full_memo = f"{ref_no} - {memo}"
 
         payload = {
-            "TxnDate": txn_date,
-            "Amount": abs(amt),
+            "TxnDate": _parse_date_yyyy_mm_dd(row.get("Date")),
+            "Amount": abs(_parse_amount(row.get("Transfer Amount"))),
             "FromAccountRef": {"value": from_id},
             "ToAccountRef": {"value": to_id},
-            "PrivateNote": memo,
-            "CurrencyRef": {"value": currency_code},
-            "DocNumber": ref_no, 
+            "PrivateNote": full_memo 
         }
-
-        return self.client.post(f"/v3/company/{self.client.cfg.realm_id}/transfer", payload)
+        # return self.client.post(f"/v3/company/{self.client.realm_id}/transfer", payload)

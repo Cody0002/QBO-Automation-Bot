@@ -1,8 +1,0 @@
-Flask==3.1.2
-gspread==6.2.1
-numpy==2.4.0
-pandas==2.3.3
-pip_system_certs==5.3
-protobuf==6.33.2
-python-dotenv==1.2.1
-Requests==2.32.5

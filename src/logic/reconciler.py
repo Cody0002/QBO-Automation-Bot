@@ -1,8 +1,7 @@
+# src/logic/reconciler.py
 from __future__ import annotations
 import pandas as pd
-import numpy as np
 import calendar
-from datetime import datetime
 from src.connectors.qbo_client import QBOClient
 from src.utils.logger import setup_logger
 
@@ -13,243 +12,162 @@ class Reconciler:
         self.client = qbo_client
 
     def _get_month_range(self, date_str: str) -> tuple[str, str]:
-        """
-        Input: "2025-10-10"
-        Output: ("2025-10-01", "2025-10-31")
-        """
         try:
             dt = pd.to_datetime(date_str)
-            year, month = dt.year, dt.month
-            
-            # Get last day of month
-            _, last_day = calendar.monthrange(year, month)
-            
-            start_date = f"{year}-{month:02d}-01"
-            end_date = f"{year}-{month:02d}-{last_day}"
-            return start_date, end_date
-        except Exception as e:
-            logger.error(f"Error parsing date '{date_str}': {e}")
+            _, last_day = calendar.monthrange(dt.year, dt.month)
+            return f"{dt.year}-{dt.month:02d}-01", f"{dt.year}-{dt.month:02d}-{last_day}"
+        except:
             return None, None
 
-    def _fetch_qbo_batch_by_date(self, entity: str, start_date: str, end_date: str) -> dict:
+    def _fetch_qbo_data(self, entity: str, start_date: str, end_date: str) -> tuple[dict, dict]:
         """
-        Fetches records by TxnDate range.
+        Fetches records and maps them in TWO ways:
+        1. By ID (primary)
+        2. By DocNumber (fallback)
         """
-        logger.info(f"   🔍 Querying QBO for {entity} from {start_date} to {end_date}...")
-        
-        # Query by Date Range
-        query = f"SELECT * FROM {entity} WHERE TxnDate >= '{start_date}' AND TxnDate <= '{end_date}'"
-        
+        logger.info(f"   🔍 Querying QBO {entity} [{start_date} to {end_date}]...")
+        query = f"SELECT * FROM {entity} WHERE TxnDate >= '{start_date}' AND TxnDate <= '{end_date}' MAXRESULTS 1000"
         results = self.client.query(query)
         
-        lookup = {}
+        map_id = {}
+        map_doc = {}
+        
         for item in results:
+            # Map by ID
+            if "Id" in item:
+                map_id[str(item["Id"])] = item
+            
+            # Map by DocNumber (if exists)
             doc_num = item.get("DocNumber")
             if doc_num:
-                lookup[doc_num] = item
-        
-        logger.info(f"      ✅ Found {len(lookup)} records in QBO.")
-        return lookup
-    
-    def _fetch_transfer_batch_by_date(self, entity: str, start_date: str, end_date: str) -> list:
-            """
-            Fetches Transfers by TxnDate range and returns a list of results.
-            """
-            logger.info(f"   🔍 Querying QBO for {entity} from {start_date} to {end_date}...")
-            
-            # Query lấy tất cả Transfer trong tháng
-            query = f"SELECT * FROM {entity} WHERE TxnDate >= '{start_date}' AND TxnDate <= '{end_date}'"
-            
-            # Kết quả trả về từ QBOClient là một list các dictionary
-            results = self.client.query(query)
-            
-            logger.info(f"      ✅ Found {len(results)} records in QBO.")
-            return results
-    
-    def _compare_values(self, sheet_val, qbo_val, tolerance=0.01) -> bool:
-        """Helper to compare floats with tolerance."""
-        try:
-            v1 = float(sheet_val or 0)
-            v2 = float(qbo_val or 0)
-            return abs(v1 - v2) < tolerance
-        except:
-            return False
+                map_doc[str(doc_num)] = item
+                
+        return map_id, map_doc
 
-    def _check_mismatch(self, errors: list, field_name: str, sheet_val: any, qbo_val: any, is_float=False):
+    def _fetch_transfers_list(self, start_date: str, end_date: str) -> list:
+        logger.info(f"   🔍 Querying QBO Transfers [{start_date} to {end_date}]...")
+        query = f"SELECT * FROM Transfer WHERE TxnDate >= '{start_date}' AND TxnDate <= '{end_date}' MAXRESULTS 1000"
+        return self.client.query(query)
+
+    def _check_mismatch(self, errors: list, field: str, sheet_val, qbo_val, is_float=False):
+        try:
             if is_float:
-                if not self._compare_values(sheet_val, qbo_val):
-                    try: s_fmt = f"{float(sheet_val):.2f}"
-                    except: s_fmt = str(sheet_val)
-                    try: q_fmt = f"{float(qbo_val):.2f}"
-                    except: q_fmt = str(qbo_val)
-                    errors.append(f"{field_name} Mismatch (Sheet: {s_fmt} != QBO: {q_fmt})")
+                v1 = float(sheet_val or 0)
+                v2 = float(qbo_val or 0)
+                if abs(v1 - v2) > 0.01:
+                    errors.append(f"{field}: {v1:,.2f} != {v2:,.2f}")
             else:
                 s_str = str(sheet_val or "").strip().lower()
                 q_str = str(qbo_val or "").strip().lower()
-                
-                if not s_str and not q_str:
-                    return
+                if s_str == q_str: return
+                if q_str.endswith(":" + s_str): return
+                if not s_str and not q_str: return
+                errors.append(f"{field}: '{sheet_val}' != '{qbo_val}'")
+        except Exception as e:
+            errors.append(f"{field} Err: {e}")
 
-                # --- SMART NAME MATCHING ---
-                # 1. Direct match
-                if s_str == q_str:
-                    return
-                
-                # 2. Check if Sheet Name is the leaf of a QBO hierarchical name 
-                # (e.g., 'Payment Gateway - PH' matches 'Payment Gateways:Payment Gateway - PH')
-                if q_str.endswith(":" + s_str):
-                    return
-                
-                # If neither match, record error
-                errors.append(f"{field_name} Mismatch (Sheet: '{sheet_val}' != QBO: '{qbo_val}')")
-
+    # --- 1. JOURNALS ---
     def reconcile_journals(self, df: pd.DataFrame, month_str: str) -> list[dict]:
-        """Compares Sheet Journals vs QBO JournalEntries (Filtered by Month)."""
         if df.empty or "Journal No" not in df.columns: return []
+        start, end = self._get_month_range(month_str)
+        if not start: return []
 
-        # Calculate Dates
-        start_date, end_date = self._get_month_range(month_str)
-        if not start_date: return []
-
-        # Fetch Data for that Month
-        qbo_map = self._fetch_qbo_batch_by_date("JournalEntry", start_date, end_date)
-        
+        map_id, map_doc = self._fetch_qbo_data("JournalEntry", start, end)
         updates = []
-        grouped = df.groupby("Journal No")
-        
-        for jv_no, group in grouped:
-            qbo_record = qbo_map.get(str(jv_no)) # Ensure string key
-            errors = []
+
+        # Group by Journal No
+        for jv_no, group in df.groupby("Journal No"):
+            row = group.iloc[0]
             
+            # A. Try ID Match (Best)
+            qbo_record = None
+            if "QBO ID" in row and pd.notna(row["QBO ID"]) and str(row["QBO ID"]).strip():
+                qbo_record = map_id.get(str(row["QBO ID"]).strip())
+            
+            # B. Fallback to DocNumber
             if not qbo_record:
-                status_msg = "❌ Missing in QBO"
+                qbo_record = map_doc.get(str(jv_no).strip())
+
+            errors = []
+            if not qbo_record:
+                status = "❌ Not found in QBO"
             else:
-                first_row = group.iloc[0]
-                sheet_date = pd.to_datetime(first_row.get("Date")).strftime("%Y-%m-%d")
-                sheet_memo = first_row.get("Memo", "")
-                sheet_curr = first_row.get("Currency Code", "USD")
-                sheet_debits = group[group["Amount"] > 0]["Amount"].sum()
-
-                qbo_date = qbo_record.get("TxnDate", "")
-                qbo_memo = qbo_record.get("PrivateNote", "")
-                qbo_amt = qbo_record.get("TotalAmt", 0)
-                qbo_curr = qbo_record.get("CurrencyRef", {}).get("value", "USD")
-
-                self._check_mismatch(errors, "Date", sheet_date, qbo_date)
-                self._check_mismatch(errors, "Amount", sheet_debits, qbo_amt, is_float=True)
-                self._check_mismatch(errors, "Memo", sheet_memo, qbo_memo)
-                self._check_mismatch(errors, "Currency", sheet_curr, qbo_curr)
-
-                if not errors:
-                    status_msg = "✅ Matched"
-                else:
-                    status_msg = "⚠️ " + "; ".join(errors)
+                sheet_amt = group.loc[group["Amount"] > 0, "Amount"].sum()
+                self._check_mismatch(errors, "Date", pd.to_datetime(row["Date"]).strftime("%Y-%m-%d"), qbo_record.get("TxnDate"))
+                self._check_mismatch(errors, "Total", sheet_amt, qbo_record.get("TotalAmt"), is_float=True)
+                self._check_mismatch(errors, "Memo", row.get("Memo"), qbo_record.get("PrivateNote"))
+                status = "✅ Matched" if not errors else "⚠️ " + "; ".join(errors)
 
             for idx in group.index:
-                updates.append({"row_idx": idx, "status": status_msg})
-                
+                updates.append({"row_idx": idx, "status": status})
         return updates
 
+    # --- 2. EXPENSES ---
     def reconcile_expenses(self, df: pd.DataFrame, month_str: str) -> list[dict]:
-        """Compares Sheet Expenses vs QBO Purchases (Filtered by Month)."""
         if df.empty or "Exp Ref. No" not in df.columns: return []
+        start, end = self._get_month_range(month_str)
+        if not start: return []
 
-        start_date, end_date = self._get_month_range(month_str)
-        if not start_date: return []
-
-        qbo_map = self._fetch_qbo_batch_by_date("Purchase", start_date, end_date)
-        
+        map_id, map_doc = self._fetch_qbo_data("Purchase", start, end)
         updates = []
+
         for idx, row in df.iterrows():
-            ref_no = str(row["Exp Ref. No"])
-            qbo_record = qbo_map.get(ref_no)
-            errors = []
-            
+            # A. Try ID Match
+            qbo_record = None
+            if "QBO ID" in row and pd.notna(row["QBO ID"]) and str(row["QBO ID"]).strip():
+                qbo_record = map_id.get(str(row["QBO ID"]).strip())
+
+            # B. Fallback to DocNumber
             if not qbo_record:
-                status_msg = "❌ Missing in QBO"
+                ref_no = str(row.get("Exp Ref. No", "")).strip()
+                qbo_record = map_doc.get(ref_no)
+
+            errors = []
+            if not qbo_record:
+                status = "❌ Not found in QBO"
             else:
-                sheet_date = pd.to_datetime(row.get("Payment Date")).strftime("%Y-%m-%d")
                 sheet_amt = abs(float(row.get("Expense Line Amount", 0)))
-                sheet_memo = row.get("Memo", "")
-                sheet_curr = row.get("Currency", "USD")
-                sheet_acct_cr = row.get("Account (Cr)", "")
-                sheet_acct_dr = row.get("Expense Account (Dr)", "")
-
-                qbo_date = qbo_record.get("TxnDate", "")
-                qbo_amt = float(qbo_record.get("TotalAmt", 0))
-                qbo_memo = qbo_record.get("PrivateNote", "")
-                qbo_curr = qbo_record.get("CurrencyRef", {}).get("value", "USD")
-                qbo_acct_cr = qbo_record.get("AccountRef", {}).get("name", "")
-                
-                qbo_lines = qbo_record.get("Line", [])
-                qbo_acct_dr = ""
-                if qbo_lines:
-                    detail = qbo_lines[0].get("AccountBasedExpenseLineDetail", {})
-                    qbo_acct_dr = detail.get("AccountRef", {}).get("name", "")
-
-                self._check_mismatch(errors, "Date", sheet_date, qbo_date)
-                self._check_mismatch(errors, "Amount", sheet_amt, qbo_amt, is_float=True)
-                self._check_mismatch(errors, "Memo", sheet_memo, qbo_memo)
-                self._check_mismatch(errors, "Currency", sheet_curr, qbo_curr)
-                self._check_mismatch(errors, "Pay Acct", sheet_acct_cr, qbo_acct_cr)
-                self._check_mismatch(errors, "Exp Acct", sheet_acct_dr, qbo_acct_dr)
-
-                if not errors:
-                    status_msg = "✅ Matched"
-                else:
-                    status_msg = "⚠️ " + "; ".join(errors)
-
-            updates.append({"row_idx": idx, "status": status_msg})
+                self._check_mismatch(errors, "Date", pd.to_datetime(row["Payment Date"]).strftime("%Y-%m-%d"), qbo_record.get("TxnDate"))
+                self._check_mismatch(errors, "Amount", sheet_amt, qbo_record.get("TotalAmt"), is_float=True)
+                status = "✅ Matched" if not errors else "⚠️ " + "; ".join(errors)
             
+            updates.append({"row_idx": idx, "status": status})
         return updates
 
+    # --- 3. TRANSFERS ---
     def reconcile_transfers(self, df: pd.DataFrame, month_str: str) -> list[dict]:
-        if df.empty or "Ref No" not in df.columns: 
-            return []
+        if df.empty or "Ref No" not in df.columns: return []
+        start, end = self._get_month_range(month_str)
+        if not start: return []
 
-        start_date, end_date = self._get_month_range(month_str)
-        if not start_date: 
-            return []
-
-        # 1. Fetch dữ liệu
-        qbo_results = self._fetch_transfer_batch_by_date("Transfer", start_date, end_date)
+        # Transfers usually don't have DocNumber, so we fetch list
+        qbo_list = self._fetch_transfers_list(start, end)
         
-        # 2. Xử lý DataFrame (Dùng logic này để tránh lỗi KeyError khi QBO rỗng)
-        if qbo_results:
-            qbo_df = pd.json_normalize(qbo_results)
-        else:
-            # Nếu rỗng, tạo DF có cột để không bị crash khi gọi .str.contains
-            qbo_df = pd.DataFrame(columns=['PrivateNote', 'Amount', 'TxnDate', 'CurrencyRef.value'])
+        # Create an ID Map for Transfers too
+        map_id = {str(item["Id"]): item for item in qbo_list if "Id" in item}
 
-        qbo_df["PrivateNote"] = qbo_df["PrivateNote"].str.replace("PHH", "PH")
         updates = []
+
         for idx, row in df.iterrows():
-            ref_no = str(row["Ref No"]).strip()
+            qbo_record = None
             
-            # 3. qbo_match sẽ check ở đây
-            # Nếu qbo_df rỗng, qbo_match sẽ tự động rỗng -> status_msg = "❌ Missing"
-            qbo_match = qbo_df[qbo_df['PrivateNote'].str.contains(ref_no, na=False, case=False)]
+            # A. Try ID Match
+            if "QBO ID" in row and pd.notna(row["QBO ID"]) and str(row["QBO ID"]).strip():
+                qbo_record = map_id.get(str(row["QBO ID"]).strip())
             
+            # B. Fallback to PrivateNote Logic
+            if not qbo_record:
+                ref_no = str(row.get("Ref No", "")).strip()
+                qbo_record = next((item for item in qbo_list if ref_no in item.get("PrivateNote", "")), None)
+
             errors = []
-            if qbo_match.empty:
-                status_msg = "❌ Missing in QBO"
+            if not qbo_record:
+                status = "❌ Not found in QBO"
             else:
-                qbo_record = qbo_match.iloc[0]
-                
-                # --- Thực hiện so sánh như bình thường ---
-                sheet_date = pd.to_datetime(row.get("Date")).strftime("%Y-%m-%d")
                 sheet_amt = abs(float(row.get("Transfer Amount", 0)))
-                
-                # QBO data (lấy từ qbo_record đã flatten)
-                qbo_date = qbo_record.get("TxnDate", "")
-                qbo_amt = float(qbo_record.get("Amount", 0))
-                
-                self._check_mismatch(errors, "Date", sheet_date, qbo_date)
-                self._check_mismatch(errors, "Amount", sheet_amt, qbo_amt, is_float=True)
-                # ... thêm các check khác của bạn ...
+                self._check_mismatch(errors, "Date", pd.to_datetime(row["Date"]).strftime("%Y-%m-%d"), qbo_record.get("TxnDate"))
+                self._check_mismatch(errors, "Amount", sheet_amt, qbo_record.get("Amount"), is_float=True)
+                status = "✅ Matched" if not errors else "⚠️ " + "; ".join(errors)
 
-                status_msg = "✅ Matched" if not errors else "⚠️ " + "; ".join(errors)
-
-            updates.append({"row_idx": idx, "status": status_msg})
-            
+            updates.append({"row_idx": idx, "status": status})
         return updates

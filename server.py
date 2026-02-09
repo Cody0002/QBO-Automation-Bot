@@ -9,11 +9,15 @@ app = Flask(__name__)
 SECRET_TOKEN = "your_secret_password_123" 
 # ---------------------
 
-def run_script_in_background(script_name):
-    """Runs a Python script independently."""
+def run_script_in_background(script_name, target_client=None):
+    """Runs a Python script, optionally filtering by client."""
+    cmd = [sys.executable, script_name]
+    if target_client:
+        cmd.extend(["--client", target_client])  # Pass client name as argument
+        
     try:
-        print(f"   ▶️  Starting {script_name}...")
-        subprocess.Popen([sys.executable, script_name]) 
+        print(f"   ▶️  Starting {script_name} for '{target_client or 'ALL'}'...")
+        subprocess.Popen(cmd) 
     except Exception as e:
         print(f"   ❌ Error running {script_name}: {e}")
 
@@ -28,27 +32,28 @@ def webhook_listener():
     # 2. Parse Data
     data = request.json
     event_type = data.get('event')
-    country = data.get('country', 'Unknown')
-    
-    print(f"\n[🔔] Incoming Webhook | Event: {event_type} | Country: {country}")
+    client_name = data.get('country') # In your AppScript, you sent 'country' as Client Name (Row 1)
+
+    print(f"\n[🔔] Webhook: {event_type} | Target: {client_name}")
 
     # 3. Handle Events
     
     # --- CASE A: TRANSFORM / INGESTION ---
     if event_type == 'pipeline_trigger':
-        thread = threading.Thread(target=run_script_in_background, args=("run_ingestion.py",))
+        # Pass the client name to the function
+        thread = threading.Thread(target=run_script_in_background, args=("run_ingestion.py", client_name))
         thread.start()
-        return jsonify({"status": "success", "message": "Ingestion started"}), 200
+        return jsonify({"status": "success", "message": f"Ingestion started for {client_name}"}), 200
 
     # --- CASE B: SYNCING ---
     elif event_type == 'sync_trigger':
-        thread = threading.Thread(target=run_script_in_background, args=("run_syncing.py",))
+        thread = threading.Thread(target=run_script_in_background, args=("run_syncing.py", client_name))
         thread.start()
         return jsonify({"status": "success", "message": "Syncing started"}), 200
 
     # --- CASE C: RECONCILIATION ---
     elif event_type == 'reconcile_trigger':
-        thread = threading.Thread(target=run_script_in_background, args=("run_reconciliation.py",))
+        thread = threading.Thread(target=run_script_in_background, args=("run_reconciliation.py", client_name))
         thread.start()
         return jsonify({"status": "success", "message": "Reconciliation started"}), 200
 

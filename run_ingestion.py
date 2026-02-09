@@ -11,9 +11,9 @@ except ImportError:
 from dotenv import load_dotenv
 load_dotenv("config/secrets.env")
 
-import os
+import calendar
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Tuple, List, Dict
 import pandas as pd
 from config import settings
 from src.connectors.gsheets_client import GSheetsClient
@@ -21,125 +21,134 @@ from src.connectors.qbo_client import QBOClient
 from src.logic.syncing import QBOSync
 from src.logic.transformer import transform_raw
 from src.utils.logger import setup_logger
-import calendar # Add this to your imports
 
 logger = setup_logger("ingestion")
 
+# ==========================================
+# 1. HELPER FUNCTIONS
+# ==========================================
+
 def get_month_date_range(month_str: str) -> Tuple[datetime, datetime]:
-    """
-    Converts 'Oct 2025', '2025-10-01', etc. into Start and End datetime objects.
-    Returns (None, None) if invalid.
-    """
+    """Converts 'Oct 2025' into Start and End datetime objects."""
     try:
-        # Parse the string to a date (defaults to 1st of month)
         dt = pd.to_datetime(month_str)
-        
-        # Start Date = 1st of that month
         start_date = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        
-        # End Date = Last day of that month
         _, last_day = calendar.monthrange(start_date.year, start_date.month)
         end_date = start_date.replace(day=last_day, hour=23, minute=59, second=59, microsecond=999999)
-        
         return start_date, end_date
     except Exception:
         return None, None
 
 def _now_iso_local() -> str:
+    """Returns current timestamp string."""
     now = datetime.now().astimezone()
-    z = now.strftime("%z") 
-    try:
-        offset_hour = int(z[:3]) 
-        gmt_str = f"GMT{offset_hour:+}" 
-    except:
-        gmt_str = "GMT"
-    return now.strftime(f"%Y-%m-%d %H:%M:%S ({gmt_str})")
+    return now.strftime(f"%Y-%m-%d %H:%M:%S")
 
 def _batch_update_control(gs, sheet_id, tab_name, row_num, columns, updates_dict):
+    """Updates specific columns for a row in the Control Sheet."""
     headers = list(columns)
+    batch_data = []
     for col_name, val in updates_dict.items():
         if col_name in headers:
             col_idx = headers.index(col_name) + 1
-            gs.update_cell(sheet_id, tab_name, row_num, col_idx, str(val))
+            batch_data.append({'row': row_num, 'col': col_idx, 'val': str(val)})
+    if batch_data:
+        gs.batch_update_cells(sheet_id, tab_name, batch_data)
 
 def format_month_name(date_str: str) -> str:
     if not date_str: return ""
     try:
-        dt = pd.to_datetime(date_str)
-        return dt.strftime("%b %y")
-    except Exception:
+        return pd.to_datetime(date_str).strftime("%b %y")
+    except:
         return date_str
 
 def get_retry_context(gs: GSheetsClient, spreadsheet_url: str, tab_name: str, id_col_name: str) -> Tuple[List[int], Dict[int, str]]:
+    """Identifies rows marked as 'ERROR' in the Transform file to re-process them."""
     try:
         df = gs.read_as_df_sync(spreadsheet_url, tab_name)
         if df.empty or "Remarks" not in df.columns or id_col_name not in df.columns:
             return [], {}
         
+        # Filter for Error rows
         error_mask = df["Remarks"].astype(str).str.contains("ERROR|Unbalanced", case=False, na=False)
         bad_rows = df[error_mask]
         if bad_rows.empty: return [], {}
 
+        # Identify IDs to delete and map existing sequential IDs
         bad_ids = bad_rows[id_col_name].unique()
-        rows_to_delete_mask = df[id_col_name].isin(bad_ids)
-        target_df = df[rows_to_delete_mask].copy()
-        if target_df.empty: return [], {}
-
+        target_df = df[df[id_col_name].isin(bad_ids)].copy()
+        
         rows_to_delete = []
         existing_id_map = {}
+        
         for idx, row in target_df.iterrows():
-            rows_to_delete.append(idx + 2) 
-            if "No" in row and pd.notna(row["No"]):
-                try:
+            rows_to_delete.append(idx + 2) # +2 for header and 0-index
+            if "No" in row:
+                try: 
                     s_no = int(float(str(row["No"])))
                     existing_id_map[s_no] = str(row[id_col_name])
                 except: pass
-
+                
         return rows_to_delete, existing_id_map
     except Exception:
         return [], {}
 
-def main():
-    gs = GSheetsClient()
+# ==========================================
+# 2. CORE LOGIC (PER CLIENT)
+# ==========================================
 
-    logger.info("🔌 Connecting to QBO to fetch Account/Location Mappings...")
+def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_id: str, client_name: str):
+    """
+    Reads the specific Client's Control Sheet and processes all 'READY' jobs.
+    """
+    logger.info(f"📂 [{client_name}] Opening Control Sheet (ID: {control_sheet_id})...")
+
+    # --- A. Fetch QBO Mappings (Specific to this Client/Realm) ---
     try:
-        qbo_client = QBOClient()
-        temp_sync = QBOSync(qbo_client) 
-        qbo_mappings = temp_sync.mappings 
-        logger.info("✅ QBO Mappings fetched successfully.")
+        temp_sync = QBOSync(qbo_client)
+        qbo_mappings = temp_sync.mappings
+        logger.info(f"   ✅ [{client_name}] QBO Mappings fetched successfully.")
     except Exception as e:
-        logger.error(f"❌ Failed to fetch QBO Mappings: {e}")
+        logger.error(f"   ❌ [{client_name}] Failed to fetch mappings. Check Realm ID/Token. Error: {e}")
         return
 
-    if not settings.CONTROL_SHEET_ID:
-        raise ValueError("CONTROL_SHEET_ID is empty in config/secrets.env")
-
-    logger.info(f"Connecting to Control Sheet: {settings.CONTROL_TAB_NAME}")
+    # --- B. Read the Control Sheet ---
     try:
-        ctrl_df = gs.read_as_df(settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME)
+        ctrl_df = gs.read_as_df(control_sheet_id, settings.CONTROL_TAB_NAME)
     except Exception as e:
-        logger.error(f"Failed to read Control Tab: {e}")
-        raise e
+        logger.error(f"   ❌ [{client_name}] Failed to read Control Tab: {e}")
+        return
 
-    if ctrl_df.empty: return
+    if ctrl_df.empty: 
+        logger.warning(f"   ⚠️ [{client_name}] Control Sheet is empty.")
+        return
 
+    # --- Constants for this Client ---
     COL_LAST_JV = "Last Journal No"
     COL_LAST_EXP = "Last Expense No"
     COL_LAST_TR = "Last Transfer No"
     COL_QBO_JV = "QBO Journal"
     COL_QBO_EXP = "QBO Expense"
     COL_QBO_TR = "QBO Transfer"
+    def safe_int(val):
+        try: return int(float(val))
+        except: return 0
 
+    # Get the max journal number currently recorded in the sheet
+    global_last_jv = ctrl_df[COL_LAST_JV].apply(safe_int).max()
+
+    # --- C. Iterate Control Sheet Rows ---
     for i, row in ctrl_df.iterrows():
+        # 1. Check Trigger
         status_val = str(row.get(settings.CTRL_COL_ACTIVE, "")).strip()
         if status_val != 'READY': continue
 
         row_num = i + 2
-        logger.info(f"🚀 Starting Row {row_num}: Status is READY -> Setting to PROCESSING")
-        _batch_update_control(gs, settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "PROCESSING"})
+        logger.info(f"🚀 [{client_name}] Processing Row {row_num}...")
+        _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "PROCESSING"})
 
         try:
+            # 2. Extract Job Details
             country = str(row.get(settings.CTRL_COL_COUNTRY, "")).strip()
             source_url = str(row.get(settings.CTRL_COL_SOURCE_URL, "")).strip()
             transform_url = str(row.get(settings.CTRL_COL_TRANSFORM_URL, "")).strip()
@@ -147,213 +156,141 @@ def main():
             raw_month = str(row.get(settings.CTRL_COL_MONTH, "")).strip()
             month = format_month_name(raw_month)
 
-            # --- CREATE TRANSFORM FILE IF MISSING ---
+            # 3. Create/Link Transform File
             if not transform_url or len(transform_url) < 10:
-                new_title = f"{country} QBO - {month}"
-                logger.info(f"   ⚠️ No Transform File found. Creating: '{new_title}'...")
+                new_title = f"{client_name} - {country} QBO - {month}"
+                logger.info(f"   ⚠️ No Transform File. Creating: '{new_title}'...")
                 try:
                     transform_url = gs.create_spreadsheet(new_title)
-                    try:
-                        new_file_id = transform_url.split("/d/")[1].split("/")[0]
-                        logger.info("      Applying permissions...")
-                        gs.copy_permissions(source_id=settings.CONTROL_SHEET_ID, target_id=new_file_id)
-                    except Exception as pe:
-                        logger.warning(f"      ⚠️ Permission copy warning: {pe}")
-
-                    _batch_update_control(gs, settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_TRANSFORM_URL: transform_url})
-                    logger.info(f"   ✅ Created & Secured: {transform_url}")
+                    new_file_id = transform_url.split("/d/")[1].split("/")[0]
+                    # Copy permissions from the Client's Control Sheet to the new Transform File
+                    gs.copy_permissions(source_id=control_sheet_id, target_id=new_file_id)
+                    
+                    _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_TRANSFORM_URL: transform_url})
                 except Exception as e:
                     logger.error(f"   ❌ Failed to create spreadsheet: {e}")
                     raise e
             
-            # --- PREPARE COUNTERS ---
-            def get_int(val):
-                try: return int(float(val))
-                except: return 0
-
-            last_processed = get_int(row.get(settings.CTRL_COL_LAST_PROCESSED_ROW, 0))
-            sheet_last_jv = get_int(row.get(COL_LAST_JV, 0))
+            # 4. Prepare ID Counters
+            last_processed = safe_int(row.get(settings.CTRL_COL_LAST_PROCESSED_ROW, 0))
             
-            logger.info(f"   🔎 Checking QBO for latest Journal Number (Prefix: KZO-JV)...")
+            # Fetch latest QBO Journal No to prevent overlap
             qbo_last_jv = qbo_client.get_max_journal_number("KZO-JV")
-            final_start_jv = max(sheet_last_jv, qbo_last_jv)
+            final_start_jv = max(global_last_jv, qbo_last_jv)
             
-            last_exp = get_int(row.get(COL_LAST_EXP, 0))
-            last_tr = get_int(row.get(COL_LAST_TR, 0))
+            last_exp = safe_int(row.get(COL_LAST_EXP, 0))
+            last_tr = safe_int(row.get(COL_LAST_TR, 0))
 
             tab_prefix = f"{country} {month}"
-            tab_jv = f"{tab_prefix} - Journals"
-            tab_exp = f"{tab_prefix} - Expenses"
-            tab_tr = f"{tab_prefix} - Transfers"
+            tab_jv, tab_exp, tab_tr = f"{tab_prefix} - Journals", f"{tab_prefix} - Expenses", f"{tab_prefix} - Transfers"
         
-            # --- RETRY CONTEXT ---
+            # 5. Handle Retries (Find 'ERROR' rows in Output)
             preserved_ids = {'journals': {}, 'expenses': {}, 'transfers': {}}
             deletions = {}
 
-            jv_del, jv_ids = get_retry_context(gs, transform_url, tab_jv, "Journal No")
-            if jv_del:
-                deletions[tab_jv] = jv_del
-                preserved_ids['journals'] = jv_ids
+            # Check Journals tab
+            d_jv, ids_jv = get_retry_context(gs, transform_url, tab_jv, "Journal No")
+            if d_jv: deletions[tab_jv] = d_jv; preserved_ids['journals'] = ids_jv
 
-            exp_del, exp_ids = get_retry_context(gs, transform_url, tab_exp, "Exp Ref. No")
-            if exp_del:
-                deletions[tab_exp] = exp_del
-                preserved_ids['expenses'] = exp_ids
+            # Check Expenses tab
+            d_exp, ids_exp = get_retry_context(gs, transform_url, tab_exp, "Exp Ref. No")
+            if d_exp: deletions[tab_exp] = d_exp; preserved_ids['expenses'] = ids_exp
 
-            tr_del, tr_ids = get_retry_context(gs, transform_url, tab_tr, "Ref No")
-            if tr_del:
-                deletions[tab_tr] = tr_del
-                preserved_ids['transfers'] = tr_ids
+            # Check Transfers tab
+            d_tr, ids_tr = get_retry_context(gs, transform_url, tab_tr, "Ref No")
+            if d_tr: deletions[tab_tr] = d_tr; preserved_ids['transfers'] = ids_tr
 
-            retry_nos = list(set(list(preserved_ids['journals'].keys()) + list(preserved_ids['expenses'].keys()) + list(preserved_ids['transfers'].keys())))
+            retry_nos = list(set([k for sub in preserved_ids.values() for k in sub.keys()]))
 
-            # --- READ SOURCE & ALIGN COLUMNS ---
-            logger.info(f"[{country}] Reading Source: {raw_tab_name}")
-            try:
-                raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=3, value_render_option='UNFORMATTED_VALUE')
-                print(raw_df.head(2))
-                raw_df = raw_df.iloc[:, :25]   # keep only first 25 columns
-            # --- DEBUG STEP 1: VERIFY RAW READ ---
-                logger.info(f"DEBUG: Raw read shape: {raw_df.shape}")
-                logger.info(f"DEBUG: First 5 columns from GSheets: {raw_df.columns[:5].tolist()}")
-                logger.info(f"DEBUG: First row values: {raw_df.iloc[0].tolist()}")
-            # 1. Manually assign columns to match the list you provided for the 2026 reporting transition
-                raw_df.columns = [
-                    "CO", "COY", "Date", "Category", "Type", "Item Description", 
-                    "TrxHarsh", "Account Fr", "Account To", "Currency", "Amount Fr", 
-                    "Currency To", "Amount To", "Budget", "USD - Raw", "USD - Actual", 
-                    "USD - Loss", "USD - QBO", "Reclass", "QBO Method", 
-                    "If Journal/Expense Method", "QBO Transfer Fr", "QBO Transfer To", 
-                    "Check (Internal use)", "No"
-                ]
-
-                raw_df["CO"] = raw_df["CO"].str.replace("GRP", "GROUP").str.strip()
-                # =========================================================
-                # NEW: FILTER BY TARGET MONTH (Strict Boundary)
-                # =========================================================
-                target_start, target_end = get_month_date_range(raw_month)
-                
-                if target_start and target_end:
-                    logger.info(f"[{country}] 📅 Filtering Source Data for Month: {target_start.strftime('%Y-%m')}")
-                    
-                    # A. Robust Date Parsing (Handle Excel Serials & Strings)
-                    # We reuse the logic from your transformer to ensure 'Date' is datetime objects
-                    numeric_dates = pd.to_numeric(raw_df["Date"], errors="coerce")
-                    date_objs = pd.to_datetime(numeric_dates, origin="1899-12-30", unit="D", errors="coerce")
-                    
-                    # Fill NaTs with string parsing attempt
-                    mask_nat = date_objs.isna()
-                    if mask_nat.any():
-                        date_objs[mask_nat] = pd.to_datetime(raw_df.loc[mask_nat, "Date"], errors="coerce")
-                    
-                    raw_df["_TempDate"] = date_objs
-
-                    # B. Apply Filter
-                    # We keep rows where Date is INSIDE the range OR Date is NULL (to be safe/warn later)
-                    # But typically strict filtering is better:
-                    month_mask = (raw_df["_TempDate"] >= target_start) & (raw_df["_TempDate"] <= target_end)
-                    
-                    # Optional: Log how many rows we are dropping
-                    dropped_count = len(raw_df) - month_mask.sum()
-                    if dropped_count > 0:
-                        logger.info(f"      ✂️  Ignoring {dropped_count} rows from other months.")
-
-                    raw_df = raw_df[month_mask].copy()
-                    
-                    # Clean up temp column
-                    raw_df.drop(columns=["_TempDate"], inplace=True)
-                    
-                    if raw_df.empty:
-                        logger.warning(f"[{country}] ⚠️ No rows found for {target_start.strftime('%b %Y')} in Source File!")
-                        _batch_update_control(gs, settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "DONE (No Data)"})
-                        continue
-                else:
-                    logger.warning(f"[{country}] ⚠️ Could not parse Month '{raw_month}'. Processing ALL rows.")
-
-            # =========================================================
-            # END MONTH FILTER
-            # =========================================================
-
-                # 2. TYPE SAFETY FIX: Convert strings to numeric objects immediately
-                # We use errors='coerce' to turn text into NaN, then fillna(0) works on the resulting Series
-                for col in ["No", "USD - QBO", "Amount Fr", "Amount To"]:
-                    if col in raw_df.columns:
-                        raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0)
-
-                print(raw_df.dtypes)
-            except Exception as e:
-                logger.error(f"Failed to read Source File or align columns: {e}")
-                _batch_update_control(gs, settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "ERROR (Read Source)"})
-                continue
+            # 6. Read & Clean Source Data
+            raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=3, value_render_option='UNFORMATTED_VALUE')
             
             if raw_df.empty:
-                logger.info(f"[{country}] Raw tab empty.")
-                _batch_update_control(gs, settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "DONE"})
+                logger.info(f"   [{client_name}] Raw tab empty.")
+                _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "DONE (Empty)"})
                 continue
-
-            # 3. ROBUST FILTERING: Ensure we can handle empty cells in the Check column
-            # We force the column to string first so .str.contains works even on empty/null cells
-            raw_df = raw_df[~raw_df["Check (Internal use)"].astype(str).str.contains("exclude", na=False, case=False)].copy()
             
-            # --- DEBUG STEP 2: VERIFY 'No' COLUMN ---
-            logger.info(f"DEBUG: 'No' column stats -- Min: {raw_df['No'].min()}, Max: {raw_df['No'].max()}")
-            logger.info(f"DEBUG: 'No' column sample: {raw_df['No'].head(5).tolist()}")
-            logger.info(f"DEBUG: Value of last_processed variable: {last_processed}")
+            raw_df = raw_df.iloc[:, :25]  # Keep first 25 columns
+            
+            # Apply Standard Columns
+            raw_df.columns = [
+                "CO", "COY", "Date", "Category", "Type", "Item Description", 
+                "TrxHarsh", "Account Fr", "Account To", "Currency", "Amount Fr", 
+                "Currency To", "Amount To", "Budget", "USD - Raw", "USD - Actual", 
+                "USD - Loss", "USD - QBO", "Reclass", "QBO Method", 
+                "If Journal/Expense Method", "QBO Transfer Fr", "QBO Transfer To", 
+                "Check (Internal use)", "No"
+            ]
 
-            # Check if we are accidentally zeroing out IDs
-            zeros_count = (raw_df["No"] == 0).sum()
-            logger.info(f"DEBUG: Count of rows where 'No' became 0: {zeros_count} out of {len(raw_df)}")
-            # -------------------------------------
+            raw_df["CO"] = raw_df["CO"].astype(str).str.replace("GRP", "GROUP").str.strip()
 
-            # 4. Filter for only new or retried rows
+            # 7. Date Filtering (Strict Month Match)
+            target_start, target_end = get_month_date_range(raw_month)
+            if target_start and target_end:
+                # Robust Parse
+                raw_df["_TempDate"] = pd.to_datetime(pd.to_numeric(raw_df["Date"], errors="coerce"), origin="1899-12-30", unit="D", errors="coerce")
+                
+                # Filter
+                month_mask = (raw_df["_TempDate"] >= target_start) & (raw_df["_TempDate"] <= target_end)
+                raw_df = raw_df[month_mask].copy()
+                raw_df.drop(columns=["_TempDate"], inplace=True)
+                
+                if raw_df.empty:
+                    logger.warning(f"   [{client_name}] ⚠️ No rows found for {month} in Source.")
+                    _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "DONE (No Data)"})
+                    continue
+
+            # 8. Numeric Cleanup
+            for col in ["No", "USD - QBO", "Amount Fr", "Amount To"]:
+                if col in raw_df.columns:
+                    raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0)
+
+            # 9. Exclude Rows
+            raw_df = raw_df[~raw_df["Check (Internal use)"].astype(str).str.contains("exclude", na=False, case=False)].copy()
+
+            # 10. Select Rows to Process (New + Retry)
             new_df = raw_df[raw_df["No"] > last_processed].copy()
             retry_df = raw_df[raw_df["No"].isin(retry_nos)].copy()
             processing_df = pd.concat([new_df, retry_df]).drop_duplicates(subset=["No"])
 
-            # --- DEBUG STEP 3: VERIFY FILTERING ---
-            logger.info(f"DEBUG: Rows in new_df: {len(new_df)}")
-            logger.info(f"DEBUG: Rows in retry_df: {len(retry_df)}")
-            logger.info(f"DEBUG: Final processing_df size: {len(processing_df)}")
             if processing_df.empty:
-                logger.warning("🚨 processing_df is EMPTY! Transformer will not run.")
-            # --------------------------------------
-
-            if processing_df.empty:
-                logger.info(f"[{country}] No new rows.")
-                _batch_update_control(gs, settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(), settings.CTRL_COL_ACTIVE: "DONE"})
+                logger.info(f"   [{client_name}] No new rows to process.")
+                _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(), settings.CTRL_COL_ACTIVE: "DONE"})
                 continue
             
-            # Clean existing bad rows in Transform File
-            for tab, rows in deletions.items():
-                if rows: gs.delete_rows(transform_url, tab, rows)
+            # 11. Execute Deletions (Clean up bad rows before appending new ones)
+            for tab, rows in deletions.items(): gs.delete_rows(transform_url, tab, rows)
 
-            logger.info(f"[{country}] Transforming {len(processing_df)} rows...")
-            
-            # --- CALL TRANSFORMER ---
-            print(processing_df.dtypes)
+            logger.info(f"   [{client_name}] Transforming {len(processing_df)} rows...")
+
+            # 12. RUN TRANSFORMER
             result = transform_raw(processing_df, final_start_jv, last_exp, last_tr, qbo_mappings=qbo_mappings, existing_ids=preserved_ids)
-            print("finished transform!")
 
-            # --- CONVERT DATETIMES TO STRINGS FOR GOOGLE SHEETS ---
-            # This prevents the "Timestamp is not JSON serializable" error
-            for df_res in [result.journals, result.expenses, result.withdraw]:
-                if not df_res.empty:
-                    for col in df_res.select_dtypes(include=['datetime64', 'datetimetz']).columns:
-                        df_res[col] = df_res[col].dt.strftime('%Y-%m-%d')
+            # 13. Write Output
+            # Note: We use 'control_sheet_id' as the template source. 
+            # Assumes the Client's Control Sheet has the "Sample - Journals" etc. hidden tabs.
+            
+            def write_tab(df_out, tab_out, templ_name):
+                if not df_out.empty:
+                    # Fix dates for JSON serialization
+                    for col in df_out.select_dtypes(include=['datetime64', 'datetimetz']).columns:
+                        df_out[col] = df_out[col].dt.strftime('%Y-%m-%d')
+                    
+                    gs.append_or_create_df(
+                        transform_url, 
+                        tab_out, 
+                        df_out, 
+                        template_tab_name=templ_name, 
+                        template_spreadsheet_id=control_sheet_id
+                    )
 
-            # --- WRITE TO OUTPUT ---
-            if not result.journals.empty:
-                gs.append_or_create_df(transform_url, tab_jv, result.journals, template_tab_name="Sample - Journals", template_spreadsheet_id=settings.CONTROL_SHEET_ID)
-            
-            if not result.expenses.empty:
-                gs.append_or_create_df(transform_url, tab_exp, result.expenses, template_tab_name="Sample - Expenses", template_spreadsheet_id=settings.CONTROL_SHEET_ID)
-            
-            if not result.withdraw.empty:
-                gs.append_or_create_df(transform_url, tab_tr, result.withdraw, template_tab_name="Sample - Transfers", template_spreadsheet_id=settings.CONTROL_SHEET_ID)
+            write_tab(result.journals, tab_jv, "Sample - Journals")
+            write_tab(result.expenses, tab_exp, "Sample - Expenses")
+            write_tab(result.withdraw, tab_tr, "Sample - Transfers")
 
             gs.cleanup_default_sheet(transform_url)
 
-            # --- STATUS & UPDATE ---
+            # 14. Check Status of Output (Any errors generated by Transformer?)
             def check_status(df):
                 if df.empty: return ""
                 if "Remarks" in df.columns and df["Remarks"].astype(str).str.contains("ERROR", case=False, na=False).any(): return "ERROR"
@@ -363,6 +300,7 @@ def main():
             status_exp = check_status(result.expenses)
             status_tr = check_status(result.withdraw)
 
+            # 15. Final Updates to Control Sheet
             final_last_row = max(last_processed, result.max_row_processed) if result.max_row_processed else last_processed
 
             updates = {
@@ -377,15 +315,70 @@ def main():
             if COL_QBO_EXP in ctrl_df.columns: updates[COL_QBO_EXP] = status_exp
             if COL_QBO_TR in ctrl_df.columns: updates[COL_QBO_TR] = status_tr
             
-            _batch_update_control(gs, settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, updates)
-            logger.info(f"[{country}] Process Complete. Statuses updated.")
+            _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, updates)
+            logger.info(f"   ✅ [{client_name}] Row {row_num} Complete.")
 
         except Exception as e:
-            logger.error(f"❌ Error processing row {row_num} ({country}): {e}")
-            _batch_update_control(gs, settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "ERROR"})
+            logger.error(f"❌ [{client_name}] Error processing row {row_num}: {e}")
+            _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "ERROR"})
             continue
 
-    logger.info("Job Finished.")
+# ==========================================
+# 3. MAIN ENTRY POINT
+# ==========================================
+def main():
+    gs = GSheetsClient()
+    
+    # Initialize QBO Client with GSheets (to allow it to read/write tokens)
+    qbo_client = QBOClient(gs_client=gs)
+
+    logger.info("🌍 Reading MASTER SHEET to find active clients...")
+    
+    try:
+        master_df = gs.read_as_df(settings.MASTER_SHEET_ID, settings.MASTER_TAB_NAME)
+    except Exception as e:
+        logger.error(f"❌ Critical: Could not read Master Sheet: {e}")
+        return
+
+    if master_df.empty:
+        logger.warning("Master sheet is empty.")
+        return
+
+    # Loop through Clients
+    for i, client_row in master_df.iterrows():
+        client_name = str(client_row.get(settings.MST_COL_CLIENT, "Unknown"))
+        status = str(client_row.get(settings.MST_COL_STATUS, "")).strip()
+        
+        # Filter Active Clients
+        if status.lower() != "active":
+            continue
+
+        sheet_id = str(client_row.get(settings.MST_COL_SHEET_ID, "")).strip()
+        realm_id = str(client_row.get(settings.MST_COL_REALM_ID, "")).strip()
+
+        if not sheet_id or not realm_id:
+            logger.warning(f"⚠️ Skipping {client_name}: Missing Sheet ID or Realm ID.")
+            continue
+
+        print(f"\n" + "="*60)
+        print(f"🏢 STARTING CLIENT: {client_name}")
+        print(f"   Realm ID: {realm_id} | Sheet: {sheet_id}")
+        print(f"="*60 + "\n")
+
+        # 1. Authenticate / Switch Context
+        try:
+            qbo_client.set_company(realm_id)
+        except Exception as e:
+            logger.error(f"❌ Critical Auth Failure for {client_name}: {e}")
+            continue
+
+        # 2. Run Ingestion for this Client
+        try:
+            process_client_control_sheet(gs, qbo_client, sheet_id, client_name)
+        except Exception as e:
+            logger.error(f"❌ Critical Logic Failure for {client_name}: {e}")
+
+    logger.info("🏁 All Clients Processed.")
 
 if __name__ == "__main__":
     main()

@@ -1,16 +1,14 @@
 from __future__ import annotations
-import os
+# --- FIX 1: Load Secrets ---
 from dotenv import load_dotenv
+load_dotenv("config/secrets.env")
+# ---------------------------
 
-# --- FIX: USE WINDOWS SYSTEM CERTIFICATES ---
 try:
     import pip_system_certs.wrappers
     pip_system_certs.wrappers.wrap_requests()
 except ImportError:
     pass
-# --------------------------------------------
-
-load_dotenv("config/secrets.env")
 
 import pandas as pd
 from datetime import datetime
@@ -22,258 +20,257 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("syncing_runner")
 
-def _now_iso_local() -> str:
-    now = datetime.now().astimezone()
-    z = now.strftime("%z") 
-    try:
-        offset_hour = int(z[:3]) 
-        gmt_str = f"GMT{offset_hour:+}" 
-    except:
-        gmt_str = "GMT"
-    return now.strftime(f"%Y-%m-%d %H:%M:%S ({gmt_str})")
-
-def _batch_update_control(gs, row_num, updates):
-    """Updates the Control Sheet status."""
-    ctrl_df = gs.read_as_df(settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME)
-    headers = list(ctrl_df.columns)
+def _batch_update_control(gs, sheet_id, tab_name, row_num, columns, updates_dict):
+    headers = list(columns)
     batch_data = []
-    
-    for col_name, val in updates.items():
+    for col_name, val in updates_dict.items():
         if col_name in headers:
             col_idx = headers.index(col_name) + 1
             batch_data.append({'row': row_num, 'col': col_idx, 'val': str(val)})
-            
     if batch_data:
-        gs.batch_update_cells(settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME, batch_data)
+        gs.batch_update_cells(sheet_id, tab_name, batch_data)
 
-def format_tab_name(country, raw_date_str, suffix):
+def _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates: list):
+    """
+    Updates 'Remarks' AND 'QBO ID' columns.
+    updates = [{'row_idx': 0, 'status': 'Synced', 'qbo_id': '123'}]
+    """
+    if not updates: return
     try:
-        dt = pd.to_datetime(raw_date_str)
-        month_label = dt.strftime("%b %y")
-        return f"{country} QBO - {month_label} - {suffix}" # Matches naming convention
-    except:
-        # Fallback if date parse fails, though ingestion usually standardizes it
-        return f"{country} {raw_date_str} - {suffix}"
+        df_header = gs.read_as_df(spreadsheet_url, tab_name)
+        headers = df_header.columns.tolist()
 
-def main():
-    gs = GSheetsClient()
-    qbo_api = QBOClient()
-    
-    logger.info(f"Connecting to Control Sheet: {settings.CONTROL_TAB_NAME}")
-    try:
-        ctrl_df = gs.read_as_df(settings.CONTROL_SHEET_ID, settings.CONTROL_TAB_NAME)
+        # 1. Find or Define 'Remarks' Column
+        if "Remarks" in headers:
+            col_rem = headers.index("Remarks") + 1
+        else:
+            col_rem = len(headers) + 1
+            # Ideally we would write the header here, but batch update handles value placement
+        
+        # 2. Find or Define 'QBO ID' Column
+        # We append it at the end if it doesn't exist
+        if "QBO ID" in headers:
+            col_id = headers.index("QBO ID") + 1
+        else:
+            # If QBO ID doesn't exist, we put it after Remarks or at the very end
+            col_id = col_rem + 1 if "Remarks" not in headers else len(headers) + 1
+            # Optional: Write header if missing (gs.update_cell(..., 1, col_id, "QBO ID"))
+
+        batch_payload = []
+        for item in updates:
+            # Update Status (Remarks)
+            batch_payload.append({"row": item["row_idx"] + 2, "col": col_rem, "val": item["status"]})
+            
+            # Update QBO ID (Only if we have one)
+            if item.get("qbo_id"):
+                batch_payload.append({"row": item["row_idx"] + 2, "col": col_id, "val": str(item["qbo_id"])})
+        
+        gs.batch_update_cells(spreadsheet_url, tab_name, batch_payload)
     except Exception as e:
-        logger.error(f"Failed to read Control Tab: {e}")
+        logger.error(f"Failed to update status in sheet: {e}")
+
+def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_id: str, client_name: str):
+    logger.info(f"📂 [{client_name}] Processing Control Sheet...")
+    try:
+        ctrl_df = gs.read_as_df(control_sheet_id, settings.CONTROL_TAB_NAME)
+    except Exception as e:
+        logger.error(f"   ❌ [{client_name}] Failed to read Control Sheet: {e}")
         return
 
     if ctrl_df.empty: return
 
-    sync_engine = QBOSync(client=qbo_api)
-
-    # Define the detailed status columns
+    sync_engine = QBOSync(client=qbo_client)
+    
     COL_QBO_JV = "QBO Journal"
     COL_QBO_EXP = "QBO Expense"
     COL_QBO_TR = "QBO Transfer"
 
     for i, row in ctrl_df.iterrows():
-        # --- 1. CHECK TRIGGER CONDITION: 'Sync now' ---
-        status = str(row.get(settings.CTRL_COL_QBO_SYNC, "")).strip()
-        if status != "SYNC NOW": 
-            continue
-
+        if str(row.get(settings.CTRL_COL_QBO_SYNC, "")).strip() != "SYNC NOW": continue
+        
         row_num = i + 2
-        country = row.get(settings.CTRL_COL_COUNTRY)
+        country = str(row.get(settings.CTRL_COL_COUNTRY, "")).strip()
+        transform_url = str(row.get(settings.CTRL_COL_TRANSFORM_URL, "")).strip()
+        month_str = str(row.get(settings.CTRL_COL_MONTH, "")).strip()
         
-        # --- 2. VALIDATION GATE: Check for ERRORs in detailed columns ---
-        jv_status_curr = str(row.get(COL_QBO_JV, "")).strip().upper()
-        exp_status_curr = str(row.get(COL_QBO_EXP, "")).strip().upper()
-        tr_status_curr = str(row.get(COL_QBO_TR, "")).strip().upper()
+        if not transform_url or not month_str: continue
 
-        if "ERROR" in [jv_status_curr, exp_status_curr, tr_status_curr]:
-            logger.warning(f"🚫 BLOCKED {country}: One or more files have errors.")
-            _batch_update_control(gs, row_num, {settings.CTRL_COL_QBO_SYNC: "BLOCKED (Fix Errors)"})
-            continue
-
-        # --- 3. PROCEED IF SAFE ---
-        # Look for the TRANSFORM FILE, not the source file
-        url = row.get(settings.CTRL_COL_TRANSFORM_URL)
-        if not url:
-            logger.error(f"❌ {country}: No Transform File URL found.")
-            _batch_update_control(gs, row_num, {settings.CTRL_COL_QBO_SYNC: "ERROR: No Transform File"})
-            continue
-
-        month_str = row.get(settings.CTRL_COL_MONTH)
+        _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_QBO_SYNC: "PROCESSING"})
         
-        logger.info(f"🚀 Starting Sync for {country} (Row {row_num})")
-        _batch_update_control(gs, row_num, {settings.CTRL_COL_QBO_SYNC: "PROCESSING"})
+        has_error = False
+        jv_status, exp_status, tr_status = "Skipped", "Skipped", "Skipped"
 
-        has_global_error = False
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        sync_msg = f"Sync at {timestamp}"
+        dt_label = pd.to_datetime(month_str).strftime("%b %y")
+        tab_jv = f"{country} {dt_label} - Journals"
+        tab_exp = f"{country} {dt_label} - Expenses"
+        tab_tr = f"{country} {dt_label} - Transfers"
 
-        # Initialize status updates for this row
-        row_updates = {}
-
+        # ---------------------------------------------------------
+        # 1. SYNC JOURNALS
+        # ---------------------------------------------------------
         try:
-            # ====================================================
-            # 1. SYNC JOURNALS
-            # ====================================================
-            try:
-                # Assuming format: "PH QBO - Oct 25 - Journals"
-                # If ingestion creates "PH Oct 25 - Journals", adjust format_tab_name logic or use exact logic from ingestion
-                # Here we replicate ingestion logic: f"{country} {month} - Journals"
-                dt_label = pd.to_datetime(month_str).strftime("%b %y")
-                tab_name = f"{country} {dt_label} - {settings.OUTPUT_TAB_JOURNALS}"
-                
-                logger.info(f"   📂 Reading Journals: '{tab_name}'")
-                
-                # Check if tab exists before reading to avoid crashing
-                try:
-                    df_journals = gs.read_as_df_sync(url, tab_name)
-                except:
-                    df_journals = pd.DataFrame()
+            logger.info(f"   Using Tab: {tab_jv}")
+            try: df_jv = gs.read_as_df_sync(transform_url, tab_jv)
+            except: df_jv = pd.DataFrame()
 
-                if not df_journals.empty and "Remarks" in df_journals.columns:
-                    # Filter for rows that are NOT already synced and NOT errors
-                    to_sync = df_journals[~df_journals["Remarks"].str.contains("Sync at|ERROR", regex=True, na=False)]
+            if not df_jv.empty and "Remarks" in df_jv.columns:
+                to_sync = df_jv[df_jv["Remarks"].astype(str).str.contains("Ready to sync", case=False, na=False)]
+                
+                if to_sync.empty:
+                    jv_status = "SYNCED"
+                else:
+                    all_jv_nos = to_sync["Journal No"].unique().tolist()
+                    existing_docs = sync_engine.get_existing_duplicates("JournalEntry", all_jv_nos)
                     
-                    if not to_sync.empty:
-                        grouped = to_sync.groupby("Journal No")
-                        rem_col_idx = list(df_journals.columns).index("Remarks") + 1
+                    updates = []
+                    section_fail = False
+                    
+                    for jv_no, group in to_sync.groupby("Journal No"):
+                        if str(jv_no) in existing_docs:
+                             for idx in group.index:
+                                updates.append({"row_idx": idx, "status": "Skipped (Already in QBO)", "qbo_id": ""})
+                             continue
+
+                        try:
+                            resp = sync_engine.push_journal(jv_no, group)
+                            new_id = resp.get("JournalEntry", {}).get("Id", "")
+                            msg = f"Synced" # Cleaner message, ID goes to own column
+                        except Exception as e:
+                            msg = f"ERROR: {str(e)}"
+                            new_id = ""
+                            has_error = True
+                            section_fail = True
                         
-                        for journal_no, group_df in grouped:
-                            batch_updates = []
-                            if abs(group_df['Amount'].sum()) > 0.01:
-                                msg = f"ERROR: Unbalanced {group_df['Amount'].sum()}"
-                                for idx, _ in group_df.iterrows():
-                                    batch_updates.append({'row': idx + 2, 'col': rem_col_idx, 'val': msg})
-                                gs.batch_update_cells(url, tab_name, batch_updates)
-                                has_global_error = True # Mark partial error
-                                continue
-
-                            try:
-                                logger.info(f"   📤 Pushing Journal: {journal_no}")
-                                sync_engine.push_journal(journal_no, group_df)
-                                for idx, _ in group_df.iterrows():
-                                    batch_updates.append({'row': idx + 2, 'col': rem_col_idx, 'val': sync_msg})
-                                    
-                            except Exception as je:
-                                error_msg = f"ERROR: {str(je)}"[:500]
-                                logger.error(f"      ❌ Failed Journal {journal_no}: {error_msg}")
-                                has_global_error = True
-                                for idx, _ in group_df.iterrows():
-                                    batch_updates.append({'row': idx + 2, 'col': rem_col_idx, 'val': error_msg})
-
-                            if batch_updates:
-                                gs.batch_update_cells(url, tab_name, batch_updates)
+                        for idx in group.index:
+                            updates.append({"row_idx": idx, "status": msg, "qbo_id": new_id})
                     
-                    # If we finished processing without catastrophic failure (even if some rows failed), 
-                    # we usually mark "SYNCED" unless it was totally empty. 
-                    # User requested: "When sheets synced => write back SYNCED".
-                    # If has_global_error is True, we might want to keep it as ERROR or PARTIAL.
-                    # But if specific rows failed, the main status is usually "DONE" or "PARTIAL".
-                    # For the individual column, let's set SYNCED if at least attempting worked.
-                    row_updates[COL_QBO_JV] = "SYNCED"
-
-            except Exception as e:
-                logger.error(f"   ❌ Critical Journal Error: {e}")
-                has_global_error = True
-                row_updates[COL_QBO_JV] = "ERROR"
-
-            # ====================================================
-            # 2. SYNC EXPENSES
-            # ====================================================
-            try:
-                tab_name = f"{country} {dt_label} - {settings.OUTPUT_TAB_EXPENSES}"
-                logger.info(f"   📂 Reading Expenses: '{tab_name}'")
-                
-                try: df_expenses = gs.read_as_df_sync(url, tab_name)
-                except: df_expenses = pd.DataFrame()
-
-                if not df_expenses.empty and "Remarks" in df_expenses.columns:
-                    to_sync = df_expenses[~df_expenses["Remarks"].str.contains("Sync at|ERROR", regex=True, na=False)]
-                    rem_col_idx = list(df_expenses.columns).index("Remarks") + 1
-
-                    batch_updates = []
-                    for idx, r in to_sync.iterrows():
-                        exp_ref = str(r.get("Exp Ref. No", "")).strip()
-                        if not exp_ref: continue
-                        try:
-                            sync_engine.push_expense(exp_ref, r)
-                            batch_updates.append({'row': idx + 2, 'col': rem_col_idx, 'val': sync_msg})
-                        except Exception as ee:
-                            error_msg = f"ERROR: {str(ee)}"[:500]
-                            logger.error(f"      ❌ Failed Expense {exp_ref}: {error_msg}")
-                            batch_updates.append({'row': idx + 2, 'col': rem_col_idx, 'val': error_msg})
-                            has_global_error = True
-                    
-                    if batch_updates:
-                        gs.batch_update_cells(url, tab_name, batch_updates)
-                    
-                    row_updates[COL_QBO_EXP] = "SYNCED"
-
-            except Exception as e:
-                logger.error(f"   ❌ Critical Expense Error: {e}")
-                has_global_error = True
-                row_updates[COL_QBO_EXP] = "ERROR"
-
-            # ====================================================
-            # 3. SYNC TRANSFERS
-            # ====================================================
-            try:
-                tab_name = f"{country} {dt_label} - {settings.OUTPUT_TAB_WITHDRAW}"
-                try: df_transfers = gs.read_as_df_sync(url, tab_name)
-                except: df_transfers = pd.DataFrame()
-
-                if not df_transfers.empty and "Remarks" in df_transfers.columns:
-                    to_sync = df_transfers[~df_transfers["Remarks"].str.contains("Sync at|ERROR", regex=True, na=False)]
-                    rem_col_idx = list(df_transfers.columns).index("Remarks") + 1
-                    
-                    batch_updates = []
-                    for idx, r in to_sync.iterrows():
-                        ref_no = str(r.get("Ref No", "")).strip()
-                        if not ref_no: continue
-                        try:
-                            sync_engine.push_transfer(r)
-                            batch_updates.append({'row': idx + 2, 'col': rem_col_idx, 'val': sync_msg})
-                        except Exception as te:
-                            error_msg = f"ERROR: {str(te)}"[:500]
-                            logger.error(f"      ❌ Failed Transfer {ref_no}: {error_msg}")
-                            batch_updates.append({'row': idx + 2, 'col': rem_col_idx, 'val': error_msg})
-                            has_global_error = True
-                    
-                    if batch_updates:
-                        gs.batch_update_cells(url, tab_name, batch_updates)
-                    
-                    row_updates[COL_QBO_TR] = "SYNCED"
-
-            except Exception as e:
-                logger.error(f"   ❌ Critical Transfer Error: {e}")
-                has_global_error = True
-                row_updates[COL_QBO_TR] = "ERROR"
-
-            # ====================================================
-            # FINAL STATUS UPDATE
-            # ====================================================
-            final_status = "DONE"
-            if has_global_error:
-                final_status = "PARTIAL ERROR"
-                logger.warning(f"⚠️ {country} finished with some row-level errors.")
-                
-            now_str =  _now_iso_local()
-
-            # Add global status to the update list
-            row_updates[settings.CTRL_COL_QBO_SYNC] = final_status
-            row_updates["Last Sync At"] = now_str
-
-            # Perform the Batch Update for this Control Sheet Row
-            _batch_update_control(gs, row_num, row_updates)
-            
-            logger.info(f"✅ {country} Sync Cycle Complete. Control Sheet Updated.")
-
+                    _update_row_status_and_id(gs, transform_url, tab_jv, updates)
+                    jv_status = "SYNC FAIL" if section_fail else "SYNCED"
         except Exception as e:
-            logger.error(f"❌ {country} Global Failure: {e}")
-            _batch_update_control(gs, row_num, {settings.CTRL_COL_QBO_SYNC: "ERROR"})
+            logger.error(f"   ❌ Journal Sync Fail: {e}")
+            has_error = True
+            jv_status = "SYNC FAIL"
+
+        # ---------------------------------------------------------
+        # 2. SYNC EXPENSES
+        # ---------------------------------------------------------
+        try:
+            logger.info(f"   Using Tab: {tab_exp}")
+            try: df_exp = gs.read_as_df_sync(transform_url, tab_exp)
+            except: df_exp = pd.DataFrame()
+
+            if not df_exp.empty and "Remarks" in df_exp.columns:
+                to_sync = df_exp[df_exp["Remarks"].astype(str).str.contains("Ready to sync", case=False, na=False)]
+                
+                if to_sync.empty:
+                    exp_status = "SYNCED"
+                else:
+                    all_exp_nos = to_sync["Exp Ref. No"].unique().tolist()
+                    existing_docs = sync_engine.get_existing_duplicates("Purchase", all_exp_nos)
+
+                    updates = []
+                    section_fail = False
+
+                    for idx, row_data in to_sync.iterrows():
+                        ref_no = str(row_data.get("Exp Ref. No", ""))
+                        if ref_no in existing_docs:
+                            updates.append({"row_idx": idx, "status": "Skipped (Already in QBO)", "qbo_id": ""})
+                            continue
+
+                        try:
+                            resp = sync_engine.push_expense(ref_no, row_data)
+                            new_id = resp.get("Purchase", {}).get("Id", "")
+                            updates.append({"row_idx": idx, "status": "Synced", "qbo_id": new_id})
+                        except Exception as e:
+                            updates.append({"row_idx": idx, "status": f"ERROR: {str(e)}", "qbo_id": ""})
+                            has_error = True
+                            section_fail = True
+                    
+                    _update_row_status_and_id(gs, transform_url, tab_exp, updates)
+                    exp_status = "SYNC FAIL" if section_fail else "SYNCED"
+        except Exception as e:
+            logger.error(f"   ❌ Expense Sync Fail: {e}")
+            has_error = True
+            exp_status = "SYNC FAIL"
+
+        # ---------------------------------------------------------
+        # 3. SYNC TRANSFERS
+        # ---------------------------------------------------------
+        try:
+            logger.info(f"   Using Tab: {tab_tr}")
+            try: df_tr = gs.read_as_df_sync(transform_url, tab_tr)
+            except: df_tr = pd.DataFrame()
+
+            if not df_tr.empty and "Remarks" in df_tr.columns:
+                to_sync = df_tr[df_tr["Remarks"].astype(str).str.contains("Ready to sync", case=False, na=False)]
+                
+                if to_sync.empty:
+                    tr_status = "SYNCED"
+                else:
+                    all_tr_nos = to_sync["Ref No"].unique().tolist()
+                    existing_docs = sync_engine.get_existing_duplicates("Transfer", all_tr_nos)
+
+                    updates = []
+                    section_fail = False
+
+                    for idx, row_data in to_sync.iterrows():
+                        ref_no = str(row_data.get("Ref No", ""))
+                        if ref_no in existing_docs:
+                            updates.append({"row_idx": idx, "status": "Skipped (Already in QBO)", "qbo_id": ""})
+                            continue
+
+                        try:
+                            resp = sync_engine.push_transfer(row_data)
+                            new_id = resp.get("Transfer", {}).get("Id", "")
+                            updates.append({"row_idx": idx, "status": "Synced", "qbo_id": new_id})
+                        except Exception as e:
+                            updates.append({"row_idx": idx, "status": f"ERROR: {str(e)}", "qbo_id": ""})
+                            has_error = True
+                            section_fail = True
+                    
+                    _update_row_status_and_id(gs, transform_url, tab_tr, updates)
+                    tr_status = "SYNC FAIL" if section_fail else "SYNCED"
+        except Exception as e:
+            logger.error(f"   ❌ Transfer Sync Fail: {e}")
+            has_error = True
+            tr_status = "SYNC FAIL"
+
+        final_status = "PARTIAL ERROR" if has_error else "DONE"
+        
+        update_payload = {
+            settings.CTRL_COL_QBO_SYNC: final_status,
+            "Last Sync At": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        if jv_status != "Skipped": update_payload[COL_QBO_JV] = jv_status
+        if exp_status != "Skipped": update_payload[COL_QBO_EXP] = exp_status
+        if tr_status != "Skipped": update_payload[COL_QBO_TR] = tr_status
+
+        _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, update_payload)
+        logger.info(f"✅ [{client_name}] Sync Complete: {final_status}")
+
+def main():
+    gs = GSheetsClient()
+    qbo_client = QBOClient(gs_client=gs)
+    try:
+        master_df = gs.read_as_df(settings.MASTER_SHEET_ID, settings.MASTER_TAB_NAME)
+    except Exception as e:
+        logger.error(f"❌ Critical: {e}")
+        return
+
+    for _, row in master_df.iterrows():
+        if str(row.get(settings.MST_COL_STATUS, "")).strip().lower() != "active": continue
+        client_name = row.get(settings.MST_COL_CLIENT)
+        sheet_id = row.get(settings.MST_COL_SHEET_ID)
+        realm_id = str(row.get(settings.MST_COL_REALM_ID)).strip()
+        if not sheet_id or not realm_id: continue
+
+        logger.info(f"🏢 STARTING SYNC FOR: {client_name} ({realm_id})")
+        try:
+            qbo_client.set_company(realm_id)
+            process_client_sync(gs, qbo_client, sheet_id, client_name)
+        except Exception as e:
+            logger.error(f"❌ Auth/Sync failed for {client_name}: {e}")
 
 if __name__ == "__main__":
     main()

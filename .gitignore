@@ -21,3 +21,6 @@ logs/*.log
 
 # setup
 initial.ipynb
+
+# bulk delete
+bulk_del.py
