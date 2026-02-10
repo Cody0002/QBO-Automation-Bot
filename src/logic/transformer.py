@@ -123,12 +123,16 @@ class TransformResult:
 # ==========================================
 def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> tuple[pd.DataFrame, int]:
     print(f"\n--- DEBUG: Processing JOURNALS (Input Rows: {len(df)}) ---")
-    
+    SPECIAL_CASE = 'Check (Internal use)'
+    print("JOURNALS:", df.columns)
     if df.empty:
         return pd.DataFrame(), start_no
         
     if COL_METHOD not in df.columns:
         return pd.DataFrame(), start_no
+    
+    # Dont change values if it is monthend
+    df.loc[df[SPECIAL_CASE] == 'Monthend', COL_USD] *= -1
 
     mask_std = df[COL_METHOD].astype(str).str.contains("Journal", case=False, na=False)
     mask_reclass = df[COL_METHOD].astype(str).str.contains("Reclass", case=False, na=False)
@@ -158,11 +162,14 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         # Debit
         deb = df_std.copy()
         deb["Amount"] =  safe_to_float(deb[COL_USD]) * -1
+
+        # Change values when it is Monthend
         deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_TYPE: "Account", COL_CO: "Location"})
         
         # Credit
         cred = df_std.copy()
         cred["Amount"] = pd.to_numeric(cred[COL_USD], errors='coerce').fillna(0.0)
+
         cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_ACC_CR: "Account", COL_CO: "Location"})
         
         processed_std = pd.concat([deb, cred], ignore_index=True)
@@ -187,8 +194,9 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         df_reclass["Class"] = ""
         df_reclass["Name"] = df_reclass[COL_ITEM_DESC]
         df_reclass = df_reclass.rename(columns={COL_ITEM_DESC: "Memo", COL_TYPE: "Account", COL_CO: "Location"})
-        
+
         processed_reclass = df_reclass[["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class"]]
+
 
     # --- 3. Safe Combination ---
     total_journals = pd.concat([processed_std, processed_reclass], ignore_index=True)

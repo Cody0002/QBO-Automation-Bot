@@ -64,14 +64,16 @@ def format_month_name(date_str: str) -> str:
 
 def get_retry_context(gs: GSheetsClient, spreadsheet_url: str, tab_name: str, id_col_name: str) -> Tuple[List[int], Dict[int, str]]:
     """Identifies rows marked as 'ERROR' in the Transform file to re-process them."""
+    print(tab_name, id_col_name)
     try:
         df = gs.read_as_df_sync(spreadsheet_url, tab_name)
         if df.empty or "Remarks" not in df.columns or id_col_name not in df.columns:
             return [], {}
-        
+        print(df.head())
         # Filter for Error rows
-        error_mask = df["Remarks"].astype(str).str.contains("ERROR|Unbalanced", case=False, na=False)
+        error_mask = df["Remarks"].astype(str).str.contains("ERROR|Unbalance", case=False, na=False)
         bad_rows = df[error_mask]
+        # print(bad_rows.head())
         if bad_rows.empty: return [], {}
 
         # Identify IDs to delete and map existing sequential IDs
@@ -90,8 +92,9 @@ def get_retry_context(gs: GSheetsClient, spreadsheet_url: str, tab_name: str, id
                 except: pass
                 
         return rows_to_delete, existing_id_map
-    except Exception:
-        return [], {}
+    except Exception as e:
+        print(f"🔥 get_retry_context crashed on tab '{tab_name}': {e}")
+        raise
 
 # ==========================================
 # 2. CORE LOGIC (PER CLIENT)
