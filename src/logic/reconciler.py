@@ -11,6 +11,16 @@ class Reconciler:
     def __init__(self, qbo_client: QBOClient):
         self.client = qbo_client
 
+    def _normalize_account(self, name: str) -> str:
+        """
+        Handles QBO parent:child accounts.
+        Example:
+        'staffing:salaries' -> 'salaries'
+        """
+        if not name:
+            return ""
+        return name.split(":")[-1].strip().lower()
+
     def _get_month_range(self, date_str: str) -> tuple[str, str]:
         try:
             dt = pd.to_datetime(date_str)
@@ -68,70 +78,172 @@ class Reconciler:
 
     # --- 1. JOURNALS ---
     def reconcile_journals(self, df: pd.DataFrame, month_str: str) -> list[dict]:
-        if df.empty or "Journal No" not in df.columns: return []
+        if df.empty or "Journal No" not in df.columns:
+            return []
+
         start, end = self._get_month_range(month_str)
-        if not start: return []
+        if not start:
+            return []
 
         map_id, map_doc = self._fetch_qbo_data("JournalEntry", start, end)
         updates = []
 
-        # Group by Journal No
         for jv_no, group in df.groupby("Journal No"):
             row = group.iloc[0]
-            
-            # A. Try ID Match (Best)
+
             qbo_record = None
-            if "QBO ID" in row and pd.notna(row["QBO ID"]) and str(row["QBO ID"]).strip():
+
+            if "QBO ID" in row and pd.notna(row["QBO ID"]):
                 qbo_record = map_id.get(str(row["QBO ID"]).strip())
-            
-            # B. Fallback to DocNumber
+
             if not qbo_record:
                 qbo_record = map_doc.get(str(jv_no).strip())
 
             errors = []
+
             if not qbo_record:
                 status = "❌ Not found in QBO"
+
             else:
-                sheet_amt = group.loc[group["Amount"] > 0, "Amount"].sum()
-                self._check_mismatch(errors, "Date", pd.to_datetime(row["Date"]).strftime("%Y-%m-%d"), qbo_record.get("TxnDate"))
-                self._check_mismatch(errors, "Total", sheet_amt, qbo_record.get("TotalAmt"), is_float=True)
-                self._check_mismatch(errors, "Memo", row.get("Memo"), qbo_record.get("PrivateNote"))
-                status = "✅ Matched" if not errors else "⚠️ " + "; ".join(errors)
+
+                # ✅ Date
+                self._check_mismatch(
+                    errors,
+                    "Date",
+                    pd.to_datetime(row["Date"]).strftime("%Y-%m-%d"),
+                    qbo_record.get("TxnDate")
+                )
+
+                # ✅ Memo
+                self._check_mismatch(
+                    errors,
+                    "Memo",
+                    row.get("Memo"),
+                    qbo_record.get("PrivateNote")
+                )
+
+                # ✅ BALANCE CHECK (MOST IMPORTANT)
+                if abs(group["Amount"].sum()) > 0.01:
+                    errors.append("Journal NOT balanced")
+
+                ###################################
+                # SIMPLE ACCOUNT CHECK
+                ###################################
+
+                sheet_accounts = set(
+                    self._normalize_account(a)
+                    for a in group["Account"].dropna()
+                )
+
+                qbo_accounts = set()
+
+                for line in qbo_record.get("Line", []):
+                    detail = line.get("JournalEntryLineDetail", {})
+                    acc = self._normalize_account(
+                        detail.get("AccountRef", {}).get("name", "")
+                    )
+                    if acc:
+                        qbo_accounts.add(acc)
+
+                if sheet_accounts != qbo_accounts:
+                    errors.append("Account mismatch")
+
+            status = "✅ Matched" if not errors else "⚠️ " + "; ".join(errors)
 
             for idx in group.index:
                 updates.append({"row_idx": idx, "status": status})
+
         return updates
 
     # --- 2. EXPENSES ---
     def reconcile_expenses(self, df: pd.DataFrame, month_str: str) -> list[dict]:
-        if df.empty or "Exp Ref. No" not in df.columns: return []
+        if df.empty or "Exp Ref. No" not in df.columns:
+            return []
+
         start, end = self._get_month_range(month_str)
-        if not start: return []
+        if not start:
+            return []
 
         map_id, map_doc = self._fetch_qbo_data("Purchase", start, end)
         updates = []
 
         for idx, row in df.iterrows():
-            # A. Try ID Match
+
             qbo_record = None
-            if "QBO ID" in row and pd.notna(row["QBO ID"]) and str(row["QBO ID"]).strip():
+
+            if "QBO ID" in row and pd.notna(row["QBO ID"]):
                 qbo_record = map_id.get(str(row["QBO ID"]).strip())
 
-            # B. Fallback to DocNumber
             if not qbo_record:
                 ref_no = str(row.get("Exp Ref. No", "")).strip()
                 qbo_record = map_doc.get(ref_no)
 
             errors = []
+
             if not qbo_record:
                 status = "❌ Not found in QBO"
+
             else:
+
+                # ✅ Date
+                self._check_mismatch(
+                    errors,
+                    "Date",
+                    pd.to_datetime(row["Payment Date"]).strftime("%Y-%m-%d"),
+                    qbo_record.get("TxnDate")
+                )
+
+                # ✅ Amount
                 sheet_amt = abs(float(row.get("Expense Line Amount", 0)))
-                self._check_mismatch(errors, "Date", pd.to_datetime(row["Payment Date"]).strftime("%Y-%m-%d"), qbo_record.get("TxnDate"))
-                self._check_mismatch(errors, "Amount", sheet_amt, qbo_record.get("TotalAmt"), is_float=True)
-                status = "✅ Matched" if not errors else "⚠️ " + "; ".join(errors)
-            
+
+                self._check_mismatch(
+                    errors,
+                    "Amount",
+                    sheet_amt,
+                    qbo_record.get("TotalAmt"),
+                    is_float=True
+                )
+
+                ###################################
+                # CREDIT ACCOUNT
+                ###################################
+
+                sheet_credit = self._normalize_account(
+                    row.get("Account (Cr)", "")
+                )
+
+                qbo_credit = self._normalize_account(
+                    qbo_record.get("AccountRef", {}).get("name", "")
+                )
+
+                if sheet_credit != qbo_credit:
+                    errors.append("Credit account mismatch")
+
+                ###################################
+                # EXPENSE ACCOUNT
+                ###################################
+
+                sheet_exp = self._normalize_account(
+                    row.get("Expense Account (Dr)", "")
+                )
+
+                qbo_exp_accounts = set()
+
+                for line in qbo_record.get("Line", []):
+                    detail = line.get("AccountBasedExpenseLineDetail", {})
+                    acc = self._normalize_account(
+                        detail.get("AccountRef", {}).get("name", "")
+                    )
+                    if acc:
+                        qbo_exp_accounts.add(acc)
+
+                if sheet_exp not in qbo_exp_accounts:
+                    errors.append("Expense account mismatch")
+
+            status = "✅ Matched" if not errors else "⚠️ " + "; ".join(errors)
+
             updates.append({"row_idx": idx, "status": status})
+
         return updates
 
     # --- 3. TRANSFERS ---

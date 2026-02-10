@@ -143,7 +143,7 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
             logger.error(f"   ❌ Trf Reconcile Error: {e}")
             has_issue = True
 
-        final = "DONE (Issues Found)" if has_issue else "DONE (Clean)"
+        final = "DONE (Issues Found)" if has_issue else "DONE"
         row_updates[CTRL_COL_RECONCILE] = final
         row_updates["Last Sync At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 

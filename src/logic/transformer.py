@@ -23,6 +23,22 @@ COL_CO = "CO"
 COL_IN_OUT = "In/Out"
 COL_BANK = "Account Fr"
 
+def safe_to_float(series: pd.Series, decimals: int = 4) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+
+    # remove infinite values
+    s = s.replace([np.inf, -np.inf], np.nan)
+
+    # cap extreme values (VERY important)
+    MAX_ALLOWED = 1e9
+    s = s.where(s.abs() < MAX_ALLOWED)
+
+    # fill nulls
+    s = s.fillna(0.0)
+
+    # finally round
+    return s.round(decimals)
+
 def _normalize_df_headers(df: pd.DataFrame) -> pd.DataFrame:
     """Cleans newlines and maps varying column names to standard constants."""
     df.columns = [str(c).replace('\n', ' ').strip() for c in df.columns]
@@ -141,7 +157,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         
         # Debit
         deb = df_std.copy()
-        deb["Amount"] = pd.to_numeric(deb[COL_USD], errors='coerce').fillna(0.0) * -1 
+        deb["Amount"] =  safe_to_float(deb[COL_USD]) * -1
         deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_TYPE: "Account", COL_CO: "Location"})
         
         # Credit
@@ -239,14 +255,19 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
 # ==========================================
 # 2. PROCESS EXPENSES
 # ==========================================
-def process_expenses(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> Tuple[pd.DataFrame, int]:
+def process_expenses(df: pd.DataFrame, country: str,
+                     start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> Tuple[pd.DataFrame, int]:
     print(f"\n--- DEBUG: Processing EXPENSES (Input Rows: {len(df)}) ---")
     if df is None or df.empty: return pd.DataFrame(), start_no
     if existing_ids is None: existing_ids = {}
 
+    # print(df[["No","CO", "COY", "Date", "Category", "USD - QBO"]])
     df[COL_USD] = pd.to_numeric(df[COL_USD], errors='coerce').fillna(0.0)
     d = df[df[COL_USD].round(2) != 0].copy()
-
+    # --- LOGGING FILTER ---
+    if len(df) != len(d):
+        print(f"      ⚠️ Dropped {len(df) - len(d)} rows due to 0.00 amount.")
+    # ----------------------
     if d.empty: return pd.DataFrame(), start_no
 
     d = d[[c for c in d.columns if "currency" not in c.lower()]]
@@ -264,9 +285,9 @@ def process_expenses(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     d["Payee (Dummy)"] = "Dummy"
     d["Payment Method"] = "Cash"
     d["Currency Code"] = "USD"
-    d["Account (Cr)"] = d.get(COL_BANK, "Payment Gateway - PH").fillna("Payment Gateway - PH")
+    d["Account (Cr)"] = d[COL_ACC_CR]
     
-    d["Expense Line Amount"] = d[COL_USD].astype(float) * -1
+    d["Expense Line Amount"] = safe_to_float(d[COL_USD]) * -1
     d["Payment Date"] = pd.to_datetime(d[COL_DATE], errors="coerce")
 
     # ID GENERATION
@@ -278,7 +299,8 @@ def process_expenses(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         else:
             mm_yy = row["Payment Date"].strftime("%m%y") if pd.notna(row["Payment Date"]) else "0000"
             start_no += 1 
-            ref_nos.append(f"KZOPH{mm_yy}E{str(start_no).zfill(4)}")
+            # FIX: Use dynamic country code instead of hardcoded 'PH'
+            ref_nos.append(f"KZO{country}{mm_yy}E{str(start_no).zfill(4)}")
     
     d["Exp Ref. No"] = ref_nos
 
@@ -329,7 +351,8 @@ def process_expenses(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
 # ==========================================
 # 3. PROCESS TRANSFERS
 # ==========================================
-def process_transfers(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> tuple[pd.DataFrame, int]:
+def process_transfers(df: pd.DataFrame, country: str,
+                      start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> tuple[pd.DataFrame, int]:
     print(f"\n--- DEBUG: Processing TRANSFERS (Input Rows: {len(df)}) ---")
     if df.empty: return pd.DataFrame(), start_no
     if existing_ids is None: existing_ids = {}
@@ -356,7 +379,7 @@ def process_transfers(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, d
             dt = pd.to_datetime(row[COL_DATE], errors='coerce')
             date_str = dt.strftime('%m%y') if pd.notna(dt) else "0000"
             start_no += 1
-            ref_nos.append(f"KZOPH{date_str}T{str(start_no).zfill(4)}")
+            ref_nos.append(f"KZO{country}{date_str}T{str(start_no).zfill(4)}")
 
     transfers["Ref No"] = ref_nos
 
@@ -405,7 +428,8 @@ def process_transfers(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, d
 # ==========================================
 # 4. MAIN TRANSFORM ENTRY POINT
 # ==========================================
-def transform_raw(raw_df: pd.DataFrame, last_jv: int, last_exp: int, last_tr: int, qbo_mappings: Dict[str, dict] = None, existing_ids: Dict[str, dict] = None) -> TransformResult:
+def transform_raw(raw_df: pd.DataFrame, country: str,
+                  last_jv: int, last_exp: int, last_tr: int, qbo_mappings: Dict[str, dict] = None, existing_ids: Dict[str, dict] = None) -> TransformResult:
     if raw_df is None or raw_df.empty:
         return TransformResult(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), last_jv, last_exp, last_tr, None)
 
@@ -434,8 +458,8 @@ def transform_raw(raw_df: pd.DataFrame, last_jv: int, last_exp: int, last_tr: in
         df = df[~df[COL_USD].isna()]
 
     final_jv, new_jv_no = process_journals(df, last_jv, qbo_mappings, existing_ids.get('journals') if existing_ids else None)
-    final_exp, new_exp_no = process_expenses(df, last_exp, qbo_mappings, existing_ids.get('expenses') if existing_ids else None)
-    final_tr, new_tr_no = process_transfers(df, last_tr, qbo_mappings, existing_ids.get('transfers') if existing_ids else None)
+    final_exp, new_exp_no = process_expenses(df, country, last_exp, qbo_mappings, existing_ids.get('expenses') if existing_ids else None)
+    final_tr, new_tr_no = process_transfers(df, country, last_tr, qbo_mappings, existing_ids.get('transfers') if existing_ids else None)
 
     max_row = int(df[COL_NO].max()) if not df.empty else None
 

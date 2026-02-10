@@ -46,22 +46,49 @@ class QBOSync:
         self.client = client
         self.mappings = self._get_qbo_mappings()
 
+    def build_qbo_url(self, entity: str, txn_id: str) -> str:
+        """
+        Returns a direct QuickBooks URL for a transaction.
+
+        Example:
+        https://qbo.intuit.com/app/expense?txnId=521
+        """
+
+        if not txn_id:
+            return ""
+
+        routes = {
+            "Purchase": "expense",
+            "JournalEntry": "journal",
+            "Transfer": "transfer"
+        }
+
+        page = routes.get(entity)
+
+        if not page:
+            return ""
+
+        return f"https://qbo.intuit.com/app/{page}?txnId={txn_id}"
+
     def _get_qbo_mappings(self) -> dict:
-        """Fetches Accounts, Locations, Classes, and Vendors for lookups."""
+        """Fetches Accounts, Locations, Classes, Vendors, and Payment Methods."""
         logger.info(f"🔍 Fetching QBO Mappings for Realm: {self.client.realm_id}...")
-        mappings = {"accounts": {}, "locations": {}, "classes": {}, "vendors": {}}
+        # Added 'payment_methods' to the dictionary
+        mappings = {"accounts": {}, "locations": {}, "classes": {}, "vendors": {}, "payment_methods": {}}
         
         entities = [
             ("Account", "accounts", "Name, FullyQualifiedName, Id"),
-            ("Department", "locations", "Name, FullyQualifiedName, Id"),
+            ("Department", "locations", "Name, FullyQualifiedName, Id"), # Department = Location
             ("Class", "classes", "Name, FullyQualifiedName, Id"),
-            ("Vendor", "vendors", "DisplayName, Id") 
+            ("Vendor", "vendors", "DisplayName, Id"),
+            ("PaymentMethod", "payment_methods", "Name, Id") # <--- NEW: Fetch Payment Methods
         ]
 
         for table, key, fields in entities:
             try:
                 data = self.client.query(f"SELECT {fields} FROM {table} MAXRESULTS 1000")
                 for item in data:
+                    # Handle different name fields (Name vs DisplayName)
                     name = item.get("FullyQualifiedName", item.get("Name", item.get("DisplayName")))
                     mappings[key][name] = item["Id"]
             except Exception as e:
@@ -179,7 +206,7 @@ class QBOSync:
             "PrivateNote": str(first_row.get('Memo', '')),
             "CurrencyRef": {"value": str(first_row.get('Currency Code', 'USD'))}
         }
-        # return self.client.post(f"/v3/company/{self.client.realm_id}/journalentry", payload)
+        return self.client.post(f"/v3/company/{self.client.realm_id}/journalentry", payload)
 
     def push_expense(self, exp_ref_no: str, row: pd.Series):
         pay_acc_id = self.find_id("accounts", row.get("Account (Cr)"))
@@ -192,25 +219,42 @@ class QBOSync:
         vendor_id = self.find_id("vendors", payee)
         entity_ref = {'value': vendor_id, 'name': payee, 'type': 'Vendor'} if vendor_id else {}
 
+        # --- FIX: Helper to get ID or None ---
+        loc_id = self.find_id('locations', row.get('Location'))
+        class_id = self.find_id('classes', row.get('Class'))
+        
+        # --- FIX: Payment Method Logic ---
+        # 1. Look for 'Payment Method' column in your sheet
+        pm_name = row.get("Payment Method") 
+        pm_id = self.find_id("payment_methods", pm_name)
+
         payload = {
             "AccountRef": {"value": pay_acc_id},
-            "PaymentType": "Cash",
+            "PaymentType": "Cash", # Default to Cash, but Ref adds specific detail
             "EntityRef": entity_ref,
             "DocNumber": str(exp_ref_no),
             "TxnDate": _parse_date_yyyy_mm_dd(row.get("Payment Date")),
             "CurrencyRef": {"value": str(row.get("Currency", "USD"))},
-            "DepartmentRef": {"value": self.find_id('locations', row.get('Location'))},
             "Line": [{
                 "DetailType": "AccountBasedExpenseLineDetail",
                 "Amount": abs(_parse_amount(row.get("Expense Line Amount"))),
                 "AccountBasedExpenseLineDetail": {
                     "AccountRef": {"value": exp_acc_id},
-                    "ClassRef": {"value": self.find_id('classes', row.get('Class'))}
+                    # Only add ClassRef if it exists
+                    **({"ClassRef": {"value": class_id}} if class_id else {})
                 },
                 "Description": str(row.get("Memo") or "")
             }]
         }
-        # return self.client.post(f"/v3/company/{self.client.realm_id}/purchase", payload)
+
+        # --- FIX: Conditionally add fields (Don't send None) ---
+        if loc_id:
+            payload["DepartmentRef"] = {"value": loc_id} # Department = Location
+        
+        if pm_id:
+            payload["PaymentMethodRef"] = {"value": pm_id}
+
+        return self.client.post(f"/v3/company/{self.client.realm_id}/purchase", payload)
 
     def push_transfer(self, row: pd.Series):
         from_id = self.find_id("accounts", row.get("Transfer Funds From"))
@@ -230,4 +274,4 @@ class QBOSync:
             "ToAccountRef": {"value": to_id},
             "PrivateNote": full_memo 
         }
-        # return self.client.post(f"/v3/company/{self.client.realm_id}/transfer", payload)
+        return self.client.post(f"/v3/company/{self.client.realm_id}/transfer", payload)

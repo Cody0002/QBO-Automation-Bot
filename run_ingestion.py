@@ -203,8 +203,13 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             retry_nos = list(set([k for sub in preserved_ids.values() for k in sub.keys()]))
 
             # 6. Read & Clean Source Data
-            raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=3, value_render_option='UNFORMATTED_VALUE')
+            raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=1, value_render_option='UNFORMATTED_VALUE')
             
+            # --- LOGGING START ---
+            initial_count = len(raw_df)
+            logger.info(f"   📊 [{client_name}] Step 6: Raw Rows Read: {initial_count}")
+            # ---------------------
+
             if raw_df.empty:
                 logger.info(f"   [{client_name}] Raw tab empty.")
                 _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "DONE (Empty)"})
@@ -235,6 +240,12 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
                 raw_df = raw_df[month_mask].copy()
                 raw_df.drop(columns=["_TempDate"], inplace=True)
                 
+                # --- LOGGING DATE FILTER ---
+                after_date_count = len(raw_df)
+                dropped_date = initial_count - after_date_count
+                logger.info(f"   🗓️ [{client_name}] Step 7: Date Filter ({raw_month}) -> Kept: {after_date_count} | Dropped: {dropped_date}")
+                # ---------------------------
+
                 if raw_df.empty:
                     logger.warning(f"   [{client_name}] ⚠️ No rows found for {month} in Source.")
                     _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "DONE (No Data)"})
@@ -246,12 +257,25 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
                     raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0)
 
             # 9. Exclude Rows
+            before_exclude = len(raw_df)
             raw_df = raw_df[~raw_df["Check (Internal use)"].astype(str).str.contains("exclude", na=False, case=False)].copy()
+
+            # --- LOGGING EXCLUDE FILTER ---
+            after_exclude = len(raw_df)
+            dropped_exclude = before_exclude - after_exclude
+            if dropped_exclude > 0:
+                logger.info(f"   🚫 [{client_name}] Step 9: 'Exclude' Filter -> Kept: {after_exclude} | Dropped: {dropped_exclude}")
+            # ------------------------------
 
             # 10. Select Rows to Process (New + Retry)
             new_df = raw_df[raw_df["No"] > last_processed].copy()
             retry_df = raw_df[raw_df["No"].isin(retry_nos)].copy()
             processing_df = pd.concat([new_df, retry_df]).drop_duplicates(subset=["No"])
+
+            # --- LOGGING SELECTION ---
+            dropped_processed = after_exclude - len(processing_df)
+            logger.info(f"   🔢 [{client_name}] Step 10: Selection -> New: {len(new_df)}, Retry: {len(retry_df)} | Total: {len(processing_df)} | Skipped (Old): {dropped_processed}")
+            # -------------------------
 
             if processing_df.empty:
                 logger.info(f"   [{client_name}] No new rows to process.")
@@ -264,8 +288,15 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             logger.info(f"   [{client_name}] Transforming {len(processing_df)} rows...")
 
             # 12. RUN TRANSFORMER
-            result = transform_raw(processing_df, final_start_jv, last_exp, last_tr, qbo_mappings=qbo_mappings, existing_ids=preserved_ids)
-
+            result = transform_raw(
+                raw_df=processing_df, 
+                last_jv=final_start_jv, 
+                last_exp=last_exp, 
+                last_tr=last_tr, 
+                country=country,  # <--- NEW ARGUMENT
+                qbo_mappings=qbo_mappings, 
+                existing_ids=preserved_ids
+            )
             # 13. Write Output
             # Note: We use 'control_sheet_id' as the template source. 
             # Assumes the Client's Control Sheet has the "Sample - Journals" etc. hidden tabs.
@@ -360,10 +391,8 @@ def main():
             logger.warning(f"⚠️ Skipping {client_name}: Missing Sheet ID or Realm ID.")
             continue
 
-        print(f"\n" + "="*60)
         print(f"🏢 STARTING CLIENT: {client_name}")
         print(f"   Realm ID: {realm_id} | Sheet: {sheet_id}")
-        print(f"="*60 + "\n")
 
         # 1. Authenticate / Switch Context
         try:
