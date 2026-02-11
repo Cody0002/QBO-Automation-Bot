@@ -153,10 +153,10 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
                     write_raw_check_results(gs, transform_url, tab, df, res_raw)
                 
                 if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):
-                    row_updates[COL_QBO_JV] = "QBO Mismatch"
+                    row_updates[COL_QBO_JV] = "QBO MISMATCH"
                     has_issue = True
                 else:
-                    row_updates[COL_QBO_JV] = "Matched"
+                    row_updates[COL_QBO_JV] = "SYNCED"
         except Exception as e:
             logger.error(f"   ❌ JV Reconcile Error: {e}")
             has_issue = True
@@ -178,10 +178,10 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
                     write_raw_check_results(gs, transform_url, tab, df, res_raw)
                 
                 if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):
-                    row_updates[COL_QBO_EXP] = "QBO Mismatch"
+                    row_updates[COL_QBO_EXP] = "QBO MISMATCH"
                     has_issue = True
                 else:
-                    row_updates[COL_QBO_EXP] = "Matched"
+                    row_updates[COL_QBO_EXP] = "SYNCED"
         except Exception as e:
             logger.error(f"   ❌ Exp Reconcile Error: {e}")
             has_issue = True
@@ -203,10 +203,10 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
                     write_raw_check_results(gs, transform_url, tab, df, res_raw)
                 
                 if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):
-                    row_updates[COL_QBO_TR] = "QBO Mismatch"
+                    row_updates[COL_QBO_TR] = "QBO MISMATCH"
                     has_issue = True
                 else:
-                    row_updates[COL_QBO_TR] = "Matched"
+                    row_updates[COL_QBO_TR] = "SYNCED"
         except Exception as e:
             logger.error(f"   ❌ Trf Reconcile Error: {e}")
             has_issue = True

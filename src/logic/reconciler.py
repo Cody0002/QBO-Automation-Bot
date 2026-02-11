@@ -12,6 +12,18 @@ class Reconciler:
     def __init__(self, qbo_client: QBOClient):
         self.client = qbo_client
 
+    def _safe_float(self, val) -> float:
+        """Converts string with commas '1,234.56' to float 1234.56"""
+        if pd.isna(val) or val == "": return 0.0
+        if isinstance(val, (int, float)): return float(val)
+        try:
+            clean_val = str(val).replace(",", "").strip()
+            return float(clean_val)
+        except ValueError:
+            # LOGGING: Warn if conversion fails
+            # logger.warning(f"⚠️ Could not convert '{val}' to float. Defaulting to 0.0")
+            return 0.0
+
     def _normalize_account(self, name: str) -> str:
         """
         Simple normalization for display/logging.
