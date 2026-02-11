@@ -26,21 +26,6 @@ def _parse_amount(val) -> float:
     except:
         return 0.0
 
-def _parse_date_yyyy_mm_dd(val) -> str:
-    if pd.isna(val) or val == "":
-        return datetime.today().strftime("%Y-%m-%d")
-    try:
-        dt = pd.to_datetime(val)
-        return dt.strftime("%Y-%m-%d")
-    except:
-        return datetime.today().strftime("%Y-%m-%d")
-
-def _parse_amount(val) -> float:
-    try:
-        return float(pd.to_numeric(val))
-    except:
-        return 0.0
-
 class QBOSync:
     def __init__(self, client: QBOClient):
         self.client = client
@@ -49,46 +34,30 @@ class QBOSync:
     def build_qbo_url(self, entity: str, txn_id: str) -> str:
         """
         Returns a direct QuickBooks URL for a transaction.
-
-        Example:
-        https://qbo.intuit.com/app/expense?txnId=521
         """
-
-        if not txn_id:
-            return ""
-
-        routes = {
-            "Purchase": "expense",
-            "JournalEntry": "journal",
-            "Transfer": "transfer"
-        }
-
+        if not txn_id: return ""
+        routes = {"Purchase": "expense", "JournalEntry": "journal", "Transfer": "transfer"}
         page = routes.get(entity)
-
-        if not page:
-            return ""
-
+        if not page: return ""
         return f"https://qbo.intuit.com/app/{page}?txnId={txn_id}"
 
     def _get_qbo_mappings(self) -> dict:
         """Fetches Accounts, Locations, Classes, Vendors, and Payment Methods."""
         logger.info(f"🔍 Fetching QBO Mappings for Realm: {self.client.realm_id}...")
-        # Added 'payment_methods' to the dictionary
         mappings = {"accounts": {}, "locations": {}, "classes": {}, "vendors": {}, "payment_methods": {}}
         
         entities = [
             ("Account", "accounts", "Name, FullyQualifiedName, Id"),
-            ("Department", "locations", "Name, FullyQualifiedName, Id"), # Department = Location
+            ("Department", "locations", "Name, FullyQualifiedName, Id"), 
             ("Class", "classes", "Name, FullyQualifiedName, Id"),
             ("Vendor", "vendors", "DisplayName, Id"),
-            ("PaymentMethod", "payment_methods", "Name, Id") # <--- NEW: Fetch Payment Methods
+            ("PaymentMethod", "payment_methods", "Name, Id") 
         ]
 
         for table, key, fields in entities:
             try:
                 data = self.client.query(f"SELECT {fields} FROM {table} MAXRESULTS 1000")
                 for item in data:
-                    # Handle different name fields (Name vs DisplayName)
                     name = item.get("FullyQualifiedName", item.get("Name", item.get("DisplayName")))
                     mappings[key][name] = item["Id"]
             except Exception as e:
@@ -96,41 +65,66 @@ class QBOSync:
 
         return mappings
 
+    # --- UPDATED FIND ID LOGIC (MATCHES TRANSFORMER.PY) ---
     def find_id(self, mapping_key: str, search_name: str) -> str | None:
         if not search_name or pd.isna(search_name) or str(search_name).strip() == "": return None
+        
         mapping_dict = self.mappings.get(mapping_key, {})
         clean_name = re.sub(r'\s+', ' ', str(search_name)).strip()
         
-        # Replacements
-        replacements = { "CBD Z Card": "KZO CBD Z", "Leading Card MKT - 1238": "Leading Card - 1238" }
-        for k, v in replacements.items():
-            if k.lower() in clean_name.lower(): clean_name = v; break
+        # 2. Explicit Replacements (Hardcoded fixes)
+        replacements = {
+            "CBD Z Card":   "KZO CBD Z",
+            "Leading Card MKT - 1238": "Leading Card - 1238"
+        }
+
+        for bad_text, target_text in replacements.items():
+            # Check if the bad text exists (Case Insensitive)
+            if bad_text.lower() in clean_name.lower():
+                # regex sub: Replace ONLY the bad_text part with target_text
+                # flags=re.IGNORECASE ensures "cbd z card" matches "CBD Z Card"
+                clean_name = re.sub(re.escape(bad_text), target_text, clean_name, flags=re.IGNORECASE)
+                
+                # Update the search variable for the next steps
+                search_lower = clean_name.lower()
+                break
 
         search_lower = clean_name.lower()
-        # Exact & Substring
+
+        # 1. EXACT MATCH
         for name, qbo_id in mapping_dict.items():
-            if name.lower() == search_lower: return qbo_id
+            if name.lower() == search_lower: 
+                # logger.info(f"      ✅ [Sync Map] EXACT: '{search_name}' -> '{name}'")
+                return qbo_id
+        
+        # 2. LEAF MATCH (Split by :)
+        # "Fixed Assets:Equipment" -> Matches "Equipment"
         for name, qbo_id in mapping_dict.items():
-            if search_lower in name.lower(): return qbo_id
-        # Fuzzy
-        matches = difflib.get_close_matches(clean_name, list(mapping_dict.keys()), n=1, cutoff=0.85)
-        if matches: return mapping_dict[matches[0]]
+            if ":" in name:
+                leaf = name.split(":")[-1].strip()
+                if leaf.lower() == search_lower:
+                    logger.info(f"      ✅ [Sync Map] LEAF: '{search_name}' -> '{name}'")
+                    return qbo_id
+
+        # 3. STRICT FUZZY MATCH (90%)
+        # Removed the aggressive "substring" check
+        matches = difflib.get_close_matches(clean_name, list(mapping_dict.keys()), n=1, cutoff=0.80)
+        if matches: 
+            best = matches[0]
+            logger.info(f"      ✨ [Sync Map] FUZZY (80%): '{search_name}' -> '{best}'")
+            return mapping_dict[best]
+            
+        logger.warning(f"      ❌ [Sync Map] FAILED: Could not find '{search_name}' in {mapping_key}")
         return None
 
-    # --- UPDATED: DUPLICATE CHECKER ---
     def get_existing_duplicates(self, entity_type: str, doc_nums: list) -> set:
         """
         Queries QBO to see which IDs already exist.
-        - For Journal/Expense: Checks 'DocNumber'.
-        - For Transfer: Checks if 'PrivateNote' CONTAINS the Ref No.
         """
         if not doc_nums: return set()
         existing = set()
         clean_docs = list(set([str(d).strip() for d in doc_nums if str(d).strip()]))
         
-        # ---------------------------------------------------------
-        # CASE A: Journals & Expenses (Check DocNumber)
-        # ---------------------------------------------------------
         if entity_type in ["JournalEntry", "Purchase"]:
             chunk_size = 50 
             for i in range(0, len(clean_docs), chunk_size):
@@ -146,26 +140,15 @@ class QBOSync:
                 except Exception as e:
                     logger.error(f"⚠️ Failed duplicate check {entity_type}: {e}")
 
-        # ---------------------------------------------------------
-        # CASE B: Transfers (Check PrivateNote)
-        # ---------------------------------------------------------
         elif entity_type == "Transfer":
-            # QBO doesn't support "PrivateNote IN (...)" efficiently.
-            # We must fetch recent transfers and check Python-side.
-            # Fetching last 1000 transfers (or filter by date if you pass date range)
             try:
-                # Optimized: We only need PrivateNote
                 query = "SELECT PrivateNote FROM Transfer ORDERBY TxnDate DESC MAXRESULTS 500"
                 results = self.client.query(query)
-                
-                # Check if any of our clean_docs exist inside the PrivateNotes
                 qbo_notes = [str(item.get("PrivateNote", "")) for item in results]
                 
                 for doc_ref in clean_docs:
-                    # If the Doc Ref is found inside ANY existing PrivateNote
                     if any(doc_ref in note for note in qbo_notes):
                         existing.add(doc_ref)
-                        
             except Exception as e:
                 logger.error(f"⚠️ Failed duplicate check Transfer: {e}")
 
@@ -176,6 +159,8 @@ class QBOSync:
         line_items = []
         for _, row in group.iterrows():
             amt = _parse_amount(row['Amount'])
+            
+            # Use updated find_id logic
             acc_id = self.find_id('accounts', row['Account'])
             if not acc_id: raise ValueError(f"Account '{row['Account']}' not found.")
             
@@ -219,18 +204,15 @@ class QBOSync:
         vendor_id = self.find_id("vendors", payee)
         entity_ref = {'value': vendor_id, 'name': payee, 'type': 'Vendor'} if vendor_id else {}
 
-        # --- FIX: Helper to get ID or None ---
         loc_id = self.find_id('locations', row.get('Location'))
         class_id = self.find_id('classes', row.get('Class'))
         
-        # --- FIX: Payment Method Logic ---
-        # 1. Look for 'Payment Method' column in your sheet
         pm_name = row.get("Payment Method") 
         pm_id = self.find_id("payment_methods", pm_name)
 
         payload = {
             "AccountRef": {"value": pay_acc_id},
-            "PaymentType": "Cash", # Default to Cash, but Ref adds specific detail
+            "PaymentType": "Cash",
             "EntityRef": entity_ref,
             "DocNumber": str(exp_ref_no),
             "TxnDate": _parse_date_yyyy_mm_dd(row.get("Payment Date")),
@@ -240,19 +222,14 @@ class QBOSync:
                 "Amount": abs(_parse_amount(row.get("Expense Line Amount"))),
                 "AccountBasedExpenseLineDetail": {
                     "AccountRef": {"value": exp_acc_id},
-                    # Only add ClassRef if it exists
                     **({"ClassRef": {"value": class_id}} if class_id else {})
                 },
                 "Description": str(row.get("Memo") or "")
             }]
         }
 
-        # --- FIX: Conditionally add fields (Don't send None) ---
-        if loc_id:
-            payload["DepartmentRef"] = {"value": loc_id} # Department = Location
-        
-        if pm_id:
-            payload["PaymentMethodRef"] = {"value": pm_id}
+        if loc_id: payload["DepartmentRef"] = {"value": loc_id}
+        if pm_id: payload["PaymentMethodRef"] = {"value": pm_id}
 
         return self.client.post(f"/v3/company/{self.client.realm_id}/purchase", payload)
 
@@ -262,7 +239,6 @@ class QBOSync:
         
         if not from_id or not to_id: raise ValueError("Source or Destination Account missing.")
         
-        # Note: We put Ref No in PrivateNote because QBO Transfer doesn't support DocNumber well
         ref_no = str(row.get("Ref No", ""))
         memo = str(row.get("Memo", ""))
         full_memo = f"{ref_no} - {memo}"

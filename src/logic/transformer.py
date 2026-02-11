@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Tuple, Dict, Any
 import pandas as pd
 import numpy as np
-import difflib  # <--- NEW IMPORT FOR FUZZY MATCHING
+import difflib
 from config import settings
 import re
 
@@ -25,18 +25,10 @@ COL_BANK = "Account Fr"
 
 def safe_to_float(series: pd.Series, decimals: int = 4) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
-
-    # remove infinite values
     s = s.replace([np.inf, -np.inf], np.nan)
-
-    # cap extreme values (VERY important)
     MAX_ALLOWED = 1e9
     s = s.where(s.abs() < MAX_ALLOWED)
-
-    # fill nulls
     s = s.fillna(0.0)
-
-    # finally round
     return s.round(decimals)
 
 def _normalize_df_headers(df: pd.DataFrame) -> pd.DataFrame:
@@ -60,46 +52,56 @@ def find_id_in_map(mapping_dict: dict, search_name: str) -> str | None:
     
     # 1. Clean: Remove double spaces & trim
     clean_name = re.sub(r'\s+', ' ', str(search_name)).strip()
+    search_lower = clean_name.lower()
 
     # 2. Explicit Replacements (Hardcoded fixes)
-    # Dictionary mapping: { "Text to Find": "Target Account Name in QBO" }
     replacements = {
-        "CBD Z Card":   "KZO CBD Z",  # Catch variations
+        "CBD Z Card":   "KZO CBD Z",
         "Leading Card MKT - 1238": "Leading Card - 1238"
     }
 
-    # Check if we need to swap the name
     for bad_text, target_text in replacements.items():
+        # Check if the bad text exists (Case Insensitive)
         if bad_text.lower() in clean_name.lower():
-            clean_name = target_text
+            # regex sub: Replace ONLY the bad_text part with target_text
+            # flags=re.IGNORECASE ensures "cbd z card" matches "CBD Z Card"
+            clean_name = re.sub(re.escape(bad_text), target_text, clean_name, flags=re.IGNORECASE)
+            
+            # Update the search variable for the next steps
+            search_lower = clean_name.lower()
             break
 
-    search_lower = clean_name.lower()
-
-    # 3. Exact Match (Case-insensitive)
+    # --- STRATEGY 1: EXACT FULL MATCH ---
+    # Checks "Fixed Assets:Equipment" == "Fixed Assets:Equipment"
     for qbo_name, qbo_id in mapping_dict.items():
         if qbo_name.lower() == search_lower: 
+            print(f"   ✅ [Mapping] EXACT: '{search_name}' -> '{qbo_name}'")
             return qbo_id
     
-    # 4. Substring Match (Existing logic)
-    # Be careful: "Bank" matches "Bank of America"
+    # --- STRATEGY 2: LEAF NODE MATCH (Split by :) ---
+    # Checks "Equipment" == "Fixed Assets:Equipment" (Splits QBO name)
+    # This solves the "Equipment" vs "Accumulated..." issue
     for qbo_name, qbo_id in mapping_dict.items():
-        if search_lower in qbo_name.lower(): 
-            return qbo_id
+        # Get the part after the last colon (the actual account name)
+        # e.g. "Fixed Assets:Equipment" -> "Equipment"
+        if ":" in qbo_name:
+            leaf_name = qbo_name.split(":")[-1].strip()
+            if leaf_name.lower() == search_lower:
+                # print(f"   ✅ [Mapping] LEAF MATCH: '{search_name}' -> '{qbo_name}'")
+                return qbo_id
 
-    # 5. Fuzzy Match (New: ~85-90% Similarity)
-    # 'difflib' finds the best match from the list of QBO names
-    # cutoff=0.85 allows for small typos or extra characters (like "MKT")
+    # --- STRATEGY 3: STRICT FUZZY MATCH (90%) ---
+    # Only allows very close matches (typos), rejects partial substrings
     qbo_names = list(mapping_dict.keys())
-    matches = difflib.get_close_matches(clean_name, qbo_names, n=1, cutoff=0.85)
+    # cutoff=0.9 ensures "Equipment" does NOT match "Accumulated..."
+    matches = difflib.get_close_matches(clean_name, qbo_names, n=1, cutoff=0.80)
     
     if matches:
         best_match = matches[0]
-        # Optional: Print debug info to see what matched what
-        print(matches)
-        # print(f"   ✨ Fuzzy Matched: '{search_name}' -> '{best_match}'")
+        print(f"   ✨ [Mapping] FUZZY (80%): '{search_name}' -> '{best_match}'")
         return mapping_dict[best_match]
 
+    print(f"   ❌ [Mapping] FAILED: Could not find '{search_name}'")
     return None
 
 def _fix_grp_location(df: pd.DataFrame, col_name: str = "Location"):
@@ -123,16 +125,12 @@ class TransformResult:
 # ==========================================
 def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> tuple[pd.DataFrame, int]:
     print(f"\n--- DEBUG: Processing JOURNALS (Input Rows: {len(df)}) ---")
-    SPECIAL_CASE = 'Check (Internal use)'
-    print("JOURNALS:", df.columns)
-    if df.empty:
-        return pd.DataFrame(), start_no
-        
-    if COL_METHOD not in df.columns:
-        return pd.DataFrame(), start_no
+    SPECIAL_CASE = 'Reclass'
     
-    # Dont change values if it is monthend
-    df.loc[df[SPECIAL_CASE] == 'Monthend', COL_USD] *= -1
+    if df.empty: return pd.DataFrame(), start_no
+    if COL_METHOD not in df.columns: return pd.DataFrame(), start_no
+    
+    df.loc[df[SPECIAL_CASE] == 'Reclass', COL_USD] *= -1
 
     mask_std = df[COL_METHOD].astype(str).str.contains("Journal", case=False, na=False)
     mask_reclass = df[COL_METHOD].astype(str).str.contains("Reclass", case=False, na=False)
@@ -162,14 +160,11 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         # Debit
         deb = df_std.copy()
         deb["Amount"] =  safe_to_float(deb[COL_USD]) * -1
-
-        # Change values when it is Monthend
         deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_TYPE: "Account", COL_CO: "Location"})
         
         # Credit
         cred = df_std.copy()
         cred["Amount"] = pd.to_numeric(cred[COL_USD], errors='coerce').fillna(0.0)
-
         cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_ACC_CR: "Account", COL_CO: "Location"})
         
         processed_std = pd.concat([deb, cred], ignore_index=True)
@@ -197,7 +192,6 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
 
         processed_reclass = df_reclass[["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class"]]
 
-
     # --- 3. Safe Combination ---
     total_journals = pd.concat([processed_std, processed_reclass], ignore_index=True)
 
@@ -209,21 +203,15 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     for col in total_journals.select_dtypes(include=['datetime64', 'datetimetz']).columns:
         total_journals[col] = total_journals[col].astype(str)
     
-    # 1. Round everything to 2 decimals FIRST
     total_journals["Amount"] = total_journals["Amount"].astype(float).round(2)
-
-    # 2. Recalculate diffs based on the rounded numbers
     diffs = total_journals.groupby("Journal No")["Amount"].sum()
 
     for journal_id, diff in diffs.items():
-        if not np.isclose(diff, 0, atol=1e-3): # If sum is not zero
+        if not np.isclose(diff, 0, atol=1e-3):
             if abs(diff) <= 0.50:
                 mask = total_journals["Journal No"] == journal_id
                 if not mask.any(): continue
-                
-                # 3. Find the last index of that journal to apply the fix
                 target_idx = total_journals[mask].index[-1]
-                # Subtract the diff (e.g., if sum is 0.01, subtract 0.01 from the last row)
                 total_journals.loc[target_idx, "Amount"] -= diff
 
     # --- VALIDATION ---
@@ -240,14 +228,12 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         acc_name = row["Account"]
         if not acc_name: return "ERROR | Missing Account Name"
         
-        # --- NEW FIND LOGIC ---
         if not find_id_in_map(map_acc, acc_name): 
             return f"ERROR | Account not found: '{acc_name}'"
             
         loc_name = row.get("Location")
         if loc_name and not find_id_in_map(map_loc, loc_name):
              return f"ERROR | Location not found: '{loc_name}'"
-        
         
         return "Ready to sync"
 
@@ -269,13 +255,12 @@ def process_expenses(df: pd.DataFrame, country: str,
     if df is None or df.empty: return pd.DataFrame(), start_no
     if existing_ids is None: existing_ids = {}
 
-    # print(df[["No","CO", "COY", "Date", "Category", "USD - QBO"]])
     df[COL_USD] = pd.to_numeric(df[COL_USD], errors='coerce').fillna(0.0)
     d = df[df[COL_USD].round(2) != 0].copy()
-    # --- LOGGING FILTER ---
+    
     if len(df) != len(d):
         print(f"      ⚠️ Dropped {len(df) - len(d)} rows due to 0.00 amount.")
-    # ----------------------
+        
     if d.empty: return pd.DataFrame(), start_no
 
     d = d[[c for c in d.columns if "currency" not in c.lower()]]
@@ -307,7 +292,6 @@ def process_expenses(df: pd.DataFrame, country: str,
         else:
             mm_yy = row["Payment Date"].strftime("%m%y") if pd.notna(row["Payment Date"]) else "0000"
             start_no += 1 
-            # FIX: Use dynamic country code instead of hardcoded 'PH'
             ref_nos.append(f"KZO{country}{mm_yy}E{str(start_no).zfill(4)}")
     
     d["Exp Ref. No"] = ref_nos
@@ -332,7 +316,7 @@ def process_expenses(df: pd.DataFrame, country: str,
         if not row["Expense Account (Dr)"]: return "ERROR | Missing Expense Account"
         if pd.isna(row["Payment Date"]): return "ERROR | Missing Date"
         
-        # --- NEW FIND LOGIC ---
+        # --- MAPPING CHECKS ---
         if not find_id_in_map(map_acc, row["Account (Cr)"]): 
             return f"ERROR | Source Account not in QBO: '{row['Account (Cr)']}'"
             
@@ -410,7 +394,6 @@ def process_transfers(df: pd.DataFrame, country: str,
         if not row["Transfer Funds From"]: return "ERROR | Missing From Account"
         if not row["Transfer Funds To"]: return "ERROR | Missing To Account"
         
-        # --- NEW FIND LOGIC ---
         if not find_id_in_map(map_acc, row["Transfer Funds From"]): 
             return f"ERROR | 'From' Account not in QBO: '{row['Transfer Funds From']}'"
             

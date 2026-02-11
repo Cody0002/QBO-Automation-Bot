@@ -82,7 +82,7 @@ def _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates: list):
         logger.error(f"Failed to update status in sheet: {e}")
 
 def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_id: str, client_name: str):
-    BATCH_SIZE = 5  # Update the Google Sheet every 5 rows
+    BATCH_SIZE = 50  # Update the Google Sheet every 5 rows
     logger.info(f"📂 [{client_name}] Processing Control Sheet...")
     try:
         ctrl_df = gs.read_as_df(control_sheet_id, settings.CONTROL_TAB_NAME)
