@@ -44,7 +44,26 @@ def write_reconcile_results(gs, spreadsheet_url, tab_name, df, updates_list):
         batch_payload.append({"row": item["row_idx"]+2, "col": col_idx, "val": item["status"]})
     gs.batch_update_cells(spreadsheet_url, tab_name, batch_payload)
 
-
+def write_raw_check_results(gs, spreadsheet_url, tab_name, df, updates_list):
+    """Writes 'Raw Status' to the Transform file."""
+    if not updates_list: return
+    target_col_name = "Raw Reconcile"
+    
+    # Check if column exists, if not add it
+    if target_col_name in df.columns:
+        col_idx = df.columns.get_loc(target_col_name) + 1
+    else:
+        col_idx = len(df.columns) + 1
+        gs.update_cell(spreadsheet_url, tab_name, 1, col_idx, target_col_name)
+    
+    batch_payload = []
+    for item in updates_list:
+        # +2 offset for 0-index + header row
+        batch_payload.append({"row": item["row_idx"]+2, "col": col_idx, "val": item["status"]})
+    
+    # print("Add Raw Reconcile")
+    
+    gs.batch_update_cells(spreadsheet_url, tab_name, batch_payload)
 # ==============================================================================
 # LOGIC: PROCESS ONE CLIENT
 # ==============================================================================
@@ -85,6 +104,36 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
         row_updates = {}
         has_issue = False
         dt_label = pd.to_datetime(month_str).strftime("%b %y")
+        
+        # --- NEW: Fetch Raw Data for Comparison ---
+        source_url = row.get(settings.CTRL_COL_SOURCE_URL)
+        raw_tab_name = row.get(settings.CTRL_COL_TAB_NAME)
+        
+        raw_df = pd.DataFrame()
+        try:
+            if source_url and raw_tab_name:
+                logger.info(f"   📥 [{client_name}] Fetching Raw Source for Validation...")
+                # Read header_row=1 to match ingestion logic
+                raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=1, value_render_option='UNFORMATTED_VALUE')
+                            # Apply Standard Columns
+                raw_df = raw_df.iloc[:, :25]  # Keep first 25 columns
+
+                raw_df.columns = [
+                    "CO", "COY", "Date", "Category", "Type", "Item Description", 
+                    "TrxHarsh", "Account Fr", "Account To", "Currency", "Amount Fr", 
+                    "Currency To", "Amount To", "Budget", "USD - Raw", "USD - Actual", 
+                    "USD - Loss", "USD - QBO", "Reclass", "QBO Method", 
+                    "If Journal/Expense Method", "QBO Transfer Fr", "QBO Transfer To", 
+                    "Check (Internal use)", "No"
+                ]
+                
+                # 8. Numeric Cleanup
+                for col in ["No", "USD - QBO", "Amount Fr", "Amount To"]:
+                    if col in raw_df.columns:
+                        raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0)
+
+        except Exception as e:
+            logger.error(f"   ⚠️ Failed to read Raw Source: {e}")
 
         # 1. Reconcile Journals
         try:
@@ -93,10 +142,17 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
             except: df = pd.DataFrame()
 
             if not df.empty:
-                res = reconciler.reconcile_journals(df, month_str)
-                write_reconcile_results(gs, transform_url, tab, df, res)
+                # A. QBO Reconcile (Existing)
+                res_qbo = reconciler.reconcile_journals(df, month_str)
+                write_reconcile_results(gs, transform_url, tab, df, res_qbo)
                 
-                if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res):
+                # B. Raw vs Transform Reconcile (NEW)
+                if not raw_df.empty:
+                    # print("RUN")
+                    res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "JournalEntry")
+                    write_raw_check_results(gs, transform_url, tab, df, res_raw)
+                
+                if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):
                     row_updates[COL_QBO_JV] = "QBO Mismatch"
                     has_issue = True
                 else:
@@ -112,10 +168,16 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
             except: df = pd.DataFrame()
 
             if not df.empty:
-                res = reconciler.reconcile_expenses(df, month_str)
-                write_reconcile_results(gs, transform_url, tab, df, res)
+                # A. QBO Reconcile
+                res_qbo = reconciler.reconcile_expenses(df, month_str)
+                write_reconcile_results(gs, transform_url, tab, df, res_qbo)
                 
-                if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res):
+                # B. Raw Check
+                if not raw_df.empty:
+                    res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "Purchase")
+                    write_raw_check_results(gs, transform_url, tab, df, res_raw)
+                
+                if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):
                     row_updates[COL_QBO_EXP] = "QBO Mismatch"
                     has_issue = True
                 else:
@@ -131,10 +193,16 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
             except: df = pd.DataFrame()
 
             if not df.empty:
-                res = reconciler.reconcile_transfers(df, month_str)
-                write_reconcile_results(gs, transform_url, tab, df, res)
+                # A. QBO Reconcile
+                res_qbo = reconciler.reconcile_transfers(df, month_str)
+                write_reconcile_results(gs, transform_url, tab, df, res_qbo)
                 
-                if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res):
+                # B. Raw Check
+                if not raw_df.empty:
+                    res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "Transfer")
+                    write_raw_check_results(gs, transform_url, tab, df, res_raw)
+                
+                if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):
                     row_updates[COL_QBO_TR] = "QBO Mismatch"
                     has_issue = True
                 else:

@@ -152,13 +152,17 @@ def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_
 
                             msg = f"Synced at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
-                            for idx in group.index:
+
+                            for seq, idx in enumerate(group.index, start=1):
+                                formatted_id = f"{new_id}.{seq}" if new_id else ""
+
                                 updates.append({
                                     "row_idx": idx,
                                     "status": msg,
-                                    "qbo_id": new_id,
-                                    "qbo_link": qbo_link
+                                    "qbo_id": formatted_id,   # 👈 THIS IS THE CHANGE
+                                    "qbo_link": qbo_link      # 👈 Still original ID
                                 })
+                                
                         except Exception as e:
                             msg = f"ERROR: {str(e)}"
                             new_id = ""
