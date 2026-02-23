@@ -140,8 +140,9 @@ def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_
                     
                     for jv_no, group in to_sync.groupby("Journal No"):
                         if str(jv_no) in existing_docs:
+                             already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
                              for idx in group.index:
-                                updates.append({"row_idx": idx, "status": "Skipped (Already in QBO)", "qbo_id": ""})
+                                updates.append({"row_idx": idx, "status": already_synced_msg, "qbo_id": ""})
                              continue
 
                         try:
@@ -209,7 +210,8 @@ def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_
                         
                         # --- Logic: Check Duplicates ---
                         if ref_no in existing_docs:
-                            updates.append({"row_idx": idx, "status": "Skipped (Already in QBO)", "qbo_id": "", "qbo_link": ""})
+                            already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+                            updates.append({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
                         
                         # --- Logic: Push to QBO ---
                         else:
@@ -276,7 +278,8 @@ def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_
                         ref_no = str(row_data.get("Ref No", ""))
 
                         if ref_no in existing_docs:
-                            updates.append({"row_idx": idx, "status": "Skipped (Already in QBO)", "qbo_id": "", "qbo_link": ""})
+                            already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+                            updates.append({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
                         else:
                             try:
                                 resp = sync_engine.push_transfer(row_data)

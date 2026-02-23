@@ -24,6 +24,23 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("ingestion")
 
+def parse_mixed_date(series: pd.Series) -> pd.Series:
+    """Parse Excel serial dates and regular date strings safely."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    excel_mask = numeric.between(-60000, 120000)
+
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if excel_mask.any():
+        parsed.loc[excel_mask] = pd.to_datetime(
+            numeric.loc[excel_mask],
+            origin="1899-12-30",
+            unit="D",
+            errors="coerce",
+        )
+    if (~excel_mask).any():
+        parsed.loc[~excel_mask] = pd.to_datetime(series.loc[~excel_mask], errors="coerce")
+    return parsed
+
 # ==========================================
 # 1. HELPER FUNCTIONS
 # ==========================================
@@ -236,7 +253,7 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             target_start, target_end = get_month_date_range(raw_month)
             if target_start and target_end:
                 # Robust Parse
-                raw_df["_TempDate"] = pd.to_datetime(pd.to_numeric(raw_df["Date"], errors="coerce"), origin="1899-12-30", unit="D", errors="coerce")
+                raw_df["_TempDate"] = parse_mixed_date(raw_df["Date"])
                 
                 # Filter
                 month_mask = (raw_df["_TempDate"] >= target_start) & (raw_df["_TempDate"] <= target_end)

@@ -23,6 +23,23 @@ COL_CO = "CO"
 COL_IN_OUT = "In/Out"
 COL_BANK = "Account Fr"
 
+def parse_mixed_date(series: pd.Series) -> pd.Series:
+    """Parse Excel serial dates and regular date strings safely."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    excel_mask = numeric.between(-60000, 120000)
+
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if excel_mask.any():
+        parsed.loc[excel_mask] = pd.to_datetime(
+            numeric.loc[excel_mask],
+            origin="1899-12-30",
+            unit="D",
+            errors="coerce",
+        )
+    if (~excel_mask).any():
+        parsed.loc[~excel_mask] = pd.to_datetime(series.loc[~excel_mask], errors="coerce")
+    return parsed
+
 def safe_to_float(series: pd.Series, decimals: int = 4) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
     s = s.replace([np.inf, -np.inf], np.nan)
@@ -434,12 +451,7 @@ def transform_raw(raw_df: pd.DataFrame, country: str,
         df = df[df["Category"].fillna("").astype(str).str.strip() != ""]
 
     if COL_DATE in df.columns:
-        numeric_dates = pd.to_numeric(df[COL_DATE], errors="coerce")
-        date_results = pd.to_datetime(numeric_dates, origin="1899-12-30", unit="D", errors="coerce")
-        mask_nan = date_results.isna()
-        if mask_nan.any():
-            date_results[mask_nan] = pd.to_datetime(df.loc[mask_nan, COL_DATE], errors="coerce")
-        df[COL_DATE] = date_results
+        df[COL_DATE] = parse_mixed_date(df[COL_DATE])
 
     if COL_IN_OUT in df.columns: 
         df[COL_IN_OUT] = pd.to_numeric(df[COL_IN_OUT], errors="coerce").fillna(0)
