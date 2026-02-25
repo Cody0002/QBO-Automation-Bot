@@ -64,7 +64,7 @@ def _normalize_df_headers(df: pd.DataFrame) -> pd.DataFrame:
 
 # --- UPDATED HELPER FUNCTION ---
 def find_id_in_map(mapping_dict: dict, search_name: str) -> str | None:
-    if not search_name or pd.isna(search_name) or str(search_name).strip() == "":
+    if pd.isna(search_name) or str(search_name).strip() == "":
         return None
     
     # 1. Clean: Remove double spaces & trim
@@ -126,6 +126,12 @@ def _fix_grp_location(df: pd.DataFrame, col_name: str = "Location"):
         df[col_name] = df[col_name].apply(
             lambda x: "GROUP" if str(x).strip().upper() == "GRP" else x
         )
+
+
+def _is_blank(value: Any) -> bool:
+    if pd.isna(value):
+        return True
+    return str(value).strip() == ""
 
 @dataclass
 class TransformResult:
@@ -239,18 +245,20 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     map_loc = qbo_mappings.get('locations', {})
 
     def validate_journal_row(row):
+        row_no = row.get("No", "")
         if row["Journal No"] in unbalanced_ids:
             diff = round(balance_map[row["Journal No"]], 2)
-            return f"ERROR | Unbalanced ({diff})"
+            return f"ERROR | Unbalanced ({diff}) | Row No: {row_no}"
         acc_name = row["Account"]
-        if not acc_name: return "ERROR | Missing Account Name"
+        if _is_blank(acc_name):
+            return f"ERROR | Missing Account Name | Row No: {row_no}"
         
         if not find_id_in_map(map_acc, acc_name): 
-            return f"ERROR | Account not found: '{acc_name}'"
+            return f"ERROR | Account not found: '{acc_name}' | Row No: {row_no}"
             
         loc_name = row.get("Location")
-        if loc_name and not find_id_in_map(map_loc, loc_name):
-             return f"ERROR | Location not found: '{loc_name}'"
+        if (not _is_blank(loc_name)) and not find_id_in_map(map_loc, loc_name):
+             return f"ERROR | Location not found: '{loc_name}' | Row No: {row_no}"
         
         return "Ready to sync"
 
@@ -329,20 +337,24 @@ def process_expenses(df: pd.DataFrame, country: str,
     map_loc = qbo_mappings.get('locations', {})
 
     def validate_expense_row(row):
-        if not row["Account (Cr)"]: return "ERROR | Missing Source Account"
-        if not row["Expense Account (Dr)"]: return "ERROR | Missing Expense Account"
-        if pd.isna(row["Payment Date"]): return "ERROR | Missing Date"
+        row_no = row.get("No", "")
+        if _is_blank(row["Account (Cr)"]):
+            return f"ERROR | Missing Source Account | Row No: {row_no}"
+        if _is_blank(row["Expense Account (Dr)"]):
+            return f"ERROR | Missing Expense Account | Row No: {row_no}"
+        if pd.isna(row["Payment Date"]):
+            return f"ERROR | Missing Date | Row No: {row_no}"
         
         # --- MAPPING CHECKS ---
         if not find_id_in_map(map_acc, row["Account (Cr)"]): 
-            return f"ERROR | Source Account not in QBO: '{row['Account (Cr)']}'"
+            return f"ERROR | Source Account not in QBO: '{row['Account (Cr)']}' | Row No: {row_no}"
             
         if not find_id_in_map(map_acc, row["Expense Account (Dr)"]): 
-            return f"ERROR | Expense Account not in QBO: '{row['Expense Account (Dr)']}'"
+            return f"ERROR | Expense Account not in QBO: '{row['Expense Account (Dr)']}' | Row No: {row_no}"
             
         loc_name = row.get("Location")
-        if loc_name and not find_id_in_map(map_loc, loc_name): 
-            return f"ERROR | Location not in QBO: '{loc_name}'"
+        if (not _is_blank(loc_name)) and not find_id_in_map(map_loc, loc_name): 
+            return f"ERROR | Location not in QBO: '{loc_name}' | Row No: {row_no}"
         return "Ready to sync"
 
     d["Remarks"] = d.apply(validate_expense_row, axis=1)
@@ -375,9 +387,6 @@ def process_transfers(df: pd.DataFrame, country: str,
     if transfers.empty: 
         return pd.DataFrame(), start_no
 
-    transfers["Transfer Amount"] = transfers[COL_USD].abs()
-    transfers["Currency"] = "USD"
-    
     # ID GENERATION
     ref_nos = []
     for i, row in transfers.iterrows():
@@ -399,6 +408,17 @@ def process_transfers(df: pd.DataFrame, country: str,
         COL_CO: "Location",
     }
     transfers = transfers.rename(columns=rename_map)
+
+    # QBO Transfer requires positive amount.
+    # For negative source amounts, flip direction to preserve movement semantics.
+    negative_mask = pd.to_numeric(transfers[COL_USD], errors="coerce").fillna(0.0) < 0
+    if negative_mask.any():
+        from_vals = transfers.loc[negative_mask, "Transfer Funds From"].copy()
+        transfers.loc[negative_mask, "Transfer Funds From"] = transfers.loc[negative_mask, "Transfer Funds To"]
+        transfers.loc[negative_mask, "Transfer Funds To"] = from_vals
+
+    transfers["Transfer Amount"] = pd.to_numeric(transfers[COL_USD], errors="coerce").fillna(0.0).abs()
+    transfers["Currency"] = "USD"
     transfers["Memo"] = transfers["Ref No"] + " - " + transfers["Memo"].astype(str)
     
     _fix_grp_location(transfers, "Location")
@@ -408,21 +428,24 @@ def process_transfers(df: pd.DataFrame, country: str,
     map_loc = qbo_mappings.get('locations', {})
     
     def validate_transfer_row(row):
-        if not row["Transfer Funds From"]: return "ERROR | Missing From Account"
-        if not row["Transfer Funds To"]: return "ERROR | Missing To Account"
+        row_no = row.get("No", "")
+        if _is_blank(row["Transfer Funds From"]):
+            return f"ERROR | Missing From Account | Row No: {row_no}"
+        if _is_blank(row["Transfer Funds To"]):
+            return f"ERROR | Missing To Account | Row No: {row_no}"
         
         if not find_id_in_map(map_acc, row["Transfer Funds From"]): 
-            return f"ERROR | 'From' Account not in QBO: '{row['Transfer Funds From']}'"
+            return f"ERROR | 'From' Account not in QBO: '{row['Transfer Funds From']}' | Row No: {row_no}"
             
         if not find_id_in_map(map_acc, row["Transfer Funds To"]): 
-            return f"ERROR | 'To' Account not in QBO: '{row['Transfer Funds To']}'"
+            return f"ERROR | 'To' Account not in QBO: '{row['Transfer Funds To']}' | Row No: {row_no}"
             
         if row["Transfer Funds From"] == row["Transfer Funds To"]: 
-            return "ERROR | 'From' and 'To' Accounts cannot be the same"
+            return f"ERROR | 'From' and 'To' Accounts cannot be the same | Row No: {row_no}"
             
         loc_name = row.get("Location")
-        if loc_name and not find_id_in_map(map_loc, loc_name): 
-            return f"ERROR | Location not in QBO: '{loc_name}'"
+        if (not _is_blank(loc_name)) and not find_id_in_map(map_loc, loc_name): 
+            return f"ERROR | Location not in QBO: '{loc_name}' | Row No: {row_no}"
         return "Ready to sync"
 
     transfers["Remarks"] = transfers.apply(validate_transfer_row, axis=1)

@@ -15,6 +15,7 @@ from src.connectors.gsheets_client import GSheetsClient
 from src.connectors.qbo_client import QBOClient
 from src.logic.reconciler import Reconciler
 from src.utils.logger import setup_logger
+from src.logic.raw_adapter import standardize_raw_df
 
 logger = setup_logger("reconciliation_runner")
 
@@ -84,7 +85,9 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
     COL_QBO_JV = "QBO Journal"
     COL_QBO_EXP = "QBO Expense"
     COL_QBO_TR = "QBO Transfer"
-    
+
+    raw_month = str(row.get(settings.CTRL_COL_MONTH, "")).strip()
+
     for i, row in ctrl_df.iterrows():
         status = str(row.get(CTRL_COL_RECONCILE, "")).strip()
         if status != "RECONCILE NOW": continue
@@ -110,12 +113,14 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
         raw_tab_name = row.get(settings.CTRL_COL_TAB_NAME)
         
         raw_df = pd.DataFrame()
+        
         try:
             if source_url and raw_tab_name:
                 logger.info(f"   📥 [{client_name}] Fetching Raw Source for Validation...")
                 # Read header_row=1 to match ingestion logic
                 raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=1, value_render_option='UNFORMATTED_VALUE')
-                            # Apply Standard Columns
+                raw_df = standardize_raw_df(raw_df, client_name=client_name, raw_month=raw_month)
+                # Apply Standard Columns
                 raw_df = raw_df.iloc[:, :25]  # Keep first 25 columns
 
                 raw_df.columns = [

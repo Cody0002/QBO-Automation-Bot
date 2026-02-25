@@ -21,6 +21,7 @@ from src.connectors.qbo_client import QBOClient
 from src.logic.syncing import QBOSync
 from src.logic.transformer import transform_raw
 from src.utils.logger import setup_logger
+from src.logic.raw_adapter import standardize_raw_df
 
 logger = setup_logger("ingestion")
 
@@ -224,7 +225,8 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
 
             # 6. Read & Clean Source Data
             raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=1, value_render_option='UNFORMATTED_VALUE')
-            
+            raw_df = standardize_raw_df(raw_df, client_name=client_name, raw_month=raw_month)
+
             # --- LOGGING START ---
             initial_count = len(raw_df)
             logger.info(f"   📊 [{client_name}] Step 6: Raw Rows Read: {initial_count}")
