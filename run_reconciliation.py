@@ -86,8 +86,6 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
     COL_QBO_EXP = "QBO Expense"
     COL_QBO_TR = "QBO Transfer"
 
-    raw_month = str(row.get(settings.CTRL_COL_MONTH, "")).strip()
-
     for i, row in ctrl_df.iterrows():
         status = str(row.get(CTRL_COL_RECONCILE, "")).strip()
         if status != "RECONCILE NOW": continue
@@ -96,6 +94,7 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
         country = row.get(settings.CTRL_COL_COUNTRY)
         transform_url = row.get(settings.CTRL_COL_TRANSFORM_URL)
         month_str = str(row.get(settings.CTRL_COL_MONTH, ""))
+        raw_month = month_str.strip()
 
         if not transform_url or not month_str or month_str.lower() == "nan":
             _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {CTRL_COL_RECONCILE: "ERROR: Missing Info"})
