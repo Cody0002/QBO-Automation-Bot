@@ -241,13 +241,13 @@ class QBOSync:
         
         ref_no = str(row.get("Ref No", ""))
         memo = str(row.get("Memo", ""))
-        full_memo = f"{ref_no} - {memo}"
+        # full_memo = f"{ref_no} - {memo}"
 
         payload = {
             "TxnDate": _parse_date_yyyy_mm_dd(row.get("Date")),
             "Amount": abs(_parse_amount(row.get("Transfer Amount"))),
             "FromAccountRef": {"value": from_id},
             "ToAccountRef": {"value": to_id},
-            "PrivateNote": full_memo 
+            "PrivateNote": memo 
         }
         return self.client.post(f"/v3/company/{self.client.realm_id}/transfer", payload)

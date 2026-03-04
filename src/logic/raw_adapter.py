@@ -125,11 +125,15 @@ def _standardize_kzp(df: pd.DataFrame, raw_month: str) -> pd.DataFrame:
     amount = _parse_amount_series(col_or_empty(amount_col))
     date_series = _normalize_kzp_date(col_or_empty(date_col), raw_month)
 
-    # For KZP raw, COY usually carries market code (TH/PH/BD...), while CO is always KZP.
-    # Keep only compact country-like codes to avoid forcing invalid location mappings.
+    # For KZP raw, keep COY as-is and only fall back to CO when COY is blank.
+    # This prevents losing values such as "Partners"/"KZO" in Location.
     location_src = col_or_empty(coy_col)
-    location = location_src.astype(str).str.strip().str.upper()
-    location = location.where(location.str.fullmatch(r"[A-Z]{2}", na=False), "")
+    co_src = col_or_empty(co_col)
+    location = location_src.fillna(co_src).astype(str).str.strip()
+    blank_loc = location.eq("") | location.str.lower().isin(["nan", "none", "nat"])
+    fallback = co_src.astype(str).str.strip()
+    location = location.where(~blank_loc, fallback)
+    location = location.replace({"nan": "", "None": "", "NaT": ""})
 
     no_series = pd.to_numeric(col_or_empty(no_col), errors="coerce")
     if no_series.fillna(0).eq(0).all():
@@ -143,7 +147,8 @@ def _standardize_kzp(df: pd.DataFrame, raw_month: str) -> pd.DataFrame:
     out["Type"] = col_or_empty(type_col)
     out["Item Description"] = col_or_empty(desc_col)
     out["TrxHarsh"] = ""
-    out["Account Fr"] = col_or_empty(transfer_from_col)
+    # KZP journals/expenses should source account from Bank.
+    out["Account Fr"] = col_or_empty(bank_col)
     out["Account To"] = col_or_empty(bank_col)
     out["Currency"] = col_or_empty(currency_col).replace("", "USD")
     out["Amount Fr"] = amount

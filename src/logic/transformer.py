@@ -8,7 +8,10 @@ from config import settings
 import re
 
 # --- CONSTANTS ---
-PREFIX = "KZO-JV" 
+DEFAULT_JV_PREFIX = "KZO-JV"
+DEFAULT_DOC_PREFIX = "KZO"
+KZP_JV_PREFIX = "KZP-JV"
+KZP_DOC_PREFIX = "KZP"
 
 COL_NO = "No"
 COL_DATE = "Date"
@@ -133,6 +136,16 @@ def _is_blank(value: Any) -> bool:
         return True
     return str(value).strip() == ""
 
+
+def _is_kzp_case(client_name: str = "") -> bool:
+    return "kzp" in str(client_name).lower()
+
+
+def _build_id_prefixes(client_name: str = "") -> tuple[str, str]:
+    if _is_kzp_case(client_name):
+        return KZP_JV_PREFIX, KZP_DOC_PREFIX
+    return DEFAULT_JV_PREFIX, DEFAULT_DOC_PREFIX
+
 @dataclass
 class TransformResult:
     journals: pd.DataFrame
@@ -146,7 +159,7 @@ class TransformResult:
 # ==========================================
 # 1. PROCESS JOURNALS
 # ==========================================
-def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> tuple[pd.DataFrame, int]:
+def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None, client_name: str = "") -> tuple[pd.DataFrame, int]:
     print(f"\n--- DEBUG: Processing JOURNALS (Input Rows: {len(df)}) ---")
     SPECIAL_CASE = 'Reclass'
     
@@ -167,33 +180,105 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
 
     # --- A. STANDARD JOURNALS ---
     if not df_std.empty:
-        generated_ids = []
-        for _, row in df_std.iterrows():
-            s_no = int(float(str(row.get(COL_NO, 0))))
-            if existing_ids and s_no in existing_ids:
-                generated_ids.append(existing_ids[s_no])
-            else:
-                current_max += 1
-                generated_ids.append(f"{PREFIX}{str(current_max).zfill(4)}")
+        jv_prefix, _ = _build_id_prefixes(client_name)
+        
+        # Split into Normal and Reimbursement
+        is_reimb_mask = df_std[COL_TYPE].astype(str).str.strip().str.lower() == 'reimbursement'
+        df_reimb = df_std[is_reimb_mask].copy()
+        df_normal = df_std[~is_reimb_mask].copy()
+        
+        processed_normal = pd.DataFrame()
+        processed_reimb = pd.DataFrame()
 
-        df_std["Journal No"] = generated_ids
-        df_std["Currency Code"] = "USD"
-        df_std["Name"] = df_std[COL_ITEM_DESC]
-        
-        # Debit
-        deb = df_std.copy()
-        deb["Amount"] =  safe_to_float(deb[COL_USD]) * -1
-        deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_TYPE: "Account", COL_CO: "Location"})
-        
-        # Credit
-        cred = df_std.copy()
-        cred["Amount"] = pd.to_numeric(cred[COL_USD], errors='coerce').fillna(0.0)
-        cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_ACC_CR: "Account", COL_CO: "Location"})
-        
-        processed_std = pd.concat([deb, cred], ignore_index=True)
+        # 1. PROCESS NORMAL JOURNALS (1 row = 2 lines: Debit & Credit)
+        if not df_normal.empty:
+            generated_ids = []
+            for _, row in df_normal.iterrows():
+                s_no = int(float(str(row.get(COL_NO, 0))))
+                if existing_ids and s_no in existing_ids:
+                    generated_ids.append(existing_ids[s_no])
+                else:
+                    current_max += 1
+                    generated_ids.append(f"{jv_prefix}{str(current_max).zfill(4)}")
+
+            df_normal["Journal No"] = generated_ids
+            df_normal["Currency Code"] = "USD"
+            df_normal["Name"] = df_normal[COL_ITEM_DESC]
+            
+            # Debit
+            deb = df_normal.copy()
+            deb["Amount"] =  safe_to_float(deb[COL_USD]) * -1
+            deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
+            deb["Location"] = deb["Location"].fillna(df_normal[COL_CO])
+            
+            # Credit
+            cred = df_normal.copy()
+            cred["Amount"] = pd.to_numeric(cred[COL_USD], errors='coerce').fillna(0.0)
+            cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_ACC_CR: "Account", COL_CO: "Location"})
+            cred["Location"] = cred["Location"].fillna(df_normal[COL_CO])
+            
+            processed_normal = pd.concat([deb, cred], ignore_index=True)
+
+            # --- NEW: KZP Logic for Reverse (Negative) Row ---
+            if _is_kzp_case(client_name) and COL_TYPE in processed_normal.columns:
+                neg_mask = processed_normal["Amount"] < 0
+                processed_normal.loc[neg_mask, "Account"] = processed_normal.loc[neg_mask, COL_TYPE]
+
+        # 2. PROCESS REIMBURSEMENT JOURNALS (Multi-line grouped by Date, NO duplication)
+        if not df_reimb.empty:
+            df_reimb["_GroupDate"] = pd.to_datetime(df_reimb[COL_DATE], errors="coerce").dt.normalize()
+            date_map = {}
+            unique_dates = sorted(df_reimb["_GroupDate"].dropna().unique())
+            
+            for dt in unique_dates:
+                existing_id_for_date = None
+                if existing_ids:
+                    rows_on_date = df_reimb[df_reimb["_GroupDate"] == dt]
+                    for _, r in rows_on_date.iterrows():
+                        r_no = int(float(str(r.get(COL_NO, 0))))
+                        if r_no in existing_ids:
+                            existing_id_for_date = existing_ids[r_no]
+                            break
+                
+                if existing_id_for_date:
+                    date_map[dt] = existing_id_for_date
+                else:
+                    current_max += 1
+                    date_map[dt] = f"{jv_prefix}{str(current_max).zfill(4)}"
+
+            # Assign IDs
+            generated_reimb_ids = []
+            for _, row in df_reimb.iterrows():
+                s_no = int(float(str(row.get(COL_NO, 0))))
+                dt = row["_GroupDate"]
+                
+                if pd.notna(dt) and dt in date_map:
+                    generated_reimb_ids.append(date_map[dt])
+                elif existing_ids and s_no in existing_ids:
+                    generated_reimb_ids.append(existing_ids[s_no])
+                else:
+                    current_max += 1
+                    generated_reimb_ids.append(f"{jv_prefix}{str(current_max).zfill(4)}")
+
+            df_reimb["Journal No"] = generated_reimb_ids
+            df_reimb.drop(columns=["_GroupDate"], inplace=True, errors="ignore")
+            
+            # Format as Single Lines (Do NOT split into Deb/Cred)
+            df_reimb["Amount"] = pd.to_numeric(df_reimb[COL_USD], errors='coerce').fillna(0.0)
+            df_reimb["Currency Code"] = "USD"
+            df_reimb["Class"] = ""
+            df_reimb["Name"] = df_reimb[COL_ITEM_DESC]
+            
+            df_reimb = df_reimb.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
+            df_reimb["Location"] = df_reimb["Location"].fillna(df_reimb[COL_CO] if COL_CO in df_reimb.columns else "")
+            
+            processed_reimb = df_reimb
+            
+        processed_std = pd.concat([processed_normal, processed_reimb], ignore_index=True)
 
     # --- B. RECLASS JOURNALS ---
     if not df_reclass.empty:
+        jv_prefix, _ = _build_id_prefixes(client_name)
         if COL_CO in df_reclass.columns: _fix_grp_location(df_reclass, COL_CO)
         
         df_reclass["_GroupDate"] = pd.to_datetime(df_reclass[COL_DATE]).dt.normalize()
@@ -202,7 +287,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         date_map = {}
         for dt in unique_dates:
             current_max += 1
-            date_map[dt] = f"{PREFIX}{str(current_max).zfill(4)}"
+            date_map[dt] = f"{jv_prefix}{str(current_max).zfill(4)}"
         
         df_reclass["Journal No"] = df_reclass["_GroupDate"].map(date_map)
         df_reclass.drop(columns=["_GroupDate"], inplace=True, errors='ignore')
@@ -211,7 +296,9 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         df_reclass["Currency Code"] = "USD"
         df_reclass["Class"] = ""
         df_reclass["Name"] = df_reclass[COL_ITEM_DESC]
-        df_reclass = df_reclass.rename(columns={COL_ITEM_DESC: "Memo", COL_TYPE: "Account", COL_CO: "Location"})
+        df_reclass = df_reclass.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
+        # Fill NA locations with raw CO value
+        df_reclass["Location"] = df_reclass["Location"].fillna(df_reclass[COL_CO] if COL_CO in df_reclass.columns else "")
 
         processed_reclass = df_reclass[["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class"]]
 
@@ -275,7 +362,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
 # 2. PROCESS EXPENSES
 # ==========================================
 def process_expenses(df: pd.DataFrame, country: str,
-                     start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> Tuple[pd.DataFrame, int]:
+                     start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None, client_name: str = "") -> Tuple[pd.DataFrame, int]:
     print(f"\n--- DEBUG: Processing EXPENSES (Input Rows: {len(df)}) ---")
     if df is None or df.empty: return pd.DataFrame(), start_no
     if existing_ids is None: existing_ids = {}
@@ -309,6 +396,7 @@ def process_expenses(df: pd.DataFrame, country: str,
     d["Payment Date"] = pd.to_datetime(d[COL_DATE], errors="coerce")
 
     # ID GENERATION
+    _, doc_prefix = _build_id_prefixes(client_name)
     ref_nos = []
     for i, row in d.iterrows():
         s_no = int(row.get(COL_NO, 0))
@@ -317,7 +405,10 @@ def process_expenses(df: pd.DataFrame, country: str,
         else:
             mm_yy = row["Payment Date"].strftime("%m%y") if pd.notna(row["Payment Date"]) else "0000"
             start_no += 1 
-            ref_nos.append(f"KZO{country}{mm_yy}E{str(start_no).zfill(4)}")
+            if _is_kzp_case(client_name):
+                ref_nos.append(f"{doc_prefix}{mm_yy}E{str(start_no).zfill(4)}")
+            else:
+                ref_nos.append(f"{doc_prefix}{country}{mm_yy}E{str(start_no).zfill(4)}")
     
     d["Exp Ref. No"] = ref_nos
 
@@ -331,10 +422,16 @@ def process_expenses(df: pd.DataFrame, country: str,
     d["Expense Description"] = d["Memo"]
 
     _fix_grp_location(d, "Location")
+    # Fill NA locations with raw CO value
+    d["Location"] = d["Location"].fillna(d.get(COL_CO, ""))
 
     # Validation
     map_acc = qbo_mappings.get('accounts', {})
     map_loc = qbo_mappings.get('locations', {})
+    
+    # DEBUG: Log account mappings for troubleshooting
+    if not map_acc:
+        print(f"   ⚠️ WARNING: No accounts in QBO mappings for country={country}. Check realm ID.")
 
     def validate_expense_row(row):
         row_no = row.get("No", "")
@@ -346,11 +443,16 @@ def process_expenses(df: pd.DataFrame, country: str,
             return f"ERROR | Missing Date | Row No: {row_no}"
         
         # --- MAPPING CHECKS ---
-        if not find_id_in_map(map_acc, row["Account (Cr)"]): 
-            return f"ERROR | Source Account not in QBO: '{row['Account (Cr)']}' | Row No: {row_no}"
+        src_acc = row["Account (Cr)"]
+        exp_acc = row["Expense Account (Dr)"]
+        
+        if not find_id_in_map(map_acc, src_acc): 
+            available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
+            return f"ERROR | Source Account not in QBO: '{src_acc}' | Available: {available}... | Row No: {row_no}"
             
-        if not find_id_in_map(map_acc, row["Expense Account (Dr)"]): 
-            return f"ERROR | Expense Account not in QBO: '{row['Expense Account (Dr)']}' | Row No: {row_no}"
+        if not find_id_in_map(map_acc, exp_acc): 
+            available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
+            return f"ERROR | Expense Account not in QBO: '{exp_acc}' | Available: {available}... | Row No: {row_no}"
             
         loc_name = row.get("Location")
         if (not _is_blank(loc_name)) and not find_id_in_map(map_loc, loc_name): 
@@ -373,7 +475,7 @@ def process_expenses(df: pd.DataFrame, country: str,
 # 3. PROCESS TRANSFERS
 # ==========================================
 def process_transfers(df: pd.DataFrame, country: str,
-                      start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None) -> tuple[pd.DataFrame, int]:
+                      start_no: int, qbo_mappings: Dict[str, dict], existing_ids: Dict[int, str] = None, client_name: str = "") -> tuple[pd.DataFrame, int]:
     print(f"\n--- DEBUG: Processing TRANSFERS (Input Rows: {len(df)}) ---")
     if df.empty: return pd.DataFrame(), start_no
     if existing_ids is None: existing_ids = {}
@@ -388,6 +490,7 @@ def process_transfers(df: pd.DataFrame, country: str,
         return pd.DataFrame(), start_no
 
     # ID GENERATION
+    _, doc_prefix = _build_id_prefixes(client_name)
     ref_nos = []
     for i, row in transfers.iterrows():
         s_no = int(row.get(COL_NO, 0))
@@ -397,7 +500,10 @@ def process_transfers(df: pd.DataFrame, country: str,
             dt = pd.to_datetime(row[COL_DATE], errors='coerce')
             date_str = dt.strftime('%m%y') if pd.notna(dt) else "0000"
             start_no += 1
-            ref_nos.append(f"KZO{country}{date_str}T{str(start_no).zfill(4)}")
+            if _is_kzp_case(client_name):
+                ref_nos.append(f"{doc_prefix}{date_str}T{str(start_no).zfill(4)}")
+            else:
+                ref_nos.append(f"{doc_prefix}{country}{date_str}T{str(start_no).zfill(4)}")
 
     transfers["Ref No"] = ref_nos
 
@@ -422,10 +528,16 @@ def process_transfers(df: pd.DataFrame, country: str,
     transfers["Memo"] = transfers["Ref No"] + " - " + transfers["Memo"].astype(str)
     
     _fix_grp_location(transfers, "Location")
+    # Fill NA locations with raw CO value
+    transfers["Location"] = transfers["Location"].fillna(transfers.get(COL_CO, ""))
 
     # Validation
     map_acc = qbo_mappings.get('accounts', {})
     map_loc = qbo_mappings.get('locations', {})
+    
+    # DEBUG: Log account mappings for troubleshooting
+    if not map_acc:
+        print(f"   ⚠️ WARNING: No accounts in QBO mappings for country={country}. Check realm ID.")
     
     def validate_transfer_row(row):
         row_no = row.get("No", "")
@@ -434,11 +546,16 @@ def process_transfers(df: pd.DataFrame, country: str,
         if _is_blank(row["Transfer Funds To"]):
             return f"ERROR | Missing To Account | Row No: {row_no}"
         
-        if not find_id_in_map(map_acc, row["Transfer Funds From"]): 
-            return f"ERROR | 'From' Account not in QBO: '{row['Transfer Funds From']}' | Row No: {row_no}"
+        from_acc = row["Transfer Funds From"]
+        to_acc = row["Transfer Funds To"]
+        
+        if not find_id_in_map(map_acc, from_acc): 
+            available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
+            return f"ERROR | 'From' Account not in QBO: '{from_acc}' | Available: {available}... | Row No: {row_no}"
             
-        if not find_id_in_map(map_acc, row["Transfer Funds To"]): 
-            return f"ERROR | 'To' Account not in QBO: '{row['Transfer Funds To']}' | Row No: {row_no}"
+        if not find_id_in_map(map_acc, to_acc): 
+            available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
+            return f"ERROR | 'To' Account not in QBO: '{to_acc}' | Available: {available}... | Row No: {row_no}"
             
         if row["Transfer Funds From"] == row["Transfer Funds To"]: 
             return f"ERROR | 'From' and 'To' Accounts cannot be the same | Row No: {row_no}"
@@ -460,7 +577,7 @@ def process_transfers(df: pd.DataFrame, country: str,
 # 4. MAIN TRANSFORM ENTRY POINT
 # ==========================================
 def transform_raw(raw_df: pd.DataFrame, country: str,
-                  last_jv: int, last_exp: int, last_tr: int, qbo_mappings: Dict[str, dict] = None, existing_ids: Dict[str, dict] = None) -> TransformResult:
+                  last_jv: int, last_exp: int, last_tr: int, qbo_mappings: Dict[str, dict] = None, existing_ids: Dict[str, dict] = None, client_name: str = "") -> TransformResult:
     if raw_df is None or raw_df.empty:
         return TransformResult(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), last_jv, last_exp, last_tr, None)
 
@@ -483,9 +600,9 @@ def transform_raw(raw_df: pd.DataFrame, country: str,
         df[COL_USD] = pd.to_numeric(df[COL_USD], errors="coerce").fillna(0.0)
         df = df[~df[COL_USD].isna()]
 
-    final_jv, new_jv_no = process_journals(df, last_jv, qbo_mappings, existing_ids.get('journals') if existing_ids else None)
-    final_exp, new_exp_no = process_expenses(df, country, last_exp, qbo_mappings, existing_ids.get('expenses') if existing_ids else None)
-    final_tr, new_tr_no = process_transfers(df, country, last_tr, qbo_mappings, existing_ids.get('transfers') if existing_ids else None)
+    final_jv, new_jv_no = process_journals(df, last_jv, qbo_mappings, existing_ids.get('journals') if existing_ids else None, client_name=client_name)
+    final_exp, new_exp_no = process_expenses(df, country, last_exp, qbo_mappings, existing_ids.get('expenses') if existing_ids else None, client_name=client_name)
+    final_tr, new_tr_no = process_transfers(df, country, last_tr, qbo_mappings, existing_ids.get('transfers') if existing_ids else None, client_name=client_name)
 
     max_row = int(df[COL_NO].max()) if not df.empty else None
 

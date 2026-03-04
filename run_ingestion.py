@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv("config/secrets.env")
 
 import calendar
+import re
 from datetime import datetime
 from typing import Tuple, List, Dict
 import pandas as pd
@@ -80,6 +81,54 @@ def format_month_name(date_str: str) -> str:
     except:
         return date_str
 
+def _parse_no_set(raw_val) -> set[int]:
+    if pd.isna(raw_val) or str(raw_val).strip() == "":
+        return set()
+    out: set[int] = set()
+    for tok in re.split(r"[,\s;|]+", str(raw_val).strip()):
+        if not tok:
+            continue
+        try:
+            n = int(float(tok))
+            if n > 0:
+                out.add(n)
+        except Exception:
+            continue
+    return out
+
+def _serialize_no_set(vals: set[int]) -> str:
+    if not vals:
+        return ""
+    return ";".join(str(x) for x in sorted(vals))
+
+def _get_successfully_processed_nos(gs: GSheetsClient, spreadsheet_url: str, tabs: list[str]) -> set[int]:
+    """
+    Returns set of raw 'No' values that already exist in any output tab
+    with a non-error Remarks (used to avoid reprocessing fully-completed rows).
+    """
+    processed: set[int] = set()
+    for tab in tabs:
+        try:
+            df_out = gs.read_as_df_sync(spreadsheet_url, tab)
+        except Exception:
+            df_out = pd.DataFrame()
+
+        if df_out.empty or "No" not in df_out.columns:
+            continue
+
+        df_tmp = df_out.copy()
+        if "Remarks" in df_tmp.columns:
+            err_mask = df_tmp["Remarks"].astype(str).str.contains("ERROR|Unbalance", case=False, na=False)
+            df_tmp = df_tmp[~err_mask]
+
+        if df_tmp.empty:
+            continue
+
+        nos = pd.to_numeric(df_tmp["No"], errors="coerce").dropna().astype(int).tolist()
+        processed.update(nos)
+
+    return processed
+
 def get_retry_context(gs: GSheetsClient, spreadsheet_url: str, tab_name: str, id_col_name: str) -> Tuple[List[int], Dict[int, str]]:
     """Identifies rows marked as 'ERROR' in the Transform file to re-process them."""
     print(tab_name, id_col_name)
@@ -128,7 +177,11 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
     try:
         temp_sync = QBOSync(qbo_client)
         qbo_mappings = temp_sync.mappings
-        logger.info(f"   ✅ [{client_name}] QBO Mappings fetched successfully.")
+        num_accounts = len(qbo_mappings.get('accounts', {}))
+        num_locations = len(qbo_mappings.get('locations', {}))
+        logger.info(f"   ✅ [{client_name}] QBO Mappings fetched: {num_accounts} accounts, {num_locations} locations.")
+        if num_accounts == 0:
+            logger.warning(f"   ⚠️ [{client_name}] WARNING: No accounts found! Check Realm ID is correct.")
     except Exception as e:
         logger.error(f"   ❌ [{client_name}] Failed to fetch mappings. Check Realm ID/Token. Error: {e}")
         return
@@ -151,6 +204,7 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
     COL_QBO_JV = "QBO Journal"
     COL_QBO_EXP = "QBO Expense"
     COL_QBO_TR = "QBO Transfer"
+    COL_PENDING_AMOUNT_NOS = "Pending Amount Nos"
     def safe_int(val):
         try: return int(float(val))
         except: return 0
@@ -195,19 +249,22 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             # 4. Prepare ID Counters
             last_processed = safe_int(row.get(settings.CTRL_COL_LAST_PROCESSED_ROW, 0))
             
-            # Fetch latest QBO Journal No to prevent overlap
-            qbo_last_jv = qbo_client.get_max_journal_number("KZO-JV")
+            # Fetch latest QBO Journal No to prevent overlap.
+            # KZP has a dedicated Journal prefix.
+            journal_prefix = "KZP-JV" if "kzp" in client_name.lower() else "KZO-JV"
+            qbo_last_jv = qbo_client.get_max_journal_number(journal_prefix)
             final_start_jv = max(global_last_jv, qbo_last_jv)
             
             last_exp = safe_int(row.get(COL_LAST_EXP, 0))
             last_tr = safe_int(row.get(COL_LAST_TR, 0))
+            previous_pending_nos = _parse_no_set(row.get(COL_PENDING_AMOUNT_NOS, ""))
 
             tab_prefix = f"{country} {month}"
             tab_jv, tab_exp, tab_tr = f"{tab_prefix} - Journals", f"{tab_prefix} - Expenses", f"{tab_prefix} - Transfers"
         
             # 5. Handle Retries (Find 'ERROR' rows in Output)
             preserved_ids = {'journals': {}, 'expenses': {}, 'transfers': {}}
-            deletions = {}
+            deletions: Dict[str, List[int]] = {}
 
             # Check Journals tab
             d_jv, ids_jv = get_retry_context(gs, transform_url, tab_jv, "Journal No")
@@ -222,6 +279,8 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             if d_tr: deletions[tab_tr] = d_tr; preserved_ids['transfers'] = ids_tr
 
             retry_nos = list(set([k for sub in preserved_ids.values() for k in sub.keys()]))
+            tabs_out = [tab_jv, tab_exp, tab_tr]
+            processed_ok_nos = _get_successfully_processed_nos(gs, transform_url, tabs_out)
 
             # 6. Read & Clean Source Data
             raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=1, value_render_option='UNFORMATTED_VALUE')
@@ -273,7 +332,7 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
                     _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "DONE (No Data)"})
                     continue
 
-            # 8. Numeric Cleanup
+            # 8. Numeric Cleanup (Do this first so we can check for 0 amounts)
             for col in ["No", "USD - QBO", "Amount Fr", "Amount To"]:
                 if col in raw_df.columns:
                     raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0)
@@ -282,26 +341,61 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             before_exclude = len(raw_df)
             raw_df = raw_df[~raw_df["Check (Internal use)"].astype(str).str.contains("exclude", na=False, case=False)].copy()
 
-            # --- LOGGING EXCLUDE FILTER ---
             after_exclude = len(raw_df)
             dropped_exclude = before_exclude - after_exclude
             if dropped_exclude > 0:
                 logger.info(f"   🚫 [{client_name}] Step 9: 'Exclude' Filter -> Kept: {after_exclude} | Dropped: {dropped_exclude}")
-            # ------------------------------
 
-            # 10. Select Rows to Process (New + Retry)
-            new_df = raw_df[raw_df["No"] > last_processed].copy()
-            retry_df = raw_df[raw_df["No"].isin(retry_nos)].copy()
-            processing_df = pd.concat([new_df, retry_df]).drop_duplicates(subset=["No"])
+            # 10. Track Pending Rows & Select Rows to Process
+            method_col = "QBO Method"
+            amount_col = "USD - QBO" # We use USD - QBO as the standard amount column
+
+            method_non_blank = raw_df[method_col].notna() & (raw_df[method_col].str.strip() != "")
+            amt_numeric = raw_df[amount_col] # Already converted to numeric in Step 8
+
+            # ---> A. Identify Pending Rows (Method exists, but amount is 0)
+            pending_amount_mask = method_non_blank & (amt_numeric == 0)
+            current_pending_nos = set(
+                int(x) for x in raw_df.loc[pending_amount_mask, "No"].astype(int).tolist() if int(x) > 0
+            )
+
+            # ---> B. Identify Ready Rows (Method exists, and amount is NOT 0)
+            ready_mask = method_non_blank & (amt_numeric != 0)
+            ready_df = raw_df[ready_mask].copy()
+
+            # 10a. Strictly new rows (No > last_processed)
+            new_df = ready_df[ready_df["No"] > last_processed].copy()
+
+            # 10b. Late-filled rows: No <= last_processed, not yet successfully processed
+            late_filled_df = ready_df[
+                (ready_df["No"] <= last_processed) &
+                (ready_df["No"].isin(previous_pending_nos))
+            ].copy()
+
+            # 10c. Explicit retries from ERROR outputs
+            retry_df = ready_df[ready_df["No"].isin(retry_nos)].copy()
+
+            processing_df = (
+                pd.concat([new_df, late_filled_df, retry_df])
+                  .drop_duplicates(subset=["No"])
+            )
 
             # --- LOGGING SELECTION ---
             dropped_processed = after_exclude - len(processing_df)
-            logger.info(f"   🔢 [{client_name}] Step 10: Selection -> New: {len(new_df)}, Retry: {len(retry_df)} | Total: {len(processing_df)} | Skipped (Old): {dropped_processed}")
+            logger.info(
+                f"   🔢 [{client_name}] Step 10: Selection -> New: {len(new_df)}, "
+                f"Late-filled: {len(late_filled_df)}, Retry: {len(retry_df)} | "
+                f"Total: {len(processing_df)} | Skipped (Old & done): {dropped_processed}"
+            )
             # -------------------------
 
             if processing_df.empty:
                 logger.info(f"   [{client_name}] No new rows to process.")
-                _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(), settings.CTRL_COL_ACTIVE: "DONE"})
+                _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {
+                    settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(), 
+                    COL_PENDING_AMOUNT_NOS: _serialize_no_set(current_pending_nos), # <-- ADDED
+                    settings.CTRL_COL_ACTIVE: "DONE"
+                })
                 continue
             
             # 11. Execute Deletions (Clean up bad rows before appending new ones)
@@ -317,7 +411,8 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
                 last_tr=last_tr, 
                 country=country,  # <--- NEW ARGUMENT
                 qbo_mappings=qbo_mappings, 
-                existing_ids=preserved_ids
+                existing_ids=preserved_ids,
+                client_name=client_name
             )
             # 13. Write Output
             # Note: We use 'control_sheet_id' as the template source. 
@@ -361,6 +456,7 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
                 COL_LAST_JV: result.last_journal_no,
                 COL_LAST_EXP: result.last_expense_no,
                 COL_LAST_TR: result.last_withdraw_no,
+                COL_PENDING_AMOUNT_NOS: _serialize_no_set(current_pending_nos), # <-- ADDED
                 settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
                 settings.CTRL_COL_ACTIVE: "DONE"
             }
@@ -418,7 +514,9 @@ def main():
 
         # 1. Authenticate / Switch Context
         try:
+            logger.info(f"🔐 [{client_name}] Authenticating with Realm ID: {realm_id}")
             qbo_client.set_company(realm_id)
+            logger.info(f"✅ [{client_name}] Successfully authenticated. Ready to fetch QBO mappings.")
         except Exception as e:
             logger.error(f"❌ Critical Auth Failure for {client_name}: {e}")
             continue
