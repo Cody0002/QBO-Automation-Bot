@@ -284,6 +284,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         return "Ready to sync"
 
     total_journals["Remarks"] = total_journals.apply(validate_journal_row, axis=1)
+    total_journals["Class"] = total_journals.get("Location", "").fillna("")
 
     cols_order = ["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class", "Remarks"]
     for c in cols_order:
@@ -358,6 +359,7 @@ def process_expenses(df: pd.DataFrame, country: str,
     _fix_grp_location(d, "Location")
     # Fill NA locations with raw CO value
     d["Location"] = d["Location"].fillna(d.get(COL_CO, ""))
+    d["Class"] = d["Location"].fillna("")
 
     # Validation
     map_acc = qbo_mappings.get('accounts', {})
@@ -395,7 +397,7 @@ def process_expenses(df: pd.DataFrame, country: str,
 
     d["Remarks"] = d.apply(validate_expense_row, axis=1)
 
-    cols_order = ["No", "Exp Ref. No", "Account (Cr)", "Payee (Dummy)", "Memo", "Payment Date", "Payment Method", "Expense Account (Dr)", "Expense Description", "Expense Line Amount", "Currency", "Location", "Remarks"]
+    cols_order = ["No", "Exp Ref. No", "Account (Cr)", "Payee (Dummy)", "Memo", "Payment Date", "Payment Method", "Expense Account (Dr)", "Expense Description", "Expense Line Amount", "Currency", "Location", "Class", "Remarks"]
     for c in cols_order:
         if c not in d.columns: d[c] = ""
     
@@ -464,6 +466,7 @@ def process_transfers(df: pd.DataFrame, country: str,
     _fix_grp_location(transfers, "Location")
     # Fill NA locations with raw CO value
     transfers["Location"] = transfers["Location"].fillna(transfers.get(COL_CO, ""))
+    transfers["Class"] = transfers["Location"].fillna("")
 
     # Validation
     map_acc = qbo_mappings.get('accounts', {})
@@ -501,7 +504,7 @@ def process_transfers(df: pd.DataFrame, country: str,
 
     transfers["Remarks"] = transfers.apply(validate_transfer_row, axis=1)
 
-    cols_order = ["No", "Ref No", "Transfer Funds From", "Transfer Funds To", "Transfer Amount", "Memo", COL_DATE, "Location", "Currency", COL_TYPE, "Remarks"]
+    cols_order = ["No", "Ref No", "Transfer Funds From", "Transfer Funds To", "Transfer Amount", "Memo", COL_DATE, "Location", "Class", "Currency", COL_TYPE, "Remarks"]
     for c in cols_order:
         if c not in transfers.columns: transfers[c] = ""
     
