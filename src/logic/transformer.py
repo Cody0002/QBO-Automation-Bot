@@ -181,100 +181,34 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     # --- A. STANDARD JOURNALS ---
     if not df_std.empty:
         jv_prefix, _ = _build_id_prefixes(client_name)
+        generated_ids = []
+        for _, row in df_std.iterrows():
+            s_no = int(float(str(row.get(COL_NO, 0))))
+            if existing_ids and s_no in existing_ids:
+                generated_ids.append(existing_ids[s_no])
+            else:
+                current_max += 1
+                generated_ids.append(f"{jv_prefix}{str(current_max).zfill(4)}")
+
+        df_std["Journal No"] = generated_ids
+        df_std["Currency Code"] = "USD"
+        df_std["Name"] = df_std[COL_ITEM_DESC]
         
-        # Split into Normal and Reimbursement
-        is_reimb_mask = df_std[COL_TYPE].astype(str).str.strip().str.lower() == 'reimbursement'
-        df_reimb = df_std[is_reimb_mask].copy()
-        df_normal = df_std[~is_reimb_mask].copy()
+        # Debit - Use Bank Account (COL_BANK) instead of Type
+        deb = df_std.copy()
+        deb["Amount"] =  safe_to_float(deb[COL_USD]) * -1
+        deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
+        # Fill NA locations with raw CO value
+        deb["Location"] = deb["Location"].fillna(df_std[COL_CO])
         
-        processed_normal = pd.DataFrame()
-        processed_reimb = pd.DataFrame()
-
-        # 1. PROCESS NORMAL JOURNALS (1 row = 2 lines: Debit & Credit)
-        if not df_normal.empty:
-            generated_ids = []
-            for _, row in df_normal.iterrows():
-                s_no = int(float(str(row.get(COL_NO, 0))))
-                if existing_ids and s_no in existing_ids:
-                    generated_ids.append(existing_ids[s_no])
-                else:
-                    current_max += 1
-                    generated_ids.append(f"{jv_prefix}{str(current_max).zfill(4)}")
-
-            df_normal["Journal No"] = generated_ids
-            df_normal["Currency Code"] = "USD"
-            df_normal["Name"] = df_normal[COL_ITEM_DESC]
-            
-            # Debit
-            deb = df_normal.copy()
-            deb["Amount"] =  safe_to_float(deb[COL_USD]) * -1
-            deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
-            deb["Location"] = deb["Location"].fillna(df_normal[COL_CO])
-            
-            # Credit
-            cred = df_normal.copy()
-            cred["Amount"] = pd.to_numeric(cred[COL_USD], errors='coerce').fillna(0.0)
-            cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_ACC_CR: "Account", COL_CO: "Location"})
-            cred["Location"] = cred["Location"].fillna(df_normal[COL_CO])
-            
-            processed_normal = pd.concat([deb, cred], ignore_index=True)
-
-            # --- NEW: KZP Logic for Reverse (Negative) Row ---
-            if _is_kzp_case(client_name) and COL_TYPE in processed_normal.columns:
-                neg_mask = processed_normal["Amount"] < 0
-                processed_normal.loc[neg_mask, "Account"] = processed_normal.loc[neg_mask, COL_TYPE]
-
-        # 2. PROCESS REIMBURSEMENT JOURNALS (Multi-line grouped by Date, NO duplication)
-        if not df_reimb.empty:
-            df_reimb["_GroupDate"] = pd.to_datetime(df_reimb[COL_DATE], errors="coerce").dt.normalize()
-            date_map = {}
-            unique_dates = sorted(df_reimb["_GroupDate"].dropna().unique())
-            
-            for dt in unique_dates:
-                existing_id_for_date = None
-                if existing_ids:
-                    rows_on_date = df_reimb[df_reimb["_GroupDate"] == dt]
-                    for _, r in rows_on_date.iterrows():
-                        r_no = int(float(str(r.get(COL_NO, 0))))
-                        if r_no in existing_ids:
-                            existing_id_for_date = existing_ids[r_no]
-                            break
-                
-                if existing_id_for_date:
-                    date_map[dt] = existing_id_for_date
-                else:
-                    current_max += 1
-                    date_map[dt] = f"{jv_prefix}{str(current_max).zfill(4)}"
-
-            # Assign IDs
-            generated_reimb_ids = []
-            for _, row in df_reimb.iterrows():
-                s_no = int(float(str(row.get(COL_NO, 0))))
-                dt = row["_GroupDate"]
-                
-                if pd.notna(dt) and dt in date_map:
-                    generated_reimb_ids.append(date_map[dt])
-                elif existing_ids and s_no in existing_ids:
-                    generated_reimb_ids.append(existing_ids[s_no])
-                else:
-                    current_max += 1
-                    generated_reimb_ids.append(f"{jv_prefix}{str(current_max).zfill(4)}")
-
-            df_reimb["Journal No"] = generated_reimb_ids
-            df_reimb.drop(columns=["_GroupDate"], inplace=True, errors="ignore")
-            
-            # Format as Single Lines (Do NOT split into Deb/Cred)
-            df_reimb["Amount"] = pd.to_numeric(df_reimb[COL_USD], errors='coerce').fillna(0.0)
-            df_reimb["Currency Code"] = "USD"
-            df_reimb["Class"] = ""
-            df_reimb["Name"] = df_reimb[COL_ITEM_DESC]
-            
-            df_reimb = df_reimb.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
-            df_reimb["Location"] = df_reimb["Location"].fillna(df_reimb[COL_CO] if COL_CO in df_reimb.columns else "")
-            
-            processed_reimb = df_reimb
-            
-        processed_std = pd.concat([processed_normal, processed_reimb], ignore_index=True)
+        # Credit
+        cred = df_std.copy()
+        cred["Amount"] = pd.to_numeric(cred[COL_USD], errors='coerce').fillna(0.0)
+        cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_ACC_CR: "Account", COL_CO: "Location"})
+        # Fill NA locations with raw CO value
+        cred["Location"] = cred["Location"].fillna(df_std[COL_CO])
+        
+        processed_std = pd.concat([deb, cred], ignore_index=True)
 
     # --- B. RECLASS JOURNALS ---
     if not df_reclass.empty:

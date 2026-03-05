@@ -502,6 +502,13 @@ def main():
         if status.lower() != "active":
             continue
 
+        if not settings.is_allowed_workspace(client_name):
+            logger.warning(
+                f"⚠️ Skipping {client_name}: workspace not allowed for QBO API. "
+                f"Allowed: {', '.join(settings.ALLOWED_QBO_WORKSPACES)}"
+            )
+            continue
+
         sheet_id = str(client_row.get(settings.MST_COL_SHEET_ID, "")).strip()
         realm_id = str(client_row.get(settings.MST_COL_REALM_ID, "")).strip()
 

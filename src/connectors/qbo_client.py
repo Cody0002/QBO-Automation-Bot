@@ -23,9 +23,11 @@ class QBOClient:
         
         # State variables
         self.realm_id: str | None = None
+        self.client_name: str | None = None
         self.refresh_token: str | None = None
         self.access_token: str | None = None
         self.token_expiry: float = 0.0
+        self._workspace_authorized: bool = False
         
         # Cache the Master Sheet row index for the current realm to speed up writes
         self._master_sheet_row_idx: int | None = None
@@ -36,11 +38,20 @@ class QBOClient:
         Reads the latest Refresh Token from the Master Sheet.
         """
         self.realm_id = str(realm_id).strip()
+        self.client_name = None
+        self._workspace_authorized = False
         self.access_token = None # Clear old access token
         self.token_expiry = 0.0
         
         print(f"🔄 [QBOClient] Switching context to Realm ID: {self.realm_id}")
         self._load_auth_from_sheet()
+
+    def _ensure_workspace_authorized(self):
+        if not self._workspace_authorized:
+            raise PermissionError(
+                f"Workspace '{self.client_name or 'Unknown'}' is not allowed. "
+                f"QBO API call blocked for Realm ID {self.realm_id}."
+            )
 
     def _load_auth_from_sheet(self):
         """Finds the refresh token in the Master Sheet for the current Realm ID."""
@@ -57,6 +68,13 @@ class QBOClient:
             raise ValueError(f"Realm ID {self.realm_id} not found in Master Sheet!")
 
         row_data = df[mask].iloc[0]
+        self.client_name = str(row_data.get(settings.MST_COL_CLIENT, "")).strip()
+        if not settings.is_allowed_workspace(self.client_name):
+            raise PermissionError(
+                f"Workspace '{self.client_name}' is not in ALLOWED_QBO_WORKSPACES "
+                f"({', '.join(settings.ALLOWED_QBO_WORKSPACES)})."
+            )
+        self._workspace_authorized = True
         
         # Calculate Row Number (Dataframe index + 2 for header/0-index correction)
         self._master_sheet_row_idx = df.index[mask][0] + 2
@@ -103,6 +121,7 @@ class QBOClient:
 
     def refresh_access_token(self) -> str:
         """Exchanges refresh_token for access_token. Handles rotation automatically."""
+        self._ensure_workspace_authorized()
         if not self.refresh_token:
             raise ValueError("Cannot refresh: No Refresh Token available.")
 
@@ -139,6 +158,7 @@ class QBOClient:
         return self.access_token
 
     def _headers(self) -> Dict[str, str]:
+        self._ensure_workspace_authorized()
         return {
             "Authorization": f"Bearer {self.get_access_token()}",
             "Accept": "application/json",

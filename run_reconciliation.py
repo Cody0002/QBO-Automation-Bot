@@ -240,6 +240,12 @@ def main():
     for i, client_row in master_df.iterrows():
         client_name = str(client_row.get(settings.MST_COL_CLIENT, "Unknown"))
         if str(client_row.get(settings.MST_COL_STATUS, "")).strip().lower() != "active": continue
+        if not settings.is_allowed_workspace(client_name):
+            logger.warning(
+                f"⚠️ Skipping {client_name}: workspace not allowed for QBO API. "
+                f"Allowed: {', '.join(settings.ALLOWED_QBO_WORKSPACES)}"
+            )
+            continue
 
         sheet_id = str(client_row.get(settings.MST_COL_SHEET_ID, "")).strip()
         realm_id = str(client_row.get(settings.MST_COL_REALM_ID, "")).strip()

@@ -60,6 +60,23 @@ MST_COL_STATUS = "Status"
 MST_COL_OUTPUT = "Output Folder"
 MST_COL_REFRESH_TOKEN = "Refresh Token"  # <--- NEW COLUMN
 
+# Allowed workspaces for QBO API calls.
+# Comma-separated list, e.g. "KZP,KZO,KZO Sports"
+ALLOWED_QBO_WORKSPACES = tuple(
+    x.strip() for x in os.getenv("ALLOWED_QBO_WORKSPACES", "KZP,KZO,KZO Sports").split(",")
+    if x.strip()
+)
+
+def normalize_workspace_name(name: str) -> str:
+    return " ".join(str(name or "").strip().lower().split())
+
+def is_allowed_workspace(name: str) -> bool:
+    normalized = normalize_workspace_name(name)
+    if not normalized:
+        return False
+    allowed = {normalize_workspace_name(x) for x in ALLOWED_QBO_WORKSPACES}
+    return normalized in allowed
+
 @dataclass(frozen=True)
 class ControlRow:
     country: str
