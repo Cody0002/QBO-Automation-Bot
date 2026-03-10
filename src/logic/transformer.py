@@ -166,10 +166,23 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     if df.empty: return pd.DataFrame(), start_no
     if COL_METHOD not in df.columns: return pd.DataFrame(), start_no
     
-    df.loc[df[SPECIAL_CASE] == 'Reclass', COL_USD] *= -1
+    # KZP special rule: Type == Reimbursements should follow reclass grouping behavior.
+    mask_kzp_reimbursements = pd.Series(False, index=df.index)
+    if _is_kzp_case(client_name) and COL_TYPE in df.columns:
+        mask_kzp_reimbursements = (
+            df[COL_TYPE].astype(str).str.strip().str.lower() == "reimbursements"
+        )
 
-    mask_std = df[COL_METHOD].astype(str).str.contains("Journal", case=False, na=False)
-    mask_reclass = df[COL_METHOD].astype(str).str.contains("Reclass", case=False, na=False)
+    mask_reclass = (
+        df[COL_METHOD].astype(str).str.contains("Reclass", case=False, na=False)
+        | mask_kzp_reimbursements
+    )
+    df.loc[(df[SPECIAL_CASE] == 'Reclass') | mask_kzp_reimbursements, COL_USD] *= -1
+
+    mask_std = (
+        df[COL_METHOD].astype(str).str.contains("Journal", case=False, na=False)
+        & ~mask_reclass
+    )
     
     df_std = df[mask_std].copy()
     df_reclass = df[mask_reclass].copy()
