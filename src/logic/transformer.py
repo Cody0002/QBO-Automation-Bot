@@ -169,9 +169,10 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     # KZP special rule: Type == Reimbursements keeps Journal debit/credit behavior,
     # but Journal No is grouped by date (handled in ID generation below).
     mask_kzp_reimbursements = pd.Series(False, index=df.index)
+    type_series = df[COL_TYPE] if COL_TYPE in df.columns else pd.Series("", index=df.index)
     if _is_kzp_case(client_name) and COL_TYPE in df.columns:
         mask_kzp_reimbursements = (
-            df[COL_TYPE].astype(str).str.strip().str.lower() == "reimbursements"
+            type_series.astype(str).str.strip().str.lower() == "reimbursements"
         )
 
     # Keep true Reclass behavior for non-reimbursements only.
@@ -237,13 +238,17 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         deb = df_std.copy()
         deb["Amount"] =  safe_to_float(deb[COL_USD]) * -1
         if _is_kzp_case(client_name):
-            deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_TYPE: "Account", COL_CO: "Location"})
+            deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
+            if COL_TYPE in deb.columns:
+                deb["Account"] = deb[COL_TYPE]
+            else:
+                deb["Account"] = ""
             if COL_BANK in deb.columns:
                 deb["Account"] = deb["Account"].where(
                     deb["Account"].astype(str).str.strip() != "",
                     deb[COL_BANK],
                 )
-                deb["Account"] = deb["Account"].fillna(deb[COL_TYPE])
+                deb["Account"] = deb["Account"].fillna(deb[COL_BANK])
         else:
             deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
             # Fallback for old layouts where debit account sits in Type.
@@ -260,7 +265,13 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         cred = df_std.copy()
         cred["Amount"] = pd.to_numeric(cred[COL_USD], errors='coerce').fillna(0.0)
         if _is_kzp_case(client_name):
-            cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
+            cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
+            if COL_BANK in cred.columns:
+                cred["Account"] = cred[COL_BANK]
+            elif COL_ACC_CR in cred.columns:
+                cred["Account"] = cred[COL_ACC_CR]
+            else:
+                cred["Account"] = ""
             if COL_ACC_CR in cred.columns:
                 cred["Account"] = cred["Account"].where(
                     cred["Account"].astype(str).str.strip() != "",
