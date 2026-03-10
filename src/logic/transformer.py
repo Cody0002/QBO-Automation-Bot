@@ -166,23 +166,18 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     if df.empty: return pd.DataFrame(), start_no
     if COL_METHOD not in df.columns: return pd.DataFrame(), start_no
     
-    # KZP special rule: Type == Reimbursements should follow reclass grouping behavior.
+    # KZP special rule: Type == Reimbursements keeps Journal debit/credit behavior,
+    # but Journal No is grouped by date (handled in ID generation below).
     mask_kzp_reimbursements = pd.Series(False, index=df.index)
     if _is_kzp_case(client_name) and COL_TYPE in df.columns:
         mask_kzp_reimbursements = (
             df[COL_TYPE].astype(str).str.strip().str.lower() == "reimbursements"
         )
 
-    mask_reclass = (
-        df[COL_METHOD].astype(str).str.contains("Reclass", case=False, na=False)
-        | mask_kzp_reimbursements
-    )
-    df.loc[(df[SPECIAL_CASE] == 'Reclass') | mask_kzp_reimbursements, COL_USD] *= -1
+    df.loc[df[SPECIAL_CASE] == 'Reclass', COL_USD] *= -1
 
-    mask_std = (
-        df[COL_METHOD].astype(str).str.contains("Journal", case=False, na=False)
-        & ~mask_reclass
-    )
+    mask_std = df[COL_METHOD].astype(str).str.contains("Journal", case=False, na=False)
+    mask_reclass = df[COL_METHOD].astype(str).str.contains("Reclass", case=False, na=False)
     
     df_std = df[mask_std].copy()
     df_reclass = df[mask_reclass].copy()
@@ -194,11 +189,34 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     # --- A. STANDARD JOURNALS ---
     if not df_std.empty:
         jv_prefix, _ = _build_id_prefixes(client_name)
+        reimbursements_in_std = pd.Series(False, index=df_std.index)
+        reimburse_date_map = {}
+        if _is_kzp_case(client_name) and COL_TYPE in df_std.columns:
+            reimbursements_in_std = (
+                df_std[COL_TYPE].astype(str).str.strip().str.lower() == "reimbursements"
+            )
+            if reimbursements_in_std.any() and COL_DATE in df_std.columns:
+                reimburse_dates = pd.to_datetime(df_std[COL_DATE], errors="coerce").dt.normalize()
+            else:
+                reimburse_dates = pd.Series(pd.NaT, index=df_std.index)
+        else:
+            reimburse_dates = pd.Series(pd.NaT, index=df_std.index)
+
         generated_ids = []
-        for _, row in df_std.iterrows():
+        for idx, row in df_std.iterrows():
             s_no = int(float(str(row.get(COL_NO, 0))))
             if existing_ids and s_no in existing_ids:
                 generated_ids.append(existing_ids[s_no])
+            elif reimbursements_in_std.loc[idx]:
+                dt = reimburse_dates.loc[idx]
+                if pd.notna(dt):
+                    if dt not in reimburse_date_map:
+                        current_max += 1
+                        reimburse_date_map[dt] = f"{jv_prefix}{str(current_max).zfill(4)}"
+                    generated_ids.append(reimburse_date_map[dt])
+                else:
+                    current_max += 1
+                    generated_ids.append(f"{jv_prefix}{str(current_max).zfill(4)}")
             else:
                 current_max += 1
                 generated_ids.append(f"{jv_prefix}{str(current_max).zfill(4)}")
