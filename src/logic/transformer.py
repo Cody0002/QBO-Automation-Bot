@@ -174,10 +174,16 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
             df[COL_TYPE].astype(str).str.strip().str.lower() == "reimbursements"
         )
 
-    df.loc[df[SPECIAL_CASE] == 'Reclass', COL_USD] *= -1
+    # Keep true Reclass behavior for non-reimbursements only.
+    df.loc[(df[SPECIAL_CASE] == 'Reclass') & (~mask_kzp_reimbursements), COL_USD] *= -1
 
-    mask_std = df[COL_METHOD].astype(str).str.contains("Journal", case=False, na=False)
-    mask_reclass = df[COL_METHOD].astype(str).str.contains("Reclass", case=False, na=False)
+    mask_method_journal = df[COL_METHOD].astype(str).str.contains("Journal", case=False, na=False)
+    mask_method_reclass = df[COL_METHOD].astype(str).str.contains("Reclass", case=False, na=False)
+
+    # Reimbursements should use Journal debit/credit account logic.
+    mask_std = mask_method_journal | mask_kzp_reimbursements
+    # Reimbursements are excluded from Reclass single-line processing.
+    mask_reclass = mask_method_reclass & (~mask_kzp_reimbursements)
     
     df_std = df[mask_std].copy()
     df_reclass = df[mask_reclass].copy()
