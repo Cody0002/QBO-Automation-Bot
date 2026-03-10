@@ -231,24 +231,44 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         df_std["Currency Code"] = "USD"
         df_std["Name"] = df_std[COL_ITEM_DESC]
         
-        # Debit - Use Bank Account (COL_BANK) instead of Type
+        # Standard mapping:
+        # - KZP: Debit uses Type, Credit uses Bank/Account Fr
+        # - Others: Debit uses Bank/Account Fr, Credit uses If Journal/Expense Method
         deb = df_std.copy()
         deb["Amount"] =  safe_to_float(deb[COL_USD]) * -1
-        deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
-        # Some journal rows should use Type as debit account when Bank/Account Fr is blank.
-        if COL_TYPE in deb.columns:
-            deb["Account"] = deb["Account"].where(
-                deb["Account"].astype(str).str.strip() != "",
-                deb[COL_TYPE],
-            )
-            deb["Account"] = deb["Account"].fillna(deb[COL_TYPE])
+        if _is_kzp_case(client_name):
+            deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_TYPE: "Account", COL_CO: "Location"})
+            if COL_BANK in deb.columns:
+                deb["Account"] = deb["Account"].where(
+                    deb["Account"].astype(str).str.strip() != "",
+                    deb[COL_BANK],
+                )
+                deb["Account"] = deb["Account"].fillna(deb[COL_TYPE])
+        else:
+            deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
+            # Fallback for old layouts where debit account sits in Type.
+            if COL_TYPE in deb.columns:
+                deb["Account"] = deb["Account"].where(
+                    deb["Account"].astype(str).str.strip() != "",
+                    deb[COL_TYPE],
+                )
+                deb["Account"] = deb["Account"].fillna(deb[COL_TYPE])
         # Fill NA locations with raw CO value
         deb["Location"] = deb["Location"].fillna(df_std[COL_CO])
         
         # Credit
         cred = df_std.copy()
         cred["Amount"] = pd.to_numeric(cred[COL_USD], errors='coerce').fillna(0.0)
-        cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_ACC_CR: "Account", COL_CO: "Location"})
+        if _is_kzp_case(client_name):
+            cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
+            if COL_ACC_CR in cred.columns:
+                cred["Account"] = cred["Account"].where(
+                    cred["Account"].astype(str).str.strip() != "",
+                    cred[COL_ACC_CR],
+                )
+                cred["Account"] = cred["Account"].fillna(cred[COL_ACC_CR])
+        else:
+            cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_ACC_CR: "Account", COL_CO: "Location"})
         # Fill NA locations with raw CO value
         cred["Location"] = cred["Location"].fillna(df_std[COL_CO])
         
