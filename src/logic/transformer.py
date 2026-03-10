@@ -198,6 +198,13 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         deb = df_std.copy()
         deb["Amount"] =  safe_to_float(deb[COL_USD]) * -1
         deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
+        # Some journal rows should use Type as debit account when Bank/Account Fr is blank.
+        if COL_TYPE in deb.columns:
+            deb["Account"] = deb["Account"].where(
+                deb["Account"].astype(str).str.strip() != "",
+                deb[COL_TYPE],
+            )
+            deb["Account"] = deb["Account"].fillna(deb[COL_TYPE])
         # Fill NA locations with raw CO value
         deb["Location"] = deb["Location"].fillna(df_std[COL_CO])
         
@@ -231,6 +238,13 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         df_reclass["Class"] = ""
         df_reclass["Name"] = df_reclass[COL_ITEM_DESC]
         df_reclass = df_reclass.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
+        # Reclass follows the same fallback as standard journals.
+        if COL_TYPE in df_reclass.columns:
+            df_reclass["Account"] = df_reclass["Account"].where(
+                df_reclass["Account"].astype(str).str.strip() != "",
+                df_reclass[COL_TYPE],
+            )
+            df_reclass["Account"] = df_reclass["Account"].fillna(df_reclass[COL_TYPE])
         # Fill NA locations with raw CO value
         df_reclass["Location"] = df_reclass["Location"].fillna(df_reclass[COL_CO] if COL_CO in df_reclass.columns else "")
 

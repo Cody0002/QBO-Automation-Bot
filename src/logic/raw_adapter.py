@@ -111,7 +111,7 @@ def _standardize_kzp(df: pd.DataFrame, raw_month: str) -> pd.DataFrame:
     desc_col = _find_col(df, ["Item Description"])
     currency_col = _find_col(df, ["Currency"])
     transfer_from_col = _find_col(df, ["Fund Transfer From"])
-    bank_col = _find_col(df, ["Bank"])
+    bank_col = _find_col(df, ["Bank", "Bank ( To )", "Bank (To)", "Bank To"])
     amount_col = _find_col(df, ["In/Out (USD)", "In/Out"])
     check_col = _find_col(df, ["Check", "Checking ( For our use only )"])
     method_col = _find_col(df, ["QBO Import Method (Journal/Expenses/Transfer)", "QBO Method"])
