@@ -19,6 +19,7 @@ CTRL_COL_SOURCE_URL = "Source File"       # Was "Spreadsheet_URL"
 CTRL_COL_TRANSFORM_URL = "Transform File" # NEW COLUMN
 CTRL_COL_TAB_NAME = "Tab Name"
 CTRL_COL_MONTH = "Month"
+CTRL_COL_LAST_MONTH_DATE = "Last Month Date"
 CTRL_COL_ACTIVE = "Transform"
 CTRL_COL_QBO_SYNC = "QBO Sync"
 

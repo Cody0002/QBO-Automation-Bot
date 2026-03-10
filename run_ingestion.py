@@ -47,14 +47,32 @@ def parse_mixed_date(series: pd.Series) -> pd.Series:
 # 1. HELPER FUNCTIONS
 # ==========================================
 
-def get_month_date_range(month_str: str) -> Tuple[datetime, datetime]:
-    """Converts 'Oct 2025' into Start and End datetime objects."""
+def get_month_date_range(month_str: str, last_month_date_val=None) -> Tuple[datetime, datetime]:
+    """Builds [start, end] date range for a month.
+    Start is always first day of month; end uses 'Last Month Date' when provided.
+    """
     try:
         dt = pd.to_datetime(month_str)
         start_date = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         _, last_day = calendar.monthrange(start_date.year, start_date.month)
-        end_date = start_date.replace(day=last_day, hour=23, minute=59, second=59, microsecond=999999)
-        return start_date, end_date
+        month_end = start_date.replace(day=last_day, hour=23, minute=59, second=59, microsecond=999999)
+
+        if pd.isna(last_month_date_val) or str(last_month_date_val).strip() == "":
+            return start_date, month_end
+
+        numeric = pd.to_numeric(pd.Series([last_month_date_val]), errors="coerce").iloc[0]
+        if pd.notna(numeric) and -60000 <= numeric <= 120000:
+            custom_end = pd.to_datetime(numeric, origin="1899-12-30", unit="D", errors="coerce")
+        else:
+            custom_end = pd.to_datetime(last_month_date_val, errors="coerce")
+
+        if pd.isna(custom_end):
+            return start_date, month_end
+
+        end_date = custom_end.replace(hour=23, minute=59, second=59, microsecond=999999)
+        if end_date < start_date:
+            return start_date, end_date
+        return start_date, min(end_date, month_end)
     except Exception:
         return None, None
 
@@ -229,6 +247,7 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             transform_url = str(row.get(settings.CTRL_COL_TRANSFORM_URL, "")).strip()
             raw_tab_name = str(row.get(settings.CTRL_COL_TAB_NAME, "")).strip()
             raw_month = str(row.get(settings.CTRL_COL_MONTH, "")).strip()
+            last_month_date = row.get(settings.CTRL_COL_LAST_MONTH_DATE, "")
             month = format_month_name(raw_month)
 
             # 3. Create/Link Transform File
@@ -311,7 +330,7 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             raw_df["CO"] = raw_df["CO"].astype(str).str.replace("GRP", "GROUP").str.strip()
 
             # 7. Date Filtering (Strict Month Match)
-            target_start, target_end = get_month_date_range(raw_month)
+            target_start, target_end = get_month_date_range(raw_month, last_month_date)
             if target_start and target_end:
                 # Robust Parse
                 raw_df["_TempDate"] = parse_mixed_date(raw_df["Date"])
@@ -324,7 +343,11 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
                 # --- LOGGING DATE FILTER ---
                 after_date_count = len(raw_df)
                 dropped_date = initial_count - after_date_count
-                logger.info(f"   🗓️ [{client_name}] Step 7: Date Filter ({raw_month}) -> Kept: {after_date_count} | Dropped: {dropped_date}")
+                logger.info(
+                    f"   🗓️ [{client_name}] Step 7: Date Filter "
+                    f"({target_start.date()} -> {target_end.date()}) -> "
+                    f"Kept: {after_date_count} | Dropped: {dropped_date}"
+                )
                 # ---------------------------
 
                 if raw_df.empty:
