@@ -331,9 +331,17 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
 
             # 7. Date Filtering (Strict Month Match)
             target_start, target_end = get_month_date_range(raw_month, last_month_date)
+            future_pending_nos: set[int] = set()
             if target_start and target_end:
                 # Robust Parse
                 raw_df["_TempDate"] = parse_mixed_date(raw_df["Date"])
+
+                # Track out-of-order future-dated rows so they can be retried later.
+                # Example: Date > Last Month Date, but No <= last_processed.
+                no_numeric = pd.to_numeric(raw_df["No"], errors="coerce").fillna(0)
+                method_non_blank_all = raw_df["QBO Method"].notna() & (raw_df["QBO Method"].astype(str).str.strip() != "")
+                future_late_mask = (raw_df["_TempDate"] > target_end) & method_non_blank_all & (no_numeric > 0) & (no_numeric <= last_processed)
+                future_pending_nos = set(int(x) for x in no_numeric[future_late_mask].astype(int).tolist())
                 
                 # Filter
                 month_mask = (raw_df["_TempDate"] >= target_start) & (raw_df["_TempDate"] <= target_end)
@@ -381,6 +389,7 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             current_pending_nos = set(
                 int(x) for x in raw_df.loc[pending_amount_mask, "No"].astype(int).tolist() if int(x) > 0
             )
+            current_pending_nos.update(future_pending_nos)
 
             # ---> B. Identify Ready Rows (Method exists, and amount is NOT 0)
             ready_mask = method_non_blank & (amt_numeric != 0)
