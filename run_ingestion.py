@@ -119,6 +119,11 @@ def _serialize_no_set(vals: set[int]) -> str:
         return ""
     return ";".join(str(x) for x in sorted(vals))
 
+def _cap_pending_nos(vals: set[int], max_processed_no: int) -> set[int]:
+    if max_processed_no <= 0:
+        return set()
+    return {x for x in vals if 0 < x <= max_processed_no}
+
 def _get_successfully_processed_nos(gs: GSheetsClient, spreadsheet_url: str, tabs: list[str]) -> set[int]:
     """
     Returns set of raw 'No' values that already exist in any output tab
@@ -276,7 +281,10 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             
             last_exp = safe_int(row.get(COL_LAST_EXP, 0))
             last_tr = safe_int(row.get(COL_LAST_TR, 0))
-            previous_pending_nos = _parse_no_set(row.get(COL_PENDING_AMOUNT_NOS, ""))
+            previous_pending_nos = _cap_pending_nos(
+                _parse_no_set(row.get(COL_PENDING_AMOUNT_NOS, "")),
+                last_processed
+            )
 
             tab_prefix = f"{country} {month}"
             tab_jv, tab_exp, tab_tr = f"{tab_prefix} - Journals", f"{tab_prefix} - Expenses", f"{tab_prefix} - Transfers"
@@ -425,9 +433,10 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
 
             if processing_df.empty:
                 logger.info(f"   [{client_name}] No new rows to process.")
+                pending_to_write = _cap_pending_nos(current_pending_nos, last_processed)
                 _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {
                     settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(), 
-                    COL_PENDING_AMOUNT_NOS: _serialize_no_set(current_pending_nos), # <-- ADDED
+                    COL_PENDING_AMOUNT_NOS: _serialize_no_set(pending_to_write), # <-- ADDED
                     settings.CTRL_COL_ACTIVE: "DONE"
                 })
                 continue
@@ -484,13 +493,14 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
 
             # 15. Final Updates to Control Sheet
             final_last_row = max(last_processed, result.max_row_processed) if result.max_row_processed else last_processed
+            pending_to_write = _cap_pending_nos(current_pending_nos, final_last_row)
 
             updates = {
                 settings.CTRL_COL_LAST_PROCESSED_ROW: final_last_row,
                 COL_LAST_JV: result.last_journal_no,
                 COL_LAST_EXP: result.last_expense_no,
                 COL_LAST_TR: result.last_withdraw_no,
-                COL_PENDING_AMOUNT_NOS: _serialize_no_set(current_pending_nos), # <-- ADDED
+                COL_PENDING_AMOUNT_NOS: _serialize_no_set(pending_to_write), # <-- ADDED
                 settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
                 settings.CTRL_COL_ACTIVE: "DONE"
             }
