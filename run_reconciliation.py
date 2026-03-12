@@ -116,8 +116,13 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
         try:
             if source_url and raw_tab_name:
                 logger.info(f"   📥 [{client_name}] Fetching Raw Source for Validation...")
-                # Read header_row=1 to match ingestion logic
-                raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=1, value_render_option='UNFORMATTED_VALUE')
+                source_header_row = 5 if "kzdw" in str(client_name).lower() else 1
+                raw_df = gs.read_as_df(
+                    source_url,
+                    raw_tab_name,
+                    header_row=source_header_row,
+                    value_render_option='UNFORMATTED_VALUE'
+                )
                 raw_df = standardize_raw_df(raw_df, client_name=client_name, raw_month=raw_month)
                 # Apply Standard Columns
                 raw_df = raw_df.iloc[:, :25]  # Keep first 25 columns

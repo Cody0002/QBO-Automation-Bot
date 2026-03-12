@@ -12,6 +12,8 @@ DEFAULT_JV_PREFIX = "KZO-JV"
 DEFAULT_DOC_PREFIX = "KZO"
 KZP_JV_PREFIX = "KZP-JV"
 KZP_DOC_PREFIX = "KZP"
+KZDW_JV_PREFIX = "KZDW-JV"
+KZDW_DOC_PREFIX = "KZDW"
 
 COL_NO = "No"
 COL_DATE = "Date"
@@ -141,9 +143,26 @@ def _is_kzp_case(client_name: str = "") -> bool:
     return "kzp" in str(client_name).lower()
 
 
+def _is_kzo_case(client_name: str = "") -> bool:
+    return "kzo" in str(client_name).lower()
+
+
+def _is_kzdw_case(client_name: str = "") -> bool:
+    return "kzdw" in str(client_name).lower()
+
+
+def _normalize_currency(value: Any) -> str:
+    text = str(value).strip() if not pd.isna(value) else ""
+    if text == "":
+        return "USD"
+    return "USD" if "USD" in text.upper() else text
+
+
 def _build_id_prefixes(client_name: str = "") -> tuple[str, str]:
     if _is_kzp_case(client_name):
         return KZP_JV_PREFIX, KZP_DOC_PREFIX
+    if _is_kzdw_case(client_name):
+        return KZDW_JV_PREFIX, KZDW_DOC_PREFIX
     return DEFAULT_JV_PREFIX, DEFAULT_DOC_PREFIX
 
 @dataclass
@@ -196,6 +215,13 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     # --- A. STANDARD JOURNALS ---
     if not df_std.empty:
         jv_prefix, _ = _build_id_prefixes(client_name)
+        is_kzo_workspace = _is_kzo_case(client_name) and not _is_kzp_case(client_name)
+        kzo_date_map = {}
+        if is_kzo_workspace and COL_DATE in df_std.columns:
+            kzo_dates = pd.to_datetime(df_std[COL_DATE], errors="coerce").dt.normalize()
+        else:
+            kzo_dates = pd.Series(pd.NaT, index=df_std.index)
+
         reimbursements_in_std = pd.Series(False, index=df_std.index)
         reimburse_date_map = {}
         if _is_kzp_case(client_name) and COL_TYPE in df_std.columns:
@@ -213,7 +239,22 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         for idx, row in df_std.iterrows():
             s_no = int(float(str(row.get(COL_NO, 0))))
             if existing_ids and s_no in existing_ids:
-                generated_ids.append(existing_ids[s_no])
+                existing_id = existing_ids[s_no]
+                generated_ids.append(existing_id)
+                if is_kzo_workspace:
+                    dt = kzo_dates.loc[idx]
+                    if pd.notna(dt):
+                        kzo_date_map[dt] = existing_id
+            elif is_kzo_workspace:
+                dt = kzo_dates.loc[idx]
+                if pd.notna(dt):
+                    if dt not in kzo_date_map:
+                        current_max += 1
+                        kzo_date_map[dt] = f"{jv_prefix}{str(current_max).zfill(4)}"
+                    generated_ids.append(kzo_date_map[dt])
+                else:
+                    current_max += 1
+                    generated_ids.append(f"{jv_prefix}{str(current_max).zfill(4)}")
             elif reimbursements_in_std.loc[idx]:
                 dt = reimburse_dates.loc[idx]
                 if pd.notna(dt):
@@ -229,7 +270,10 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                 generated_ids.append(f"{jv_prefix}{str(current_max).zfill(4)}")
 
         df_std["Journal No"] = generated_ids
-        df_std["Currency Code"] = "USD"
+        if _is_kzdw_case(client_name) and "Currency" in df_std.columns:
+            df_std["Currency Code"] = df_std["Currency"].apply(_normalize_currency)
+        else:
+            df_std["Currency Code"] = "USD"
         df_std["Name"] = df_std[COL_ITEM_DESC]
         
         # Standard mapping:
@@ -302,7 +346,10 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         df_reclass.drop(columns=["_GroupDate"], inplace=True, errors='ignore')
 
         df_reclass["Amount"] = pd.to_numeric(df_reclass[COL_USD], errors='coerce').fillna(0.0)
-        df_reclass["Currency Code"] = "USD"
+        if _is_kzdw_case(client_name) and "Currency" in df_reclass.columns:
+            df_reclass["Currency Code"] = df_reclass["Currency"].apply(_normalize_currency)
+        else:
+            df_reclass["Currency Code"] = "USD"
         df_reclass["Class"] = ""
         df_reclass["Name"] = df_reclass[COL_ITEM_DESC]
         df_reclass = df_reclass.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
@@ -392,7 +439,11 @@ def process_expenses(df: pd.DataFrame, country: str,
         
     if d.empty: return pd.DataFrame(), start_no
 
-    d = d[[c for c in d.columns if "currency" not in c.lower()]]
+    if _is_kzdw_case(client_name):
+        # Keep "Currency" for KZDW while dropping transfer-side currency columns.
+        d = d[[c for c in d.columns if c.lower() not in {"currency to", "currency from"}]]
+    else:
+        d = d[[c for c in d.columns if "currency" not in c.lower()]]
 
     if COL_METHOD in d.columns: 
         d = d[d[COL_METHOD].astype(str).str.contains("Expense", case=False, na=False)]
@@ -406,7 +457,10 @@ def process_expenses(df: pd.DataFrame, country: str,
 
     d["Payee (Dummy)"] = "Dummy"
     d["Payment Method"] = "Cash"
-    d["Currency Code"] = "USD"
+    if _is_kzdw_case(client_name) and "Currency" in d.columns:
+        d["Currency Code"] = d["Currency"].apply(_normalize_currency)
+    else:
+        d["Currency Code"] = "USD"
     d["Account (Cr)"] = d[COL_ACC_CR]
     
     d["Expense Line Amount"] = safe_to_float(d[COL_USD]) * -1
@@ -424,6 +478,8 @@ def process_expenses(df: pd.DataFrame, country: str,
             start_no += 1 
             if _is_kzp_case(client_name):
                 ref_nos.append(f"{doc_prefix}{mm_yy}E{str(start_no).zfill(4)}")
+            elif _is_kzdw_case(client_name):
+                ref_nos.append(f"{doc_prefix}{mm_yy}E{str(start_no).zfill(4)}")
             else:
                 ref_nos.append(f"{doc_prefix}{country}{mm_yy}E{str(start_no).zfill(4)}")
     
@@ -435,6 +491,9 @@ def process_expenses(df: pd.DataFrame, country: str,
         COL_TYPE: "Expense Account (Dr)",
         "Currency Code": "Currency"
     }
+    # Avoid duplicate "Currency" headers when raw currency is still present (e.g. KZDW).
+    if "Currency" in d.columns and "Currency Code" in d.columns:
+        d = d.drop(columns=["Currency"])
     d = d.rename(columns=rename_map)
     d["Expense Description"] = d["Memo"]
 
@@ -520,6 +579,8 @@ def process_transfers(df: pd.DataFrame, country: str,
             start_no += 1
             if _is_kzp_case(client_name):
                 ref_nos.append(f"{doc_prefix}{date_str}T{str(start_no).zfill(4)}")
+            elif _is_kzdw_case(client_name):
+                ref_nos.append(f"{doc_prefix}{date_str}T{str(start_no).zfill(4)}")
             else:
                 ref_nos.append(f"{doc_prefix}{country}{date_str}T{str(start_no).zfill(4)}")
 
@@ -542,7 +603,10 @@ def process_transfers(df: pd.DataFrame, country: str,
         transfers.loc[negative_mask, "Transfer Funds To"] = from_vals
 
     transfers["Transfer Amount"] = pd.to_numeric(transfers[COL_USD], errors="coerce").fillna(0.0).abs()
-    transfers["Currency"] = "USD"
+    if _is_kzdw_case(client_name) and "Currency" in transfers.columns:
+        transfers["Currency"] = transfers["Currency"].apply(_normalize_currency)
+    else:
+        transfers["Currency"] = "USD"
     transfers["Memo"] = transfers["Ref No"] + " - " + transfers["Memo"].astype(str)
     
     _fix_grp_location(transfers, "Location")

@@ -64,7 +64,7 @@ MST_COL_REFRESH_TOKEN = "Refresh Token"  # <--- NEW COLUMN
 # Allowed workspaces for QBO API calls.
 # Comma-separated list, e.g. "KZP,KZO,KZO Sports"
 ALLOWED_QBO_WORKSPACES = tuple(
-    x.strip() for x in os.getenv("ALLOWED_QBO_WORKSPACES", "KZP,KZO,KZO Sports").split(",")
+    x.strip() for x in os.getenv("ALLOWED_QBO_WORKSPACES", "KZP,KZO,KZO Sports,KZDW").split(",")
     if x.strip()
 )
 

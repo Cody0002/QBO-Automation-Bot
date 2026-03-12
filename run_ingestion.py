@@ -274,8 +274,13 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             last_processed = safe_int(row.get(settings.CTRL_COL_LAST_PROCESSED_ROW, 0))
             
             # Fetch latest QBO Journal No to prevent overlap.
-            # KZP has a dedicated Journal prefix.
-            journal_prefix = "KZP-JV" if "kzp" in client_name.lower() else "KZO-JV"
+            client_lower = client_name.lower()
+            if "kzp" in client_lower:
+                journal_prefix = "KZP-JV"
+            elif "kzdw" in client_lower:
+                journal_prefix = "KZDW-JV"
+            else:
+                journal_prefix = "KZO-JV"
             qbo_last_jv = qbo_client.get_max_journal_number(journal_prefix)
             final_start_jv = max(global_last_jv, qbo_last_jv)
             
@@ -310,7 +315,13 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             processed_ok_nos = _get_successfully_processed_nos(gs, transform_url, tabs_out)
 
             # 6. Read & Clean Source Data
-            raw_df = gs.read_as_df(source_url, raw_tab_name, header_row=1, value_render_option='UNFORMATTED_VALUE')
+            source_header_row = 5 if "kzdw" in client_name.lower() else 1
+            raw_df = gs.read_as_df(
+                source_url,
+                raw_tab_name,
+                header_row=source_header_row,
+                value_render_option='UNFORMATTED_VALUE'
+            )
             raw_df = standardize_raw_df(raw_df, client_name=client_name, raw_month=raw_month)
 
             # --- LOGGING START ---

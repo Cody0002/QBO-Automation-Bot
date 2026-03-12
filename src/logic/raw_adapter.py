@@ -47,6 +47,17 @@ def _find_col(df: pd.DataFrame, aliases: Iterable[str]) -> str | None:
     return None
 
 
+def _value_series(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.strip()
+
+
+def _normalize_currency_series(series: pd.Series) -> pd.Series:
+    vals = _value_series(series)
+    has_usd = vals.str.contains("USD", case=False, na=False)
+    out = vals.where(~has_usd, "USD")
+    return out.where(out != "", "USD")
+
+
 def _clean_headers(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out.columns = [re.sub(r"\s+", " ", str(c).replace("\n", " ").strip()) for c in out.columns]
@@ -175,6 +186,84 @@ def _standardize_kzp(df: pd.DataFrame, raw_month: str) -> pd.DataFrame:
     return _coerce_standard_numeric_cols(out)
 
 
+def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
+    idx = df.index
+
+    co_col = _find_col(df, ["CO"])
+    coy_col = _find_col(df, ["COY"])
+    date_col = _find_col(df, ["Date"])
+    category_col = _find_col(df, ["Category"])
+    sub_category_col = _find_col(df, ["Sub Category"])
+    type_col = _find_col(df, ["Type"])
+    desc_col = _find_col(df, ["Item Description"])
+    trx_hash_col = _find_col(df, ["Trx Hash", "TrxHarsh"])
+    amount_col = _find_col(df, ["Final Amount to be take (different currency)", "USD - QBO", "USD"])
+    currency_col = _find_col(df, ["Currency"])
+    method_col = _find_col(df, ["QBO Import", "QBO Method", "QBO Import Method (Journal/Expenses/Transfer)"])
+    acc_debit_col = _find_col(df, ["If Journal/Expense method: Another records", "If Journal/Expense Method"])
+    transfer_from_col = _find_col(df, ["Transfer from", "Transfer From", "If Transfer method: Fund Transfer From", "Fund Transfer From"])
+    transfer_to_col = _find_col(df, ["Transfer to", "Transfer To", "Transfer to ((Can copy from column H )"])
+    check_col = _find_col(df, ["Checking ( For our use only )", "Check (Internal use)", "Check"])
+    no_col = _find_col(df, ["No"])
+
+    def col_or_empty(col_name: str | None) -> pd.Series:
+        if col_name and col_name in df.columns:
+            return df[col_name]
+        return pd.Series([""] * len(df), index=idx)
+
+    amount = _parse_amount_series(col_or_empty(amount_col))
+    currency = _normalize_currency_series(col_or_empty(currency_col))
+    debit_account = _value_series(col_or_empty(acc_debit_col))
+    transfer_to = _value_series(col_or_empty(transfer_to_col))
+    transfer_from = _value_series(col_or_empty(transfer_from_col))
+    debit_account = debit_account.where(debit_account != "", transfer_to)
+    type_vals = _value_series(col_or_empty(type_col)).where(
+        _value_series(col_or_empty(type_col)) != "",
+        debit_account
+    )
+
+    no_series = pd.to_numeric(col_or_empty(no_col), errors="coerce")
+    if no_series.fillna(0).eq(0).all():
+        no_series = pd.Series(range(1, len(df) + 1), index=idx, dtype="float64")
+
+    out = pd.DataFrame(index=idx)
+    out["CO"] = col_or_empty(co_col)
+    out["COY"] = col_or_empty(coy_col)
+    out["Date"] = col_or_empty(date_col)
+    out["Category"] = col_or_empty(category_col)
+    out["Type"] = type_vals
+    out["Item Description"] = col_or_empty(desc_col)
+    out["TrxHarsh"] = col_or_empty(trx_hash_col)
+    # Debit account for Journal/Expense.
+    out["Account Fr"] = debit_account
+    out["Account To"] = col_or_empty(transfer_to_col)
+    out["Currency"] = currency
+    out["Amount Fr"] = amount
+    out["Currency To"] = ""
+    out["Amount To"] = 0.0
+    out["Budget"] = 0.0
+    out["USD - Raw"] = amount
+    out["USD - Actual"] = amount
+    out["USD - Loss"] = 0.0
+    out["USD - QBO"] = amount
+    out["Reclass"] = ""
+    out["QBO Method"] = col_or_empty(method_col)
+    # Credit account for Journal/Expense.
+    out["If Journal/Expense Method"] = transfer_from
+    out["QBO Transfer Fr"] = transfer_from
+    out["QBO Transfer To"] = transfer_to
+    out["Check (Internal use)"] = col_or_empty(check_col)
+    out["No"] = no_series
+
+    if sub_category_col:
+        out["Category"] = out["Category"].where(
+            _value_series(out["Category"]) != "",
+            col_or_empty(sub_category_col),
+        )
+
+    return _coerce_standard_numeric_cols(out)
+
+
 def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -> pd.DataFrame:
     """
     Convert incoming raw data into the canonical 25-column schema expected by
@@ -184,13 +273,22 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
         return pd.DataFrame(columns=RAW_STANDARD_COLUMNS)
 
     cleaned = _clean_headers(raw_df)
-    is_kzp_client = "kzp" in str(client_name).lower()
+    client_lower = str(client_name).lower()
+    is_kzp_client = "kzp" in client_lower
+    is_kzdw_client = "kzdw" in client_lower
     has_kzp_shape = (
         _find_col(cleaned, ["In/Out (USD)"]) is not None
         and _find_col(cleaned, ["Bank"]) is not None
         and _find_col(cleaned, ["USD - QBO"]) is None
     )
+    has_kzdw_shape = (
+        _find_col(cleaned, ["Final Amount to be take (different currency)"]) is not None
+        and _find_col(cleaned, ["Transfer from"]) is not None
+        and _find_col(cleaned, ["Transfer to"]) is not None
+    )
 
+    if is_kzdw_client or has_kzdw_shape:
+        return _standardize_kzdw(cleaned)
     if is_kzp_client or has_kzp_shape:
         return _standardize_kzp(cleaned, raw_month)
     return _standardize_legacy(cleaned)
