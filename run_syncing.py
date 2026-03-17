@@ -402,11 +402,14 @@ def _is_target_client(row: pd.Series, target_client: str | None) -> bool:
     row_client = str(row.get(settings.MST_COL_CLIENT, "")).strip()
     row_realm = str(row.get(settings.MST_COL_REALM_ID, "")).strip()
     row_sheet_id = str(row.get(settings.MST_COL_SHEET_ID, "")).strip()
+    row_folder_id = str(row.get(settings.MST_COL_OUTPUT, "")).strip()
 
     # Allow targeting by realm ID or by normalized client name.
     if target == row_realm:
         return True
     if target == row_sheet_id:
+        return True
+    if target == row_folder_id:
         return True
     return target_norm == settings.normalize_workspace_name(row_client)
 
@@ -470,6 +473,11 @@ def main(target_client: str | None = None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run QBO syncing pipeline.")
-    parser.add_argument("--client", dest="client", default="", help="Target client name or Realm ID.")
+    parser.add_argument(
+        "--client",
+        dest="client",
+        default="",
+        help="Target client name, Realm ID, Spreadsheet ID, or Output Folder ID.",
+    )
     args = parser.parse_args()
     main(target_client=args.client)

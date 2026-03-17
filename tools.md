@@ -34,7 +34,7 @@ Run one target:
 .\.venv\python.exe .\run_ingestion.py --client "KZDW"
 ```
 
-Also supports `--client <realm_id>` and `--client <spreadsheet_id>`.
+Also supports `--client <realm_id>`, `--client <spreadsheet_id>`, and `--client <output_folder_id>`.
 
 ### 2.2 Sync
 Run all:
@@ -74,11 +74,12 @@ Endpoint:
 
 Supported target fields in payload:
 
-- `spreadsheet_id`, `spreadsheetId`
+- `spreadsheet_id`, `spreadsheetId` (primary, recommended: one sheet = one client)
+- `folder_id`, `folderId`, `folderid`
+- `output_folder_id`, `outputFolderId`, `output_folder`, `folder`
 - `realm_id`, `realmId`
 - `client`, `client_name`
 - `workspace`, `target`
-- fallback `country`
 
 ## 3. Sync Throttling Controls
 
