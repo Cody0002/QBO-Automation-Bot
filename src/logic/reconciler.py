@@ -11,6 +11,8 @@ logger = setup_logger("reconciler")
 class Reconciler:
     def __init__(self, qbo_client: QBOClient):
         self.client = qbo_client
+        self._qbo_entity_cache: dict[tuple[str, str, str], tuple[dict, dict]] = {}
+        self._qbo_transfer_cache: dict[tuple[str, str], list] = {}
 
     def _safe_float(self, val) -> float:
         """Converts string with commas '1,234.56' to float 1234.56"""
@@ -32,6 +34,19 @@ class Reconciler:
         if not name: return ""
         return name.split(":")[-1].strip().lower()
 
+    def _normalize_qbo_id(self, qbo_id_val) -> str:
+        """
+        Normalizes sheet QBO IDs.
+        Supports legacy journal line IDs like '2888.1' -> '2888'.
+        """
+        raw = str(qbo_id_val or "").strip()
+        if not raw:
+            return ""
+        m = re.match(r"^(\d+)\.\d+$", raw)
+        if m:
+            return m.group(1)
+        return raw
+
     def _get_month_range(self, date_str: str) -> tuple[str, str]:
         try:
             dt = pd.to_datetime(date_str)
@@ -41,6 +56,11 @@ class Reconciler:
             return None, None
 
     def _fetch_qbo_data(self, entity: str, start_date: str, end_date: str) -> tuple[dict, dict]:
+        cache_key = (entity, start_date, end_date)
+        if cache_key in self._qbo_entity_cache:
+            logger.info(f"   ⚡ Using cached QBO {entity} [{start_date} to {end_date}]")
+            return self._qbo_entity_cache[cache_key]
+
         logger.info(f"   🔍 Querying QBO {entity} [{start_date} to {end_date}]...")
         query = f"SELECT * FROM {entity} WHERE TxnDate >= '{start_date}' AND TxnDate <= '{end_date}' MAXRESULTS 1000"
         results = self.client.query(query)
@@ -52,13 +72,22 @@ class Reconciler:
             if "Id" in item: map_id[str(item["Id"])] = item
             doc_num = item.get("DocNumber")
             if doc_num: map_doc[str(doc_num)] = item
-                
-        return map_id, map_doc
+
+        out = (map_id, map_doc)
+        self._qbo_entity_cache[cache_key] = out
+        return out
 
     def _fetch_transfers_list(self, start_date: str, end_date: str) -> list:
+        cache_key = (start_date, end_date)
+        if cache_key in self._qbo_transfer_cache:
+            logger.info(f"   ⚡ Using cached QBO Transfers [{start_date} to {end_date}]")
+            return self._qbo_transfer_cache[cache_key]
+
         logger.info(f"   🔍 Querying QBO Transfers [{start_date} to {end_date}]...")
         query = f"SELECT * FROM Transfer WHERE TxnDate >= '{start_date}' AND TxnDate <= '{end_date}' MAXRESULTS 1000"
-        return self.client.query(query)
+        out = self.client.query(query)
+        self._qbo_transfer_cache[cache_key] = out
+        return out
 
     # --- NEW: ROBUST MATCHING LOGIC (COPIED FROM SYNCING) ---
     def _is_account_match(self, sheet_acc: str, qbo_acc: str) -> bool:
@@ -129,7 +158,7 @@ class Reconciler:
             # 1. FIND QBO RECORD
             qbo_record = None
             if "QBO ID" in first_row and pd.notna(first_row["QBO ID"]):
-                qbo_record = map_id.get(str(first_row["QBO ID"]).strip())
+                qbo_record = map_id.get(self._normalize_qbo_id(first_row["QBO ID"]))
             if not qbo_record:
                 qbo_record = map_doc.get(str(jv_no).strip())
 
@@ -257,7 +286,7 @@ class Reconciler:
         for idx, row in df.iterrows():
             qbo_record = None
             if "QBO ID" in row and pd.notna(row["QBO ID"]):
-                qbo_record = map_id.get(str(row["QBO ID"]).strip())
+                qbo_record = map_id.get(self._normalize_qbo_id(row["QBO ID"]))
             if not qbo_record:
                 qbo_record = map_doc.get(str(row.get("Exp Ref. No", "")).strip())
 
@@ -305,7 +334,7 @@ class Reconciler:
         for idx, row in df.iterrows():
             qbo_record = None
             if "QBO ID" in row and pd.notna(row["QBO ID"]) and str(row["QBO ID"]).strip():
-                qbo_record = map_id.get(str(row["QBO ID"]).strip())
+                qbo_record = map_id.get(self._normalize_qbo_id(row["QBO ID"]))
             
             if not qbo_record:
                 ref_no = str(row.get("Ref No", "")).strip()

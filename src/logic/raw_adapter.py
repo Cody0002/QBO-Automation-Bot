@@ -213,14 +213,17 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
 
     amount = _parse_amount_series(col_or_empty(amount_col))
     currency = _normalize_currency_series(col_or_empty(currency_col))
-    debit_account = _value_series(col_or_empty(acc_debit_col))
+    acc_v = _value_series(col_or_empty(acc_debit_col))
     transfer_to = _value_series(col_or_empty(transfer_to_col))
     transfer_from = _value_series(col_or_empty(transfer_from_col))
-    debit_account = debit_account.where(debit_account != "", transfer_to)
-    type_vals = _value_series(col_or_empty(type_col)).where(
-        _value_series(col_or_empty(type_col)) != "",
-        debit_account
-    )
+    # KZDW mapping rules from source sheet:
+    # - JV Debit: X (Transfer to) -> V (If Journal/Expense)
+    # - JV Credit: W (Transfer from)
+    # - Expense Transfer from: W -> V
+    # - Expense Transfer to: X
+    debit_account = transfer_to.where(transfer_to != "", acc_v)     # X -> V
+    credit_account = transfer_from.where(transfer_from != "", acc_v)  # W -> V
+    type_vals = transfer_to
 
     no_series = pd.to_numeric(col_or_empty(no_col), errors="coerce")
     if no_series.fillna(0).eq(0).all():
@@ -248,9 +251,9 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
     out["USD - QBO"] = amount
     out["Reclass"] = ""
     out["QBO Method"] = col_or_empty(method_col)
-    # Credit account for Journal/Expense.
-    out["If Journal/Expense Method"] = transfer_from
-    out["QBO Transfer Fr"] = transfer_from
+    # Credit/source account for Journal/Expense: W -> V.
+    out["If Journal/Expense Method"] = credit_account
+    out["QBO Transfer Fr"] = credit_account
     out["QBO Transfer To"] = transfer_to
     out["Check (Internal use)"] = col_or_empty(check_col)
     out["No"] = no_series

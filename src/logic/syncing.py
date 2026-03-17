@@ -26,6 +26,54 @@ def _parse_amount(val) -> float:
     except:
         return 0.0
 
+def _normalize_currency_code(val) -> str:
+    text = str(val).strip().upper()
+    if not text:
+        return "USD"
+    # Keep common 3-letter ISO codes; map variants containing USD to USD.
+    if "USD" in text:
+        return "USD"
+    return text[:3]
+
+def _infer_currency_from_text(val) -> str | None:
+    text = str(val or "").upper()
+    if not text:
+        return None
+
+    # Exact/contains ISO code cues first.
+    direct_codes = [
+        "USD", "THB", "VND", "IDR", "SGD", "MYR", "PHP",
+        "EUR", "GBP", "AUD", "JPY", "CNY", "HKD", "KRW", "INR", "AED"
+    ]
+    for code in direct_codes:
+        if re.search(rf"\b{code}\b", text):
+            return code
+
+    # Common workspace shorthand in account names (e.g. "... TH 2'").
+    shorthand_map = {
+        " TH ": "THB",
+        " VN ": "VND",
+        " ID ": "IDR",
+        " SG ": "SGD",
+        " MY ": "MYR",
+        " PH ": "PHP",
+        " UK ": "GBP",
+        " EU ": "EUR",
+        " AU ": "AUD",
+        " JP ": "JPY",
+        " CN ": "CNY",
+        " HK ": "HKD",
+        " KR ": "KRW",
+        " IN ": "INR",
+        " AE ": "AED",
+    }
+    padded = f" {text} "
+    for token, code in shorthand_map.items():
+        if token in padded:
+            return code
+
+    return None
+
 class QBOSync:
     def __init__(self, client: QBOClient):
         self.client = client
@@ -41,13 +89,40 @@ class QBOSync:
         if not page: return ""
         return f"https://qbo.intuit.com/app/{page}?txnId={txn_id}"
 
+    def _attach_exchange_rate_if_needed(self, payload: dict, txn_currency: str, txn_date: str, context: str) -> None:
+        """
+        Attach ExchangeRate for foreign-currency transactions.
+        Raises when FX is unavailable to avoid implicit 1:1 postings.
+        """
+        ccy = _normalize_currency_code(txn_currency)
+        if ccy == "USD":
+            return
+        fx_rate = self.client.get_exchange_rate(
+            source_currency_code=ccy,
+            as_of_date=txn_date,
+            target_currency_code="USD",
+        )
+        if fx_rate is None:
+            raise ValueError(
+                f"Missing FX rate for {ccy}->USD on {txn_date} ({context}); "
+                "skipped to avoid 1:1 exchange posting."
+            )
+        payload["ExchangeRate"] = fx_rate
+
     def _get_qbo_mappings(self) -> dict:
         """Fetches Accounts, Locations, Classes, Vendors, and Payment Methods."""
         logger.info(f"🔍 Fetching QBO Mappings for Realm: {self.client.realm_id}...")
-        mappings = {"accounts": {}, "locations": {}, "classes": {}, "vendors": {}, "payment_methods": {}}
+        mappings = {
+            "accounts": {},
+            "accounts_meta": {},
+            "locations": {},
+            "classes": {},
+            "vendors": {},
+            "payment_methods": {}
+        }
         
         entities = [
-            ("Account", "accounts", "Name, FullyQualifiedName, Id"),
+            ("Account", "accounts", "Name, FullyQualifiedName, Id, CurrencyRef"),
             ("Department", "locations", "Name, FullyQualifiedName, Id"), 
             ("Class", "classes", "Name, FullyQualifiedName, Id"),
             ("Vendor", "vendors", "DisplayName, Id"),
@@ -60,13 +135,18 @@ class QBOSync:
                 for item in data:
                     name = item.get("FullyQualifiedName", item.get("Name", item.get("DisplayName")))
                     mappings[key][name] = item["Id"]
+                    if table == "Account":
+                        acc_currency = _normalize_currency_code(
+                            (item.get("CurrencyRef") or {}).get("value", "USD")
+                        )
+                        mappings["accounts_meta"][item["Id"]] = {"currency": acc_currency}
             except Exception as e:
                 logger.error(f"❌ Failed to fetch {table}: {e}")
 
         return mappings
 
     # --- UPDATED FIND ID LOGIC (MATCHES TRANSFORMER.PY) ---
-    def find_id(self, mapping_key: str, search_name: str) -> str | None:
+    def find_id(self, mapping_key: str, search_name: str, warn_on_missing: bool = True) -> str | None:
         if not search_name or pd.isna(search_name) or str(search_name).strip() == "": return None
         
         mapping_dict = self.mappings.get(mapping_key, {})
@@ -114,7 +194,8 @@ class QBOSync:
             logger.info(f"      ✨ [Sync Map] FUZZY (80%): '{search_name}' -> '{best}'")
             return mapping_dict[best]
             
-        logger.warning(f"      ❌ [Sync Map] FAILED: Could not find '{search_name}' in {mapping_key}")
+        if warn_on_missing:
+            logger.warning(f"      ❌ [Sync Map] FAILED: Could not find '{search_name}' in {mapping_key}")
         return None
 
     def get_existing_duplicates(self, entity_type: str, doc_nums: list) -> set:
@@ -166,15 +247,19 @@ class QBOSync:
             
             entity_ref = None
             if row.get('Name'):
-                ven_id = self.find_id('vendors', row['Name'])
+                ven_id = self.find_id('vendors', row['Name'], warn_on_missing=False)
                 if ven_id: entity_ref = {"Type": "Vendor", "EntityRef": {"value": ven_id}}
 
+            loc_id = self.find_id('locations', row.get('Location'))
+            class_id = self.find_id('classes', row.get('Class'), warn_on_missing=False)
             line_detail = {
                 "PostingType": "Debit" if amt > 0 else "Credit",
                 "AccountRef": {"value": acc_id},
-                "DepartmentRef": {"value": self.find_id('locations', row.get('Location'))},
-                "ClassRef": {"value": self.find_id('classes', row.get('Class'))}
             }
+            if loc_id:
+                line_detail["DepartmentRef"] = {"value": loc_id}
+            if class_id:
+                line_detail["ClassRef"] = {"value": class_id}
             if entity_ref: line_detail["Entity"] = entity_ref
 
             line_items.append({
@@ -184,13 +269,16 @@ class QBOSync:
                 "JournalEntryLineDetail": line_detail
             })
 
+        txn_date = _parse_date_yyyy_mm_dd(first_row.get('Date'))
+        txn_currency = _normalize_currency_code(first_row.get('Currency Code', 'USD'))
         payload = {
             "Line": line_items,
             "DocNumber": str(journal_no),
-            "TxnDate": _parse_date_yyyy_mm_dd(first_row.get('Date')),
+            "TxnDate": txn_date,
             "PrivateNote": str(first_row.get('Memo', '')),
-            "CurrencyRef": {"value": str(first_row.get('Currency Code', 'USD'))}
+            "CurrencyRef": {"value": txn_currency}
         }
+        self._attach_exchange_rate_if_needed(payload, txn_currency, txn_date, f"Journal {journal_no}")
         return self.client.post(f"/v3/company/{self.client.realm_id}/journalentry", payload)
 
     def push_expense(self, exp_ref_no: str, row: pd.Series):
@@ -201,22 +289,23 @@ class QBOSync:
         if not exp_acc_id: raise ValueError(f"Expense Account '{row.get('Expense Account (Dr)')}' missing.")
         
         payee = str(row.get("Payee (Dummy)") or "Dummy")
-        vendor_id = self.find_id("vendors", payee)
-        entity_ref = {'value': vendor_id, 'name': payee, 'type': 'Vendor'} if vendor_id else {}
+        vendor_id = self.find_id("vendors", payee, warn_on_missing=False)
+        entity_ref = {'value': vendor_id, 'name': payee, 'type': 'Vendor'} if vendor_id else None
 
         loc_id = self.find_id('locations', row.get('Location'))
-        class_id = self.find_id('classes', row.get('Class'))
+        class_id = self.find_id('classes', row.get('Class'), warn_on_missing=False)
         
         pm_name = row.get("Payment Method") 
         pm_id = self.find_id("payment_methods", pm_name)
 
+        txn_date = _parse_date_yyyy_mm_dd(row.get("Payment Date"))
+        txn_currency = _normalize_currency_code(row.get("Currency", "USD"))
         payload = {
             "AccountRef": {"value": pay_acc_id},
             "PaymentType": "Cash",
-            "EntityRef": entity_ref,
             "DocNumber": str(exp_ref_no),
-            "TxnDate": _parse_date_yyyy_mm_dd(row.get("Payment Date")),
-            "CurrencyRef": {"value": str(row.get("Currency", "USD"))},
+            "TxnDate": txn_date,
+            "CurrencyRef": {"value": txn_currency},
             "Line": [{
                 "DetailType": "AccountBasedExpenseLineDetail",
                 "Amount": abs(_parse_amount(row.get("Expense Line Amount"))),
@@ -228,20 +317,63 @@ class QBOSync:
             }]
         }
 
+        if entity_ref:
+            payload["EntityRef"] = entity_ref
         if loc_id: payload["DepartmentRef"] = {"value": loc_id}
         if pm_id: payload["PaymentMethodRef"] = {"value": pm_id}
+        self._attach_exchange_rate_if_needed(payload, txn_currency, txn_date, f"Expense {exp_ref_no}")
 
         return self.client.post(f"/v3/company/{self.client.realm_id}/purchase", payload)
 
     def push_transfer(self, row: pd.Series):
-        from_id = self.find_id("accounts", row.get("Transfer Funds From"))
-        to_id = self.find_id("accounts", row.get("Transfer Funds To"))
+        from_name = row.get("Transfer Funds From")
+        to_name = row.get("Transfer Funds To")
+
+        from_id = self.find_id("accounts", from_name)
+        to_id = self.find_id("accounts", to_name)
         
         if not from_id or not to_id: raise ValueError("Source or Destination Account missing.")
+
+        accounts_meta = self.mappings.get("accounts_meta", {})
+        from_ccy = _normalize_currency_code((accounts_meta.get(from_id) or {}).get("currency", "USD"))
+        to_ccy = _normalize_currency_code((accounts_meta.get(to_id) or {}).get("currency", "USD"))
+        row_ccy = _normalize_currency_code(row.get("Currency", "USD"))
+
+        # Fallback for cases where Account query did not return reliable CurrencyRef.
+        inferred_from_ccy = _infer_currency_from_text(from_name)
+        inferred_to_ccy = _infer_currency_from_text(to_name)
+        if from_ccy == "USD" and inferred_from_ccy and inferred_from_ccy != "USD":
+            from_ccy = inferred_from_ccy
+        if to_ccy == "USD" and inferred_to_ccy and inferred_to_ccy != "USD":
+            to_ccy = inferred_to_ccy
         
         ref_no = str(row.get("Ref No", ""))
         memo = str(row.get("Memo", ""))
         # full_memo = f"{ref_no} - {memo}"
+
+        txn_currency = "USD"
+        if from_ccy == to_ccy:
+            txn_currency = from_ccy
+        elif from_ccy == "USD" and to_ccy != "USD":
+            txn_currency = to_ccy
+        elif to_ccy == "USD" and from_ccy != "USD":
+            txn_currency = from_ccy
+        else:
+            raise ValueError(
+                f"Transfer currency conflict ({from_ccy} -> {to_ccy}). "
+                "QBO allows only one foreign currency per transfer."
+            )
+
+        # Respect sheet currency if it aligns with account currencies.
+        if row_ccy == "USD":
+            txn_currency = "USD"
+        elif row_ccy in {from_ccy, to_ccy}:
+            txn_currency = row_ccy
+
+        logger.info(
+            f"      [Transfer Currency] Ref={row.get('Ref No','')} "
+            f"From={from_ccy} To={to_ccy} Row={row_ccy} -> Txn={txn_currency}"
+        )
 
         payload = {
             "TxnDate": _parse_date_yyyy_mm_dd(row.get("Date")),
@@ -250,4 +382,19 @@ class QBOSync:
             "ToAccountRef": {"value": to_id},
             "PrivateNote": memo 
         }
+        # Keep existing behavior for USD-only workspaces; include CurrencyRef only when foreign.
+        if txn_currency != "USD":
+            payload["CurrencyRef"] = {"value": txn_currency}
+            txn_date = payload["TxnDate"]
+            fx_rate = self.client.get_exchange_rate(
+                source_currency_code=txn_currency,
+                as_of_date=txn_date,
+                target_currency_code="USD",
+            )
+            if fx_rate is None:
+                raise ValueError(
+                    f"Missing FX rate for {txn_currency}->USD on {txn_date}; "
+                    "skipped to avoid 1:1 exchange posting."
+                )
+            payload["ExchangeRate"] = fx_rate
         return self.client.post(f"/v3/company/{self.client.realm_id}/transfer", payload)

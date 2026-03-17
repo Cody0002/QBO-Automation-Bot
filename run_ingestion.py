@@ -1,4 +1,6 @@
 from __future__ import annotations
+import argparse
+from contextlib import nullcontext
 
 # --- FIX: USE WINDOWS SYSTEM CERTIFICATES ---
 try:
@@ -23,6 +25,7 @@ from src.logic.syncing import QBOSync
 from src.logic.transformer import transform_raw
 from src.utils.logger import setup_logger
 from src.logic.raw_adapter import standardize_raw_df
+from src.utils.run_lock import single_instance_lock
 
 logger = setup_logger("ingestion")
 
@@ -154,49 +157,104 @@ def _get_successfully_processed_nos(gs: GSheetsClient, spreadsheet_url: str, tab
 
 def get_retry_context(gs: GSheetsClient, spreadsheet_url: str, tab_name: str, id_col_name: str) -> Tuple[List[int], Dict[int, str]]:
     """Identifies rows marked as 'ERROR' in the Transform file to re-process them."""
-    print(tab_name, id_col_name)
     try:
-        df = gs.read_as_df_sync(spreadsheet_url, tab_name)
+        # Use read_as_df to keep row positions aligned with sheet rows.
+        df = gs.read_as_df(spreadsheet_url, tab_name)
         if df.empty or "Remarks" not in df.columns or id_col_name not in df.columns:
             return [], {}
-        print(df.head())
-        # Filter for Error rows
-        error_mask = df["Remarks"].astype(str).str.contains("ERROR|Unbalance", case=False, na=False)
-        bad_rows = df[error_mask]
-        # print(bad_rows.head())
-        if bad_rows.empty: return [], {}
 
-        # Identify IDs to delete and map existing sequential IDs
-        bad_ids = bad_rows[id_col_name].unique()
-        target_df = df[df[id_col_name].isin(bad_ids)].copy()
-        
-        rows_to_delete = []
+        work_df = df.copy()
+        work_df["_sheet_row"] = work_df.index + 2  # +2 for header + 0-indexed DataFrame
+        work_df["_remarks"] = work_df["Remarks"].astype(str)
+        work_df["_doc_id"] = work_df[id_col_name].astype(str).str.strip()
+        work_df["_no"] = pd.to_numeric(work_df.get("No"), errors="coerce")
+
+        # Any row flagged as error/unbalanced should trigger full cleanup for its document/no.
+        error_mask = work_df["_remarks"].str.contains("ERROR|Unbalance", case=False, na=False)
+        bad_rows = work_df[error_mask]
+        if bad_rows.empty:
+            return [], {}
+
+        bad_ids = set(bad_rows["_doc_id"].dropna().tolist())
+        bad_ids.discard("")
+        bad_nos = set(
+            bad_rows["_no"]
+            .dropna()
+            .astype(int)
+            .tolist()
+        )
+
+        target_mask = pd.Series(False, index=work_df.index)
+        if bad_ids:
+            target_mask = target_mask | work_df["_doc_id"].isin(bad_ids)
+        if bad_nos:
+            target_mask = target_mask | work_df["_no"].fillna(-1).astype(int).isin(bad_nos)
+
+        target_df = work_df[target_mask].copy()
+        if target_df.empty:
+            return [], {}
+
+        rows_to_delete = sorted(target_df["_sheet_row"].astype(int).unique().tolist(), reverse=True)
         existing_id_map = {}
-        
-        for idx, row in target_df.iterrows():
-            rows_to_delete.append(idx + 2) # +2 for header and 0-index
-            if "No" in row:
-                try: 
-                    s_no = int(float(str(row["No"])))
-                    existing_id_map[s_no] = str(row[id_col_name])
-                except: pass
-                
+
+        for _, row in target_df.iterrows():
+            try:
+                s_no = int(float(str(row.get("No", ""))))
+                doc_id = str(row.get(id_col_name, "")).strip()
+                if s_no > 0 and doc_id:
+                    existing_id_map[s_no] = doc_id
+            except Exception:
+                pass
+
         return rows_to_delete, existing_id_map
     except Exception as e:
-        print(f"🔥 get_retry_context crashed on tab '{tab_name}': {e}")
+        logger.exception(f"get_retry_context crashed on tab '{tab_name}': {e}")
         raise
 
 # ==========================================
 # 2. CORE LOGIC (PER CLIENT)
 # ==========================================
 
-def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_id: str, client_name: str):
+def process_client_control_sheet(
+    gs: GSheetsClient,
+    qbo_client: QBOClient,
+    control_sheet_id: str,
+    client_name: str,
+    realm_id: str,
+):
     """
     Reads the specific Client's Control Sheet and processes all 'READY' jobs.
     """
     logger.info(f"📂 [{client_name}] Opening Control Sheet (ID: {control_sheet_id})...")
 
-    # --- A. Fetch QBO Mappings (Specific to this Client/Realm) ---
+    # --- A. Read the Control Sheet ---
+    try:
+        ctrl_df = gs.read_as_df(control_sheet_id, settings.CONTROL_TAB_NAME)
+    except Exception as e:
+        logger.error(f"   ❌ [{client_name}] Failed to read Control Tab: {e}")
+        return
+
+    if ctrl_df.empty: 
+        logger.warning(f"   ⚠️ [{client_name}] Control Sheet is empty.")
+        return
+
+    # Avoid expensive QBO auth/mapping calls when this client has nothing to run.
+    status_series = ctrl_df.get(settings.CTRL_COL_ACTIVE, pd.Series("", index=ctrl_df.index))
+    ready_count = int(status_series.astype(str).str.strip().eq("READY").sum())
+    if ready_count == 0:
+        logger.info(f"   ⏭️ [{client_name}] No READY rows in control sheet. Skipping QBO auth/mappings.")
+        return
+
+    # --- B. Authenticate/Switch QBO context ---
+    try:
+        logger.info(f"🔐 [{client_name}] Authenticating with Realm ID: {realm_id}")
+        qbo_client.set_company(realm_id)
+        logger.info(f"✅ [{client_name}] Successfully authenticated. Ready to fetch QBO mappings.")
+    except Exception as e:
+        logger.error(f"❌ Critical Auth Failure for {client_name}: {e}")
+        return
+
+    # --- C. Fetch QBO Mappings (Specific to this Client/Realm) ---
     try:
         temp_sync = QBOSync(qbo_client)
         qbo_mappings = temp_sync.mappings
@@ -207,17 +265,6 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             logger.warning(f"   ⚠️ [{client_name}] WARNING: No accounts found! Check Realm ID is correct.")
     except Exception as e:
         logger.error(f"   ❌ [{client_name}] Failed to fetch mappings. Check Realm ID/Token. Error: {e}")
-        return
-
-    # --- B. Read the Control Sheet ---
-    try:
-        ctrl_df = gs.read_as_df(control_sheet_id, settings.CONTROL_TAB_NAME)
-    except Exception as e:
-        logger.error(f"   ❌ [{client_name}] Failed to read Control Tab: {e}")
-        return
-
-    if ctrl_df.empty: 
-        logger.warning(f"   ⚠️ [{client_name}] Control Sheet is empty.")
         return
 
     # --- Constants for this Client ---
@@ -235,7 +282,7 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
     # Get the max journal number currently recorded in the sheet
     global_last_jv = ctrl_df[COL_LAST_JV].apply(safe_int).max()
 
-    # --- C. Iterate Control Sheet Rows ---
+    # --- D. Iterate Control Sheet Rows ---
     for i, row in ctrl_df.iterrows():
         # 1. Check Trigger
         status_val = str(row.get(settings.CTRL_COL_ACTIVE, "")).strip()
@@ -256,6 +303,7 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             month = format_month_name(raw_month)
 
             # 3. Create/Link Transform File
+            created_new_transform = False
             if not transform_url or len(transform_url) < 10:
                 new_title = f"{client_name} - {country} QBO - {month}"
                 logger.info(f"   ⚠️ No Transform File. Creating: '{new_title}'...")
@@ -266,6 +314,7 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
                     gs.copy_permissions(source_id=control_sheet_id, target_id=new_file_id)
                     
                     _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_TRANSFORM_URL: transform_url})
+                    created_new_transform = True
                 except Exception as e:
                     logger.error(f"   ❌ Failed to create spreadsheet: {e}")
                     raise e
@@ -290,6 +339,17 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
                 _parse_no_set(row.get(COL_PENDING_AMOUNT_NOS, "")),
                 last_processed
             )
+
+            # If this run created a brand-new transform file, treat it as a fresh row state.
+            # This avoids accidental skipping when a duplicated control row carries old counters.
+            if created_new_transform:
+                if last_processed > 0 or previous_pending_nos:
+                    logger.info(
+                        f"   [{client_name}] New transform detected; resetting carried row state "
+                        f"(Last Processed Row {last_processed} -> 0, Pending Amount Nos cleared)."
+                    )
+                last_processed = 0
+                previous_pending_nos = set()
 
             tab_prefix = f"{country} {month}"
             tab_jv, tab_exp, tab_tr = f"{tab_prefix} - Journals", f"{tab_prefix} - Expenses", f"{tab_prefix} - Transfers"
@@ -434,11 +494,25 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
             )
 
             # --- LOGGING SELECTION ---
-            dropped_processed = after_exclude - len(processing_df)
+            no_numeric = pd.to_numeric(raw_df["No"], errors="coerce").fillna(0).astype(int)
+            no_method_count = int((~method_non_blank).sum())
+            zero_amount_count = int((method_non_blank & (amt_numeric == 0)).sum())
+            positive_amt_count = int((method_non_blank & (amt_numeric != 0)).sum())
+            eligible_old_done_count = int(
+                ((no_numeric <= last_processed) &
+                 (~no_numeric.isin(previous_pending_nos)) &
+                 (~no_numeric.isin(retry_nos)) &
+                 (method_non_blank & (amt_numeric != 0))).sum()
+            )
             logger.info(
                 f"   🔢 [{client_name}] Step 10: Selection -> New: {len(new_df)}, "
                 f"Late-filled: {len(late_filled_df)}, Retry: {len(retry_df)} | "
-                f"Total: {len(processing_df)} | Skipped (Old & done): {dropped_processed}"
+                f"Total: {len(processing_df)}"
+            )
+            logger.info(
+                f"   🔍 [{client_name}] Step 10 Detail -> No Method: {no_method_count}, "
+                f"Zero Amount(Pending): {zero_amount_count}, Ready Rows: {positive_amt_count}, "
+                f"Eligible Old & done: {eligible_old_done_count}, Last Processed Row: {last_processed}"
             )
             # -------------------------
 
@@ -530,66 +604,112 @@ def process_client_control_sheet(gs: GSheetsClient, qbo_client: QBOClient, contr
 # ==========================================
 # 3. MAIN ENTRY POINT
 # ==========================================
-def main():
-    gs = GSheetsClient()
-    
-    # Initialize QBO Client with GSheets (to allow it to read/write tokens)
-    qbo_client = QBOClient(gs_client=gs)
+def _is_target_client(client_row: pd.Series, target_client: str | None) -> bool:
+    if not target_client:
+        return True
 
-    logger.info("🌍 Reading MASTER SHEET to find active clients...")
-    
-    try:
-        master_df = gs.read_as_df(settings.MASTER_SHEET_ID, settings.MASTER_TAB_NAME)
-    except Exception as e:
-        logger.error(f"❌ Critical: Could not read Master Sheet: {e}")
-        return
+    target = str(target_client).strip()
+    if not target:
+        return True
+    target_norm = settings.normalize_workspace_name(target)
+    if target_norm in {"all", "*", "all clients"}:
+        return True
 
-    if master_df.empty:
-        logger.warning("Master sheet is empty.")
-        return
+    row_client = str(client_row.get(settings.MST_COL_CLIENT, "")).strip()
+    row_realm = str(client_row.get(settings.MST_COL_REALM_ID, "")).strip()
+    row_sheet_id = str(client_row.get(settings.MST_COL_SHEET_ID, "")).strip()
 
-    # Loop through Clients
-    for i, client_row in master_df.iterrows():
-        client_name = str(client_row.get(settings.MST_COL_CLIENT, "Unknown"))
-        status = str(client_row.get(settings.MST_COL_STATUS, "")).strip()
+    if target == row_realm:
+        return True
+    if target == row_sheet_id:
+        return True
+    return target_norm == settings.normalize_workspace_name(row_client)
+
+def _target_is_all(target_client: str | None) -> bool:
+    if not target_client:
+        return True
+    t = settings.normalize_workspace_name(target_client)
+    return t in {"", "all", "*", "all clients"}
+
+def main(target_client: str | None = None):
+    target_is_all = _target_is_all(target_client)
+    dispatch_ctx = single_instance_lock("run_ingestion_all_dispatch") if target_is_all else nullcontext(True)
+    with dispatch_ctx as acquired:
+        if target_is_all and not acquired:
+            logger.warning("Another ALL ingestion dispatch is already in progress. Skipping this run.")
+            return
+
+        gs = GSheetsClient()
         
-        # Filter Active Clients
-        if status.lower() != "active":
-            continue
+        # Initialize QBO Client with GSheets (to allow it to read/write tokens)
+        qbo_client = QBOClient(gs_client=gs)
 
-        if not settings.is_allowed_workspace(client_name):
-            logger.warning(
-                f"⚠️ Skipping {client_name}: workspace not allowed for QBO API. "
-                f"Allowed: {', '.join(settings.ALLOWED_QBO_WORKSPACES)}"
-            )
-            continue
-
-        sheet_id = str(client_row.get(settings.MST_COL_SHEET_ID, "")).strip()
-        realm_id = str(client_row.get(settings.MST_COL_REALM_ID, "")).strip()
-
-        if not sheet_id or not realm_id:
-            logger.warning(f"⚠️ Skipping {client_name}: Missing Sheet ID or Realm ID.")
-            continue
-
-        print(f"🏢 STARTING CLIENT: {client_name}")
-        print(f"   Realm ID: {realm_id} | Sheet: {sheet_id}")
-
-        # 1. Authenticate / Switch Context
+        logger.info("🌍 Reading MASTER SHEET to find active clients...")
+        
         try:
-            logger.info(f"🔐 [{client_name}] Authenticating with Realm ID: {realm_id}")
-            qbo_client.set_company(realm_id)
-            logger.info(f"✅ [{client_name}] Successfully authenticated. Ready to fetch QBO mappings.")
+            master_df = gs.read_as_df(settings.MASTER_SHEET_ID, settings.MASTER_TAB_NAME)
         except Exception as e:
-            logger.error(f"❌ Critical Auth Failure for {client_name}: {e}")
-            continue
+            logger.error(f"❌ Critical: Could not read Master Sheet: {e}")
+            return
 
-        # 2. Run Ingestion for this Client
-        try:
-            process_client_control_sheet(gs, qbo_client, sheet_id, client_name)
-        except Exception as e:
-            logger.error(f"❌ Critical Logic Failure for {client_name}: {e}")
+        # Normalize headers to avoid silent misses from extra spaces/newlines in sheet columns.
+        master_df.columns = [" ".join(str(c).replace("\n", " ").split()) for c in master_df.columns]
 
-    logger.info("🏁 All Clients Processed.")
+        if master_df.empty:
+            logger.warning("Master sheet is empty.")
+            return
+
+        # Loop through Clients
+        matched_clients = 0
+        for i, client_row in master_df.iterrows():
+            if not _is_target_client(client_row, target_client):
+                continue
+            matched_clients += 1
+
+            client_name = str(client_row.get(settings.MST_COL_CLIENT, "Unknown"))
+            status = str(client_row.get(settings.MST_COL_STATUS, "")).strip()
+            
+            # Filter Active Clients
+            if status.lower() != "active":
+                continue
+
+            if not settings.is_allowed_workspace(client_name):
+                logger.warning(
+                    f"⚠️ Skipping {client_name}: workspace not allowed for QBO API. "
+                    f"Allowed: {', '.join(settings.ALLOWED_QBO_WORKSPACES)}"
+                )
+                continue
+
+            sheet_id = str(client_row.get(settings.MST_COL_SHEET_ID, "")).strip()
+            realm_id = str(client_row.get(settings.MST_COL_REALM_ID, "")).strip()
+
+            if not sheet_id or not realm_id:
+                logger.warning(f"⚠️ Skipping {client_name}: Missing Sheet ID or Realm ID.")
+                continue
+
+            print(f"🏢 STARTING CLIENT: {client_name}")
+            print(f"   Realm ID: {realm_id} | Sheet: {sheet_id}")
+
+            client_lock_name = f"run_ingestion_client_{realm_id}"
+            with single_instance_lock(client_lock_name) as client_acquired:
+                if not client_acquired:
+                    logger.warning(
+                        f"⏭️ Skipping {client_name}: another ingestion run is already processing Realm {realm_id}."
+                    )
+                    continue
+                # Run Ingestion for this Client
+                try:
+                    process_client_control_sheet(gs, qbo_client, sheet_id, client_name, realm_id)
+                except Exception as e:
+                    logger.error(f"❌ Critical Logic Failure for {client_name}: {e}")
+
+        if target_client and matched_clients == 0:
+            logger.warning(f"No client matched target '{target_client}'.")
+
+        logger.info("🏁 All Clients Processed.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run QBO ingestion/transform pipeline.")
+    parser.add_argument("--client", dest="client", default="", help="Target client name or Realm ID.")
+    args = parser.parse_args()
+    main(target_client=args.client)

@@ -1,4 +1,7 @@
 from __future__ import annotations
+import argparse
+import os
+from contextlib import nullcontext
 try:
     import pip_system_certs.wrappers
     pip_system_certs.wrappers.wrap_requests()
@@ -16,8 +19,12 @@ from src.connectors.qbo_client import QBOClient
 from src.logic.reconciler import Reconciler
 from src.utils.logger import setup_logger
 from src.logic.raw_adapter import standardize_raw_df
+from src.utils.run_lock import single_instance_lock
 
 logger = setup_logger("reconciliation_runner")
+RECONCILE_ENABLE_RAW_CHECK = str(os.getenv("RECONCILE_ENABLE_RAW_CHECK", "1")).strip().lower() not in {
+    "0", "false", "no", "off"
+}
 
 def _batch_update_control(gs, sheet_id, tab_name, row_num, columns, updates_dict):
     """Updates the Control Sheet."""
@@ -68,7 +75,13 @@ def write_raw_check_results(gs, spreadsheet_url, tab_name, df, updates_list):
 # ==============================================================================
 # LOGIC: PROCESS ONE CLIENT
 # ==============================================================================
-def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_id: str, client_name: str):
+def process_client_reconcile(
+    gs: GSheetsClient,
+    qbo_client: QBOClient,
+    control_sheet_id: str,
+    client_name: str,
+    realm_id: str,
+):
     logger.info(f"📂 [{client_name}] Reading Control Sheet (ID: {control_sheet_id})...")
     
     try:
@@ -77,14 +90,30 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
         logger.error(f"   ❌ [{client_name}] Failed to read Control Sheet: {e}")
         return
     
-    if ctrl_df.empty: return
+    if ctrl_df.empty:
+        return
 
-    # Initialize Reconciler
-    reconciler = Reconciler(qbo_client)
     CTRL_COL_RECONCILE = "QBO Reconcile"
     COL_QBO_JV = "QBO Journal"
     COL_QBO_EXP = "QBO Expense"
     COL_QBO_TR = "QBO Transfer"
+
+    status_series = ctrl_df.get(CTRL_COL_RECONCILE, pd.Series("", index=ctrl_df.index))
+    reconcile_now_count = int(status_series.astype(str).str.strip().eq("RECONCILE NOW").sum())
+    if reconcile_now_count == 0:
+        logger.info(f"   ⏭️ [{client_name}] No RECONCILE NOW rows. Skipping QBO auth.")
+        return
+
+    try:
+        logger.info(f"🔐 [{client_name}] Authenticating with Realm ID: {realm_id}")
+        qbo_client.set_company(realm_id)
+        logger.info(f"✅ [{client_name}] Authenticated. Ready to reconcile.")
+    except Exception as e:
+        logger.error(f"❌ Failed auth for {client_name}: {e}")
+        return
+
+    # Initialize Reconciler
+    reconciler = Reconciler(qbo_client)
 
     for i, row in ctrl_df.iterrows():
         status = str(row.get(CTRL_COL_RECONCILE, "")).strip()
@@ -112,37 +141,40 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
         raw_tab_name = row.get(settings.CTRL_COL_TAB_NAME)
         
         raw_df = pd.DataFrame()
-        
-        try:
-            if source_url and raw_tab_name:
-                logger.info(f"   📥 [{client_name}] Fetching Raw Source for Validation...")
-                source_header_row = 5 if "kzdw" in str(client_name).lower() else 1
-                raw_df = gs.read_as_df(
-                    source_url,
-                    raw_tab_name,
-                    header_row=source_header_row,
-                    value_render_option='UNFORMATTED_VALUE'
-                )
-                raw_df = standardize_raw_df(raw_df, client_name=client_name, raw_month=raw_month)
-                # Apply Standard Columns
-                raw_df = raw_df.iloc[:, :25]  # Keep first 25 columns
 
-                raw_df.columns = [
-                    "CO", "COY", "Date", "Category", "Type", "Item Description", 
-                    "TrxHarsh", "Account Fr", "Account To", "Currency", "Amount Fr", 
-                    "Currency To", "Amount To", "Budget", "USD - Raw", "USD - Actual", 
-                    "USD - Loss", "USD - QBO", "Reclass", "QBO Method", 
-                    "If Journal/Expense Method", "QBO Transfer Fr", "QBO Transfer To", 
-                    "Check (Internal use)", "No"
-                ]
-                
-                # 8. Numeric Cleanup
-                for col in ["No", "USD - QBO", "Amount Fr", "Amount To"]:
-                    if col in raw_df.columns:
-                        raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0)
+        if RECONCILE_ENABLE_RAW_CHECK:
+            try:
+                if source_url and raw_tab_name:
+                    logger.info(f"   📥 [{client_name}] Fetching Raw Source for Validation...")
+                    source_header_row = 5 if "kzdw" in str(client_name).lower() else 1
+                    raw_df = gs.read_as_df(
+                        source_url,
+                        raw_tab_name,
+                        header_row=source_header_row,
+                        value_render_option='UNFORMATTED_VALUE'
+                    )
+                    raw_df = standardize_raw_df(raw_df, client_name=client_name, raw_month=raw_month)
+                    # Apply Standard Columns
+                    raw_df = raw_df.iloc[:, :25]  # Keep first 25 columns
 
-        except Exception as e:
-            logger.error(f"   ⚠️ Failed to read Raw Source: {e}")
+                    raw_df.columns = [
+                        "CO", "COY", "Date", "Category", "Type", "Item Description", 
+                        "TrxHarsh", "Account Fr", "Account To", "Currency", "Amount Fr", 
+                        "Currency To", "Amount To", "Budget", "USD - Raw", "USD - Actual", 
+                        "USD - Loss", "USD - QBO", "Reclass", "QBO Method", 
+                        "If Journal/Expense Method", "QBO Transfer Fr", "QBO Transfer To", 
+                        "Check (Internal use)", "No"
+                    ]
+                    
+                    # 8. Numeric Cleanup
+                    for col in ["No", "USD - QBO", "Amount Fr", "Amount To"]:
+                        if col in raw_df.columns:
+                            raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0)
+
+            except Exception as e:
+                logger.error(f"   ⚠️ Failed to read Raw Source: {e}")
+        else:
+            logger.info(f"   ⏭️ [{client_name}] Raw-vs-transform check disabled by RECONCILE_ENABLE_RAW_CHECK.")
 
         # 1. Reconcile Journals
         try:
@@ -231,41 +263,93 @@ def process_client_reconcile(gs: GSheetsClient, qbo_client: QBOClient, control_s
 # ==============================================================================
 # MAIN ENTRY POINT
 # ==============================================================================
-def main():
-    gs = GSheetsClient()
-    qbo_client = QBOClient(gs_client=gs)
+def _is_target_client(client_row: pd.Series, target_client: str | None) -> bool:
+    if not target_client:
+        return True
 
-    logger.info("🌍 Reading MASTER SHEET for Reconcile Jobs...")
-    try:
-        master_df = gs.read_as_df(settings.MASTER_SHEET_ID, settings.MASTER_TAB_NAME)
-    except Exception as e:
-        logger.error(f"❌ Critical: {e}")
-        return
+    target = str(target_client).strip()
+    if not target:
+        return True
+    target_norm = settings.normalize_workspace_name(target)
+    if target_norm in {"all", "*", "all clients"}:
+        return True
 
-    for i, client_row in master_df.iterrows():
-        client_name = str(client_row.get(settings.MST_COL_CLIENT, "Unknown"))
-        if str(client_row.get(settings.MST_COL_STATUS, "")).strip().lower() != "active": continue
-        if not settings.is_allowed_workspace(client_name):
-            logger.warning(
-                f"⚠️ Skipping {client_name}: workspace not allowed for QBO API. "
-                f"Allowed: {', '.join(settings.ALLOWED_QBO_WORKSPACES)}"
-            )
-            continue
+    row_client = str(client_row.get(settings.MST_COL_CLIENT, "")).strip()
+    row_realm = str(client_row.get(settings.MST_COL_REALM_ID, "")).strip()
+    row_sheet_id = str(client_row.get(settings.MST_COL_SHEET_ID, "")).strip()
 
-        sheet_id = str(client_row.get(settings.MST_COL_SHEET_ID, "")).strip()
-        realm_id = str(client_row.get(settings.MST_COL_REALM_ID, "")).strip()
+    if target == row_realm:
+        return True
+    if target == row_sheet_id:
+        return True
+    return target_norm == settings.normalize_workspace_name(row_client)
 
-        if not sheet_id or not realm_id: continue
+def _target_is_all(target_client: str | None) -> bool:
+    if not target_client:
+        return True
+    t = settings.normalize_workspace_name(target_client)
+    return t in {"", "all", "*", "all clients"}
 
-        print(f"\n🏢 RECONCILING CLIENT: {client_name} (Realm: {realm_id})")
-        
+def main(target_client: str | None = None):
+    target_is_all = _target_is_all(target_client)
+    dispatch_ctx = single_instance_lock("run_reconciliation_all_dispatch") if target_is_all else nullcontext(True)
+    with dispatch_ctx as acquired:
+        if target_is_all and not acquired:
+            logger.warning("Another ALL reconciliation dispatch is already in progress. Skipping this run.")
+            return
+
+        gs = GSheetsClient()
+        qbo_client = QBOClient(gs_client=gs)
+
+        logger.info("🌍 Reading MASTER SHEET for Reconcile Jobs...")
         try:
-            # 1. Switch Auth
-            qbo_client.set_company(realm_id)
-            # 2. Process
-            process_client_reconcile(gs, qbo_client, sheet_id, client_name)
+            master_df = gs.read_as_df(settings.MASTER_SHEET_ID, settings.MASTER_TAB_NAME)
         except Exception as e:
-            logger.error(f"❌ Failed client {client_name}: {e}")
+            logger.error(f"❌ Critical: {e}")
+            return
+
+        # Normalize headers to avoid silent misses from extra spaces/newlines in sheet columns.
+        master_df.columns = [" ".join(str(c).replace("\n", " ").split()) for c in master_df.columns]
+
+        matched_clients = 0
+        for i, client_row in master_df.iterrows():
+            if not _is_target_client(client_row, target_client):
+                continue
+            matched_clients += 1
+
+            client_name = str(client_row.get(settings.MST_COL_CLIENT, "Unknown"))
+            if str(client_row.get(settings.MST_COL_STATUS, "")).strip().lower() != "active": continue
+            if not settings.is_allowed_workspace(client_name):
+                logger.warning(
+                    f"⚠️ Skipping {client_name}: workspace not allowed for QBO API. "
+                    f"Allowed: {', '.join(settings.ALLOWED_QBO_WORKSPACES)}"
+                )
+                continue
+
+            sheet_id = str(client_row.get(settings.MST_COL_SHEET_ID, "")).strip()
+            realm_id = str(client_row.get(settings.MST_COL_REALM_ID, "")).strip()
+
+            if not sheet_id or not realm_id: continue
+
+            print(f"\n🏢 RECONCILING CLIENT: {client_name} (Realm: {realm_id})")
+
+            client_lock_name = f"run_reconciliation_client_{realm_id}"
+            with single_instance_lock(client_lock_name) as client_acquired:
+                if not client_acquired:
+                    logger.warning(
+                        f"⏭️ Skipping {client_name}: another reconciliation run is already processing Realm {realm_id}."
+                    )
+                    continue
+                try:
+                    process_client_reconcile(gs, qbo_client, sheet_id, client_name, realm_id)
+                except Exception as e:
+                    logger.error(f"❌ Failed client {client_name}: {e}")
+
+        if target_client and matched_clients == 0:
+            logger.warning(f"No client matched target '{target_client}'.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run QBO reconciliation pipeline.")
+    parser.add_argument("--client", dest="client", default="", help="Target client name or Realm ID.")
+    args = parser.parse_args()
+    main(target_client=args.client)

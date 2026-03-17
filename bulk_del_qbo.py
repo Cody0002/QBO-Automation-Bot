@@ -109,23 +109,18 @@ if __name__ == "__main__":
     # 1. SETTINGS
     # -------------------------------------------
     # Enter your Company Realm ID here
-    TARGET_REALM_ID = "9341455236392142"  
+    # TARGET_REALM_ID = "9341455236401293"  
     
     # PASTE YOUR IDs HERE (as strings or numbers)
     # ids_to_delete = [616, 617, 618, 619, 620, 621, 622]
     
     ids_to_delete =[
-            3009,
-            3010,
-            3011,
-            3012,
-            3013,
-            3014
+33668,33669,33670,33671,33854,33855,33856,33857,33877,33878,33879,33880,33881,33870,33871,33873,33874,33875
             ]
 
     # SELECT THE TYPE (Must match the IDs above)
     # Options: "JournalEntry", "Purchase" (Expense), "Transfer", "Deposit"
-    ENTITY_TYPE = "Purchase" 
+    ENTITY_TYPE = "JournalEntry" 
     
     # -------------------------------------------
     # 2. EXECUTION

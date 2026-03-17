@@ -208,6 +208,69 @@ class QBOClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_exchange_rate(
+        self,
+        source_currency_code: str,
+        as_of_date: str | None = None,
+        target_currency_code: str = "USD",
+    ) -> Optional[float]:
+        """
+        Fetches QBO exchange rate for source -> target currency.
+        Returns None when unavailable.
+        """
+        src = str(source_currency_code or "").strip().upper()
+        tgt = str(target_currency_code or "").strip().upper()
+        if not src or src == tgt:
+            return 1.0
+
+        params = [f"sourcecurrencycode={urllib.parse.quote(src)}"]
+        if as_of_date:
+            params.append(f"asofdate={urllib.parse.quote(str(as_of_date))}")
+        if tgt:
+            params.append(f"targetcurrencycode={urllib.parse.quote(tgt)}")
+        params.append(f"minorversion={settings.QBO_MINOR_VERSION}")
+
+        path = f"/v3/company/{self.realm_id}/exchangerate?{'&'.join(params)}"
+        try:
+            data = self._get(path)
+        except Exception as e:
+            print(f"⚠️ Failed to fetch exchange rate {src}->{tgt} ({as_of_date}): {e}")
+            return None
+
+        candidates = []
+        if isinstance(data, dict):
+            er = data.get("ExchangeRate")
+            if isinstance(er, list):
+                candidates.extend(er)
+            elif isinstance(er, dict):
+                candidates.append(er)
+
+            qr = data.get("QueryResponse", {})
+            qer = qr.get("ExchangeRate")
+            if isinstance(qer, list):
+                candidates.extend(qer)
+            elif isinstance(qer, dict):
+                candidates.append(qer)
+
+        for item in candidates:
+            try:
+                item_src = str(item.get("SourceCurrencyCode", "")).upper()
+                item_tgt = str(item.get("TargetCurrencyCode", "")).upper()
+                if item_src and item_src != src:
+                    continue
+                if item_tgt and item_tgt != tgt:
+                    continue
+
+                raw_rate = item.get("Rate", item.get("ExchangeRate"))
+                rate = float(raw_rate)
+                if rate > 0:
+                    return rate
+            except Exception:
+                continue
+
+        print(f"⚠️ Exchange rate not found in QBO response for {src}->{tgt} ({as_of_date}).")
+        return None
+
     def get_max_journal_number(self, prefix: str) -> int:
         query = f"SELECT DocNumber FROM JournalEntry WHERE DocNumber LIKE '{prefix}%' ORDER BY DocNumber DESC MAXRESULTS 1"
         try:

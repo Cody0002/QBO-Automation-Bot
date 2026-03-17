@@ -32,28 +32,38 @@ def webhook_listener():
     # 2. Parse Data
     data = request.json
     event_type = data.get('event')
-    client_name = data.get('country') # In your AppScript, you sent 'country' as Client Name (Row 1)
+    target_client = (
+        data.get('spreadsheet_id')
+        or data.get('spreadsheetId')
+        or data.get('realm_id')
+        or data.get('realmId')
+        or data.get('client')
+        or data.get('client_name')
+        or data.get('workspace')
+        or data.get('target')
+        or data.get('country')
+    )
 
-    print(f"\n[🔔] Webhook: {event_type} | Target: {client_name}")
+    print(f"\n[🔔] Webhook: {event_type} | Target: {target_client}")
 
     # 3. Handle Events
     
     # --- CASE A: TRANSFORM / INGESTION ---
     if event_type == 'pipeline_trigger':
         # Pass the client name to the function
-        thread = threading.Thread(target=run_script_in_background, args=("run_ingestion.py", client_name))
+        thread = threading.Thread(target=run_script_in_background, args=("run_ingestion.py", target_client))
         thread.start()
-        return jsonify({"status": "success", "message": f"Ingestion started for {client_name}"}), 200
+        return jsonify({"status": "success", "message": f"Ingestion started for {target_client}"}), 200
 
     # --- CASE B: SYNCING ---
     elif event_type == 'sync_trigger':
-        thread = threading.Thread(target=run_script_in_background, args=("run_syncing.py", client_name))
+        thread = threading.Thread(target=run_script_in_background, args=("run_syncing.py", target_client))
         thread.start()
         return jsonify({"status": "success", "message": "Syncing started"}), 200
 
     # --- CASE C: RECONCILIATION ---
     elif event_type == 'reconcile_trigger':
-        thread = threading.Thread(target=run_script_in_background, args=("run_reconciliation.py", client_name))
+        thread = threading.Thread(target=run_script_in_background, args=("run_reconciliation.py", target_client))
         thread.start()
         return jsonify({"status": "success", "message": "Reconciliation started"}), 200
 

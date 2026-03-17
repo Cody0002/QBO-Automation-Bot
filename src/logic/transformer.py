@@ -150,12 +150,60 @@ def _is_kzo_case(client_name: str = "") -> bool:
 def _is_kzdw_case(client_name: str = "") -> bool:
     return "kzdw" in str(client_name).lower()
 
+def _should_check_currency_transfer_only(client_name: str = "") -> bool:
+    """
+    Workspaces where currency validation should run only for Transfer,
+    not for Journal/Expense.
+    """
+    return _is_kzdw_case(client_name)
+
+def _should_check_transfer_currency(client_name: str = "") -> bool:
+    return _is_kzdw_case(client_name)
+
 
 def _normalize_currency(value: Any) -> str:
     text = str(value).strip() if not pd.isna(value) else ""
     if text == "":
         return "USD"
     return "USD" if "USD" in text.upper() else text
+
+def _normalize_currency_code(value: Any) -> str:
+    text = _normalize_currency(value).strip().upper()
+    if not text:
+        return "USD"
+    return text[:3]
+
+def _account_currency_from_id(qbo_mappings: Dict[str, dict], account_id: str | None) -> str | None:
+    if not account_id:
+        return None
+    acc_meta = (qbo_mappings or {}).get("accounts_meta", {})
+    raw_currency = (acc_meta.get(account_id) or {}).get("currency")
+    if not raw_currency:
+        return None
+    return _normalize_currency_code(raw_currency)
+
+def _currency_mismatch_error(
+    row_no: Any,
+    file_currency: Any,
+    account_checks: list[tuple[str, str, str | None]],
+) -> str | None:
+    """
+    account_checks: [(label, account_name, qbo_account_currency_or_none), ...]
+    """
+    file_ccy = _normalize_currency_code(file_currency)
+    mismatches = []
+    for label, acc_name, qbo_ccy in account_checks:
+        if not qbo_ccy:
+            continue
+        if qbo_ccy != file_ccy:
+            mismatches.append(f"{label} '{acc_name}'={qbo_ccy}")
+
+    if not mismatches:
+        return None
+    return (
+        f"ERROR | Currency mismatch: File={file_ccy} | "
+        f"{'; '.join(mismatches)} | Row No: {row_no}"
+    )
 
 
 def _build_id_prefixes(client_name: str = "") -> tuple[str, str]:
@@ -214,6 +262,9 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
 
     # --- A. STANDARD JOURNALS ---
     if not df_std.empty:
+        df_std = df_std.copy()
+        # Keep source row order so debit/credit lines can be written as grouped pairs.
+        df_std["_LineGroupOrder"] = range(len(df_std))
         jv_prefix, _ = _build_id_prefixes(client_name)
         is_kzo_workspace = _is_kzo_case(client_name) and not _is_kzp_case(client_name)
         kzo_date_map = {}
@@ -304,6 +355,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                 deb["Account"] = deb["Account"].fillna(deb[COL_TYPE])
         # Fill NA locations with raw CO value
         deb["Location"] = deb["Location"].fillna(df_std[COL_CO])
+        deb["_LineRole"] = 0
         
         # Credit
         cred = df_std.copy()
@@ -326,8 +378,13 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
             cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_ACC_CR: "Account", COL_CO: "Location"})
         # Fill NA locations with raw CO value
         cred["Location"] = cred["Location"].fillna(df_std[COL_CO])
+        cred["_LineRole"] = 1
         
         processed_std = pd.concat([deb, cred], ignore_index=True)
+        processed_std = processed_std.sort_values(
+            by=["Journal No", "_LineGroupOrder", "_LineRole"],
+            kind="stable",
+        ).reset_index(drop=True)
 
     # --- B. RECLASS JOURNALS ---
     if not df_reclass.empty:
@@ -362,8 +419,10 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
             df_reclass["Account"] = df_reclass["Account"].fillna(df_reclass[COL_TYPE])
         # Fill NA locations with raw CO value
         df_reclass["Location"] = df_reclass["Location"].fillna(df_reclass[COL_CO] if COL_CO in df_reclass.columns else "")
+        df_reclass["_LineGroupOrder"] = range(len(df_reclass))
+        df_reclass["_LineRole"] = 0
 
-        processed_reclass = df_reclass[["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class"]]
+        processed_reclass = df_reclass[["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class", "_LineGroupOrder", "_LineRole"]]
 
     # --- 3. Safe Combination ---
     total_journals = pd.concat([processed_std, processed_reclass], ignore_index=True)
@@ -372,7 +431,11 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         return pd.DataFrame(), start_no
 
     total_journals = total_journals[total_journals["Amount"].abs() > 1e-9].copy()
-    
+    if "_LineGroupOrder" not in total_journals.columns:
+        total_journals["_LineGroupOrder"] = 0
+    if "_LineRole" not in total_journals.columns:
+        total_journals["_LineRole"] = 0
+     
     for col in total_journals.select_dtypes(include=['datetime64', 'datetimetz']).columns:
         total_journals[col] = total_journals[col].astype(str)
     
@@ -386,6 +449,12 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                 if not mask.any(): continue
                 target_idx = total_journals[mask].index[-1]
                 total_journals.loc[target_idx, "Amount"] -= diff
+
+    # Keep each Journal No contiguous in output (debit/credit grouped together).
+    total_journals = total_journals.sort_values(
+        by=["Journal No", "_LineGroupOrder", "_LineRole"],
+        kind="stable",
+    ).reset_index(drop=True)
 
     # --- VALIDATION ---
     balance_map = total_journals.groupby("Journal No")["Amount"].sum()
@@ -403,9 +472,19 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         if _is_blank(acc_name):
             return f"ERROR | Missing Account Name | Row No: {row_no}"
         
-        if not find_id_in_map(map_acc, acc_name): 
+        acc_id = find_id_in_map(map_acc, acc_name)
+        if not acc_id:
             return f"ERROR | Account not found: '{acc_name}' | Row No: {row_no}"
-            
+
+        if _is_kzdw_case(client_name) and not _should_check_currency_transfer_only(client_name):
+            mismatch_error = _currency_mismatch_error(
+                row_no=row_no,
+                file_currency=row.get("Currency Code", "USD"),
+                account_checks=[("Account", acc_name, _account_currency_from_id(qbo_mappings, acc_id))],
+            )
+            if mismatch_error:
+                return mismatch_error
+             
         loc_name = row.get("Location")
         if (not _is_blank(loc_name)) and not find_id_in_map(map_loc, loc_name):
              return f"ERROR | Location not found: '{loc_name}' | Row No: {row_no}"
@@ -447,6 +526,10 @@ def process_expenses(df: pd.DataFrame, country: str,
 
     if COL_METHOD in d.columns: 
         d = d[d[COL_METHOD].astype(str).str.contains("Expense", case=False, na=False)]
+
+    # KZP reimbursements are journal-only; do not duplicate into Expense tab.
+    if _is_kzp_case(client_name) and COL_TYPE in d.columns:
+        d = d[d[COL_TYPE].astype(str).str.strip().str.lower() != "reimbursements"]
     
     if COL_IN_OUT in d.columns:
         numeric_vals = pd.to_numeric(d[COL_IN_OUT], errors="coerce").fillna(0)
@@ -461,7 +544,18 @@ def process_expenses(df: pd.DataFrame, country: str,
         d["Currency Code"] = d["Currency"].apply(_normalize_currency)
     else:
         d["Currency Code"] = "USD"
-    d["Account (Cr)"] = d[COL_ACC_CR]
+    # Expense source account:
+    # Prefer Transfer From (W) and fall back to If Journal/Expense Method (V).
+    if COL_TR_FROM in d.columns:
+        transfer_from_vals = d[COL_TR_FROM]
+        fallback_vals = d[COL_ACC_CR] if COL_ACC_CR in d.columns else ""
+        d["Account (Cr)"] = transfer_from_vals.where(
+            transfer_from_vals.astype(str).str.strip() != "",
+            fallback_vals,
+        )
+        d["Account (Cr)"] = d["Account (Cr)"].fillna(fallback_vals)
+    else:
+        d["Account (Cr)"] = d[COL_ACC_CR]
     
     d["Expense Line Amount"] = safe_to_float(d[COL_USD]) * -1
     d["Payment Date"] = pd.to_datetime(d[COL_DATE], errors="coerce")
@@ -523,14 +617,28 @@ def process_expenses(df: pd.DataFrame, country: str,
         src_acc = row["Account (Cr)"]
         exp_acc = row["Expense Account (Dr)"]
         
-        if not find_id_in_map(map_acc, src_acc): 
+        src_acc_id = find_id_in_map(map_acc, src_acc)
+        if not src_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | Source Account not in QBO: '{src_acc}' | Available: {available}... | Row No: {row_no}"
-            
-        if not find_id_in_map(map_acc, exp_acc): 
+             
+        exp_acc_id = find_id_in_map(map_acc, exp_acc)
+        if not exp_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | Expense Account not in QBO: '{exp_acc}' | Available: {available}... | Row No: {row_no}"
-            
+
+        if _is_kzdw_case(client_name) and not _should_check_currency_transfer_only(client_name):
+            mismatch_error = _currency_mismatch_error(
+                row_no=row_no,
+                file_currency=row.get("Currency", "USD"),
+                account_checks=[
+                    ("Source", src_acc, _account_currency_from_id(qbo_mappings, src_acc_id)),
+                    ("Expense", exp_acc, _account_currency_from_id(qbo_mappings, exp_acc_id)),
+                ],
+            )
+            if mismatch_error:
+                return mismatch_error
+             
         loc_name = row.get("Location")
         if (not _is_blank(loc_name)) and not find_id_in_map(map_loc, loc_name): 
             return f"ERROR | Location not in QBO: '{loc_name}' | Row No: {row_no}"
@@ -562,6 +670,10 @@ def process_transfers(df: pd.DataFrame, country: str,
 
     if COL_METHOD in transfers.columns:
         transfers = transfers[transfers[COL_METHOD].astype(str).str.contains("Transfer", case=False, na=False)]
+
+    # KZP reimbursements are journal-only; do not duplicate into Transfer tab.
+    if _is_kzp_case(client_name) and COL_TYPE in transfers.columns:
+        transfers = transfers[transfers[COL_TYPE].astype(str).str.strip().str.lower() != "reimbursements"]
     
     if transfers.empty: 
         return pd.DataFrame(), start_no
@@ -632,14 +744,29 @@ def process_transfers(df: pd.DataFrame, country: str,
         from_acc = row["Transfer Funds From"]
         to_acc = row["Transfer Funds To"]
         
-        if not find_id_in_map(map_acc, from_acc): 
+        from_acc_id = find_id_in_map(map_acc, from_acc)
+        if not from_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | 'From' Account not in QBO: '{from_acc}' | Available: {available}... | Row No: {row_no}"
-            
-        if not find_id_in_map(map_acc, to_acc): 
+             
+        to_acc_id = find_id_in_map(map_acc, to_acc)
+        if not to_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | 'To' Account not in QBO: '{to_acc}' | Available: {available}... | Row No: {row_no}"
-            
+
+        row_currency_code = _normalize_currency_code(row.get("Currency", "USD"))
+        if _should_check_transfer_currency(client_name) and row_currency_code == "USD":
+            mismatch_error = _currency_mismatch_error(
+                row_no=row_no,
+                file_currency=row_currency_code,
+                account_checks=[
+                    ("From", from_acc, _account_currency_from_id(qbo_mappings, from_acc_id)),
+                    ("To", to_acc, _account_currency_from_id(qbo_mappings, to_acc_id)),
+                ],
+            )
+            if mismatch_error:
+                return mismatch_error
+             
         if row["Transfer Funds From"] == row["Transfer Funds To"]: 
             return f"ERROR | 'From' and 'To' Accounts cannot be the same | Row No: {row_no}"
             

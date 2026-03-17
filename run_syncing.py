@@ -1,4 +1,8 @@
 from __future__ import annotations
+import argparse
+import os
+import time
+from contextlib import nullcontext
 # --- FIX 1: Load Secrets ---
 from dotenv import load_dotenv
 load_dotenv("config/secrets.env")
@@ -17,8 +21,42 @@ from src.connectors.gsheets_client import GSheetsClient
 from src.connectors.qbo_client import QBOClient
 from src.logic.syncing import QBOSync
 from src.utils.logger import setup_logger
+from src.utils.run_lock import single_instance_lock
 
 logger = setup_logger("syncing_runner")
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except Exception:
+        return default
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.getenv(name, str(default))))
+    except Exception:
+        return default
+
+# Sync pacing controls:
+# - patch size for status updates to sheet
+# - delay after each QBO call
+# - delay after each sheet patch flush
+SYNC_PATCH_SIZE = _env_int("QBO_SYNC_PATCH_SIZE", 10)
+QBO_SYNC_CALL_DELAY_SEC = _env_float("QBO_SYNC_CALL_DELAY_SEC", 0.35)
+QBO_SYNC_PATCH_DELAY_SEC = _env_float("QBO_SYNC_PATCH_DELAY_SEC", 0.8)
+
+def _throttle_qbo_call():
+    if QBO_SYNC_CALL_DELAY_SEC > 0:
+        time.sleep(QBO_SYNC_CALL_DELAY_SEC)
+
+def _flush_updates(gs, spreadsheet_url, tab_name, updates: list):
+    if not updates:
+        return []
+    logger.info(f"   >>> Flushing {len(updates)} updates to Sheet...")
+    _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates)
+    if QBO_SYNC_PATCH_DELAY_SEC > 0:
+        time.sleep(QBO_SYNC_PATCH_DELAY_SEC)
+    return []
 
 def _batch_update_control(gs, sheet_id, tab_name, row_num, columns, updates_dict):
     headers = list(columns)
@@ -81,8 +119,14 @@ def _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates: list):
     except Exception as e:
         logger.error(f"Failed to update status in sheet: {e}")
 
-def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_id: str, client_name: str):
-    BATCH_SIZE = 50  # Update the Google Sheet every 5 rows
+def process_client_sync(
+    gs: GSheetsClient,
+    qbo_client: QBOClient,
+    control_sheet_id: str,
+    client_name: str,
+    realm_id: str,
+):
+    BATCH_SIZE = SYNC_PATCH_SIZE
     logger.info(f"📂 [{client_name}] Processing Control Sheet...")
     try:
         ctrl_df = gs.read_as_df(control_sheet_id, settings.CONTROL_TAB_NAME)
@@ -90,10 +134,25 @@ def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_
         logger.error(f"   ❌ [{client_name}] Failed to read Control Sheet: {e}")
         return
 
-    if ctrl_df.empty: return
+    if ctrl_df.empty:
+        return
+
+    status_series = ctrl_df.get(settings.CTRL_COL_QBO_SYNC, pd.Series("", index=ctrl_df.index))
+    sync_now_count = int(status_series.astype(str).str.strip().eq("SYNC NOW").sum())
+    if sync_now_count == 0:
+        logger.info(f"   ⏭️ [{client_name}] No SYNC NOW rows. Skipping QBO auth/mappings.")
+        return
+
+    try:
+        logger.info(f"🔐 [{client_name}] Authenticating with Realm ID: {realm_id}")
+        qbo_client.set_company(realm_id)
+        logger.info(f"✅ [{client_name}] Authenticated. Ready to sync.")
+    except Exception as e:
+        logger.error(f"❌ Auth/Sync failed for {client_name}: {e}")
+        return
 
     sync_engine = QBOSync(client=qbo_client)
-    
+
     COL_QBO_JV = "QBO Journal"
     COL_QBO_EXP = "QBO Expense"
     COL_QBO_TR = "QBO Transfer"
@@ -140,40 +199,40 @@ def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_
                     
                     for jv_no, group in to_sync.groupby("Journal No"):
                         if str(jv_no) in existing_docs:
-                             already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
-                             for idx in group.index:
-                                updates.append({"row_idx": idx, "status": already_synced_msg, "qbo_id": ""})
-                             continue
+                            already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+                            for idx in group.index:
+                                updates.append({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
+                            if len(updates) >= BATCH_SIZE:
+                                updates = _flush_updates(gs, transform_url, tab_jv, updates)
+                            continue
 
                         try:
                             resp = sync_engine.push_journal(jv_no, group)
+                            _throttle_qbo_call()
                             new_id = resp.get("JournalEntry", {}).get("Id", "")
-
                             qbo_link = sync_engine.build_qbo_url("JournalEntry", new_id) if new_id else ""
-
                             msg = f"Synced at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
-
-                            for seq, idx in enumerate(group.index, start=1):
-                                formatted_id = f"{new_id}.{seq}" if new_id else ""
-
+                            for idx in group.index:
                                 updates.append({
                                     "row_idx": idx,
                                     "status": msg,
-                                    "qbo_id": formatted_id,   # 👈 THIS IS THE CHANGE
-                                    "qbo_link": qbo_link      # 👈 Still original ID
+                                    "qbo_id": new_id,
+                                    "qbo_link": qbo_link
                                 })
-                                
                         except Exception as e:
                             msg = f"ERROR: {str(e)}"
-                            new_id = ""
                             has_error = True
                             section_fail = True
-                        
-                        for idx in group.index:
-                            updates.append({"row_idx": idx, "status": msg, "qbo_id": new_id})
-                    
-                    _update_row_status_and_id(gs, transform_url, tab_jv, updates)
+                            _throttle_qbo_call()
+                            for idx in group.index:
+                                updates.append({"row_idx": idx, "status": msg, "qbo_id": "", "qbo_link": ""})
+
+                        if len(updates) >= BATCH_SIZE:
+                            updates = _flush_updates(gs, transform_url, tab_jv, updates)
+
+                    if updates:
+                        updates = _flush_updates(gs, transform_url, tab_jv, updates)
                     jv_status = "SYNC FAIL" if section_fail else "SYNCED"
         except Exception as e:
             logger.error(f"   ❌ Journal Sync Fail: {e}")
@@ -217,6 +276,7 @@ def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_
                         else:
                             try:
                                 resp = sync_engine.push_expense(ref_no, row_data)
+                                _throttle_qbo_call()
                                 new_id = resp.get("Purchase", {}).get("Id", "")
                                 qbo_link = sync_engine.build_qbo_url("Purchase", new_id) if new_id else ""
                                 msg = f"Synced at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -233,17 +293,16 @@ def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_
                                 updates.append({"row_idx": idx, "status": error_msg, "qbo_id": "", "qbo_link": ""})
                                 has_error = True
                                 section_fail = True
+                                _throttle_qbo_call()
                         
                         # --- NEW: BATCH UPDATE ---
                         # If we hit the batch size, write to Sheet immediately and clear memory
                         if len(updates) >= BATCH_SIZE:
-                            logger.info(f"   >>> Flushing {len(updates)} updates to Sheet...")
-                            _update_row_status_and_id(gs, transform_url, tab_exp, updates)
-                            updates = [] # Clear the list for the next batch
+                            updates = _flush_updates(gs, transform_url, tab_exp, updates)
 
                     # Flush any remaining updates after the loop finishes
                     if updates:
-                        _update_row_status_and_id(gs, transform_url, tab_exp, updates)
+                        updates = _flush_updates(gs, transform_url, tab_exp, updates)
 
                     exp_status = "SYNC FAIL" if section_fail else "SYNCED"
         except Exception as e:
@@ -283,6 +342,7 @@ def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_
                         else:
                             try:
                                 resp = sync_engine.push_transfer(row_data)
+                                _throttle_qbo_call()
                                 new_id = resp.get("Transfer", {}).get("Id", "")
                                 qbo_link = sync_engine.build_qbo_url("Transfer", new_id) if new_id else ""
                                 msg = f"Synced at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -299,15 +359,14 @@ def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_
                                 updates.append({"row_idx": idx, "status": error_msg, "qbo_id": "", "qbo_link": ""})
                                 has_error = True
                                 section_fail = True
+                                _throttle_qbo_call()
 
                         # --- NEW: BATCH UPDATE ---
                         if len(updates) >= BATCH_SIZE:
-                            logger.info(f"   >>> Flushing {len(updates)} updates to Sheet...")
-                            _update_row_status_and_id(gs, transform_url, tab_tr, updates)
-                            updates = [] 
+                            updates = _flush_updates(gs, transform_url, tab_tr, updates)
 
                     if updates:
-                        _update_row_status_and_id(gs, transform_url, tab_tr, updates)
+                        updates = _flush_updates(gs, transform_url, tab_tr, updates)
 
                     tr_status = "SYNC FAIL" if section_fail else "SYNCED"
         except Exception as e:
@@ -329,34 +388,88 @@ def process_client_sync(gs: GSheetsClient, qbo_client: QBOClient, control_sheet_
         _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, update_payload)
         logger.info(f"✅ [{client_name}] Sync Complete: {final_status}")
 
-def main():
-    gs = GSheetsClient()
-    qbo_client = QBOClient(gs_client=gs)
-    try:
-        master_df = gs.read_as_df(settings.MASTER_SHEET_ID, settings.MASTER_TAB_NAME)
-    except Exception as e:
-        logger.error(f"❌ Critical: {e}")
-        return
+def _is_target_client(row: pd.Series, target_client: str | None) -> bool:
+    if not target_client:
+        return True
 
-    for _, row in master_df.iterrows():
-        if str(row.get(settings.MST_COL_STATUS, "")).strip().lower() != "active": continue
-        client_name = row.get(settings.MST_COL_CLIENT)
-        if not settings.is_allowed_workspace(client_name):
-            logger.warning(
-                f"⚠️ Skipping {client_name}: workspace not allowed for QBO API. "
-                f"Allowed: {', '.join(settings.ALLOWED_QBO_WORKSPACES)}"
-            )
-            continue
-        sheet_id = row.get(settings.MST_COL_SHEET_ID)
-        realm_id = str(row.get(settings.MST_COL_REALM_ID)).strip()
-        if not sheet_id or not realm_id: continue
+    target = str(target_client).strip()
+    if not target:
+        return True
+    target_norm = settings.normalize_workspace_name(target)
+    if target_norm in {"all", "*", "all clients"}:
+        return True
 
-        logger.info(f"🏢 STARTING SYNC FOR: {client_name} ({realm_id})")
+    row_client = str(row.get(settings.MST_COL_CLIENT, "")).strip()
+    row_realm = str(row.get(settings.MST_COL_REALM_ID, "")).strip()
+    row_sheet_id = str(row.get(settings.MST_COL_SHEET_ID, "")).strip()
+
+    # Allow targeting by realm ID or by normalized client name.
+    if target == row_realm:
+        return True
+    if target == row_sheet_id:
+        return True
+    return target_norm == settings.normalize_workspace_name(row_client)
+
+def _target_is_all(target_client: str | None) -> bool:
+    if not target_client:
+        return True
+    t = settings.normalize_workspace_name(target_client)
+    return t in {"", "all", "*", "all clients"}
+
+def main(target_client: str | None = None):
+    target_is_all = _target_is_all(target_client)
+    dispatch_ctx = single_instance_lock("run_syncing_all_dispatch") if target_is_all else nullcontext(True)
+    with dispatch_ctx as acquired:
+        if target_is_all and not acquired:
+            logger.warning("Another ALL syncing dispatch is already in progress. Skipping this run.")
+            return
+
+        gs = GSheetsClient()
+        qbo_client = QBOClient(gs_client=gs)
         try:
-            qbo_client.set_company(realm_id)
-            process_client_sync(gs, qbo_client, sheet_id, client_name)
+            master_df = gs.read_as_df(settings.MASTER_SHEET_ID, settings.MASTER_TAB_NAME)
         except Exception as e:
-            logger.error(f"❌ Auth/Sync failed for {client_name}: {e}")
+            logger.error(f"❌ Critical: {e}")
+            return
+
+        # Normalize headers to avoid silent misses from extra spaces/newlines in sheet columns.
+        master_df.columns = [" ".join(str(c).replace("\n", " ").split()) for c in master_df.columns]
+
+        matched_clients = 0
+        for _, row in master_df.iterrows():
+            if str(row.get(settings.MST_COL_STATUS, "")).strip().lower() != "active": continue
+            if not _is_target_client(row, target_client):
+                continue
+            matched_clients += 1
+            client_name = row.get(settings.MST_COL_CLIENT)
+            if not settings.is_allowed_workspace(client_name):
+                logger.warning(
+                    f"⚠️ Skipping {client_name}: workspace not allowed for QBO API. "
+                    f"Allowed: {', '.join(settings.ALLOWED_QBO_WORKSPACES)}"
+                )
+                continue
+            sheet_id = row.get(settings.MST_COL_SHEET_ID)
+            realm_id = str(row.get(settings.MST_COL_REALM_ID)).strip()
+            if not sheet_id or not realm_id: continue
+
+            logger.info(f"🏢 STARTING SYNC FOR: {client_name} ({realm_id})")
+            client_lock_name = f"run_syncing_client_{realm_id}"
+            with single_instance_lock(client_lock_name) as client_acquired:
+                if not client_acquired:
+                    logger.warning(
+                        f"⏭️ Skipping {client_name}: another syncing run is already processing Realm {realm_id}."
+                    )
+                    continue
+                try:
+                    process_client_sync(gs, qbo_client, sheet_id, client_name, realm_id)
+                except Exception as e:
+                    logger.error(f"❌ Sync failed for {client_name}: {e}")
+
+        if target_client and matched_clients == 0:
+            logger.warning(f"No client matched target '{target_client}'.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run QBO syncing pipeline.")
+    parser.add_argument("--client", dest="client", default="", help="Target client name or Realm ID.")
+    args = parser.parse_args()
+    main(target_client=args.client)
