@@ -236,6 +236,28 @@ def get_retry_context(
         logger.exception(f"get_retry_context crashed on tab '{tab_name}': {e}")
         raise
 
+def _get_sheet_rows_for_nos(
+    gs: GSheetsClient,
+    spreadsheet_url: str,
+    tab_name: str,
+    target_nos: set[int],
+) -> list[int]:
+    """Return sheet row numbers whose 'No' is in target_nos (for safe retry cleanup)."""
+    if not target_nos:
+        return []
+    try:
+        df = gs.read_as_df(spreadsheet_url, tab_name)
+    except Exception:
+        return []
+    if df.empty or "No" not in df.columns:
+        return []
+
+    work_df = df.copy()
+    work_df["_sheet_row"] = work_df.index + 2
+    work_df["_no"] = pd.to_numeric(work_df["No"], errors="coerce").fillna(-1).astype(int)
+    rows = work_df[work_df["_no"].isin(target_nos)]["_sheet_row"].astype(int).unique().tolist()
+    return sorted(rows, reverse=True)
+
 # ==========================================
 # 2. CORE LOGIC (PER CLIENT)
 # ==========================================
@@ -379,27 +401,34 @@ def process_client_control_sheet(
             tab_prefix = f"{country} {month}"
             tab_jv, tab_exp, tab_tr = f"{tab_prefix} - Journals", f"{tab_prefix} - Expenses", f"{tab_prefix} - Transfers"
         
-            # 5. Handle Retries (Find 'ERROR' rows in Output)
+            # 5. Build retry context from existing transform ERROR rows.
             preserved_ids = {'journals': {}, 'expenses': {}, 'transfers': {}}
             deletions: Dict[str, List[int]] = {}
+            retry_nos: list[int] = []
 
-            # Check Journals tab
+            # Retry by raw No only (avoid broad doc-id expansion).
             d_jv, ids_jv = get_retry_context(
                 gs, transform_url, tab_jv, "Journal No", include_doc_id_match=False
             )
-            if d_jv: deletions[tab_jv] = d_jv; preserved_ids['journals'] = ids_jv
+            if d_jv:
+                deletions[tab_jv] = d_jv
+                preserved_ids['journals'] = ids_jv
 
-            # Check Expenses tab
-            d_exp, ids_exp = get_retry_context(gs, transform_url, tab_exp, "Exp Ref. No")
-            if d_exp: deletions[tab_exp] = d_exp; preserved_ids['expenses'] = ids_exp
+            d_exp, ids_exp = get_retry_context(
+                gs, transform_url, tab_exp, "Exp Ref. No", include_doc_id_match=False
+            )
+            if d_exp:
+                deletions[tab_exp] = d_exp
+                preserved_ids['expenses'] = ids_exp
 
-            # Check Transfers tab
-            d_tr, ids_tr = get_retry_context(gs, transform_url, tab_tr, "Ref No")
-            if d_tr: deletions[tab_tr] = d_tr; preserved_ids['transfers'] = ids_tr
+            d_tr, ids_tr = get_retry_context(
+                gs, transform_url, tab_tr, "Ref No", include_doc_id_match=False
+            )
+            if d_tr:
+                deletions[tab_tr] = d_tr
+                preserved_ids['transfers'] = ids_tr
 
             retry_nos = list(set([k for sub in preserved_ids.values() for k in sub.keys()]))
-            tabs_out = [tab_jv, tab_exp, tab_tr]
-            processed_ok_nos = _get_successfully_processed_nos(gs, transform_url, tabs_out)
 
             # 6. Read & Clean Source Data
             source_header_row = 5 if "kzdw" in client_name.lower() else 1
@@ -506,14 +535,18 @@ def process_client_control_sheet(
             # 10a. Strictly new rows (No > last_processed)
             new_df = ready_df[ready_df["No"] > last_processed].copy()
 
-            # 10b. Late-filled rows: No <= last_processed, not yet successfully processed
-            late_filled_df = ready_df[
-                (ready_df["No"] <= last_processed) &
-                (ready_df["No"].isin(previous_pending_nos))
+            # 10b. Always retry rows listed in Pending Amount Nos.
+            late_filled_df = raw_df[
+                (raw_df["No"] <= last_processed) &
+                (raw_df["No"].isin(previous_pending_nos)) &
+                method_non_blank
             ].copy()
 
-            # 10c. Explicit retries from ERROR outputs
-            retry_df = ready_df[ready_df["No"].isin(retry_nos)].copy()
+            # 10c. Always retry old ERROR rows from transform outputs.
+            retry_df = raw_df[
+                raw_df["No"].isin(retry_nos) &
+                method_non_blank
+            ].copy()
 
             processing_df = (
                 pd.concat([new_df, late_filled_df, retry_df])
@@ -552,6 +585,19 @@ def process_client_control_sheet(
                     settings.CTRL_COL_ACTIVE: "DONE"
                 })
                 continue
+
+            # Delete only rows that are actually being retried from ERROR state.
+            retry_selected_nos = set(
+                int(x)
+                for x in pd.to_numeric(retry_df.get("No"), errors="coerce").dropna().astype(int).tolist()
+                if int(x) > 0
+            )
+            deletions = {}
+            if retry_selected_nos:
+                for tab_name in (tab_jv, tab_exp, tab_tr):
+                    rows = _get_sheet_rows_for_nos(gs, transform_url, tab_name, retry_selected_nos)
+                    if rows:
+                        deletions[tab_name] = rows
             
             # 11. Execute Deletions (Clean up bad rows before appending new ones)
             for tab, rows in deletions.items(): gs.delete_rows(transform_url, tab, rows)
