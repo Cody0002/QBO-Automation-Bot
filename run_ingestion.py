@@ -127,6 +127,23 @@ def _cap_pending_nos(vals: set[int], max_processed_no: int) -> set[int]:
         return set()
     return {x for x in vals if 0 < x <= max_processed_no}
 
+def _safe_int(val) -> int:
+    """Coerce sheet values like 1234, 1234.0, '1,234' into int safely."""
+    try:
+        if pd.isna(val):
+            return 0
+    except Exception:
+        pass
+
+    try:
+        s = str(val).strip()
+        if not s:
+            return 0
+        s = s.replace(",", "")
+        return int(float(s))
+    except Exception:
+        return 0
+
 def _get_successfully_processed_nos(gs: GSheetsClient, spreadsheet_url: str, tabs: list[str]) -> set[int]:
     """
     Returns set of raw 'No' values that already exist in any output tab
@@ -155,7 +172,13 @@ def _get_successfully_processed_nos(gs: GSheetsClient, spreadsheet_url: str, tab
 
     return processed
 
-def get_retry_context(gs: GSheetsClient, spreadsheet_url: str, tab_name: str, id_col_name: str) -> Tuple[List[int], Dict[int, str]]:
+def get_retry_context(
+    gs: GSheetsClient,
+    spreadsheet_url: str,
+    tab_name: str,
+    id_col_name: str,
+    include_doc_id_match: bool = True,
+) -> Tuple[List[int], Dict[int, str]]:
     """Identifies rows marked as 'ERROR' in the Transform file to re-process them."""
     try:
         # Use read_as_df to keep row positions aligned with sheet rows.
@@ -175,8 +198,10 @@ def get_retry_context(gs: GSheetsClient, spreadsheet_url: str, tab_name: str, id
         if bad_rows.empty:
             return [], {}
 
-        bad_ids = set(bad_rows["_doc_id"].dropna().tolist())
-        bad_ids.discard("")
+        bad_ids = set()
+        if include_doc_id_match:
+            bad_ids = set(bad_rows["_doc_id"].dropna().tolist())
+            bad_ids.discard("")
         bad_nos = set(
             bad_rows["_no"]
             .dropna()
@@ -185,7 +210,7 @@ def get_retry_context(gs: GSheetsClient, spreadsheet_url: str, tab_name: str, id
         )
 
         target_mask = pd.Series(False, index=work_df.index)
-        if bad_ids:
+        if include_doc_id_match and bad_ids:
             target_mask = target_mask | work_df["_doc_id"].isin(bad_ids)
         if bad_nos:
             target_mask = target_mask | work_df["_no"].fillna(-1).astype(int).isin(bad_nos)
@@ -238,6 +263,9 @@ def process_client_control_sheet(
         logger.warning(f"   ⚠️ [{client_name}] Control Sheet is empty.")
         return
 
+    # Normalize headers to avoid silent misses from extra spaces/newlines.
+    ctrl_df.columns = [" ".join(str(c).replace("\n", " ").split()) for c in ctrl_df.columns]
+
     # Avoid expensive QBO auth/mapping calls when this client has nothing to run.
     status_series = ctrl_df.get(settings.CTRL_COL_ACTIVE, pd.Series("", index=ctrl_df.index))
     ready_count = int(status_series.astype(str).str.strip().eq("READY").sum())
@@ -275,12 +303,9 @@ def process_client_control_sheet(
     COL_QBO_EXP = "QBO Expense"
     COL_QBO_TR = "QBO Transfer"
     COL_PENDING_AMOUNT_NOS = "Pending Amount Nos"
-    def safe_int(val):
-        try: return int(float(val))
-        except: return 0
 
     # Get the max journal number currently recorded in the sheet
-    global_last_jv = ctrl_df[COL_LAST_JV].apply(safe_int).max()
+    global_last_jv = ctrl_df[COL_LAST_JV].apply(_safe_int).max()
 
     # --- D. Iterate Control Sheet Rows ---
     for i, row in ctrl_df.iterrows():
@@ -320,7 +345,7 @@ def process_client_control_sheet(
                     raise e
             
             # 4. Prepare ID Counters
-            last_processed = safe_int(row.get(settings.CTRL_COL_LAST_PROCESSED_ROW, 0))
+            last_processed = _safe_int(row.get(settings.CTRL_COL_LAST_PROCESSED_ROW, 0))
             
             # Fetch latest QBO Journal No to prevent overlap.
             client_lower = client_name.lower()
@@ -333,8 +358,8 @@ def process_client_control_sheet(
             qbo_last_jv = qbo_client.get_max_journal_number(journal_prefix)
             final_start_jv = max(global_last_jv, qbo_last_jv)
             
-            last_exp = safe_int(row.get(COL_LAST_EXP, 0))
-            last_tr = safe_int(row.get(COL_LAST_TR, 0))
+            last_exp = _safe_int(row.get(COL_LAST_EXP, 0))
+            last_tr = _safe_int(row.get(COL_LAST_TR, 0))
             previous_pending_nos = _cap_pending_nos(
                 _parse_no_set(row.get(COL_PENDING_AMOUNT_NOS, "")),
                 last_processed
@@ -359,7 +384,9 @@ def process_client_control_sheet(
             deletions: Dict[str, List[int]] = {}
 
             # Check Journals tab
-            d_jv, ids_jv = get_retry_context(gs, transform_url, tab_jv, "Journal No")
+            d_jv, ids_jv = get_retry_context(
+                gs, transform_url, tab_jv, "Journal No", include_doc_id_match=False
+            )
             if d_jv: deletions[tab_jv] = d_jv; preserved_ids['journals'] = ids_jv
 
             # Check Expenses tab
