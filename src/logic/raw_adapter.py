@@ -217,13 +217,13 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
     transfer_to = _value_series(col_or_empty(transfer_to_col))
     transfer_from = _value_series(col_or_empty(transfer_from_col))
     # KZDW mapping rules from source sheet:
-    # - JV Debit: X (Transfer to) -> V (If Journal/Expense)
-    # - JV Credit: W (Transfer from)
-    # - Expense Transfer from: W -> V
-    # - Expense Transfer to: X
-    debit_account = transfer_to.where(transfer_to != "", acc_v)     # X -> V
-    credit_account = transfer_from.where(transfer_from != "", acc_v)  # W -> V
-    type_vals = transfer_to
+    # 1) Prefill Transfer From/To with V ("If Journal/Expense ... Another records")
+    # 2) Reverse Journal account direction (Debit/Credit) for KZDW.
+    transfer_from_filled = transfer_from.where(transfer_from != "", acc_v)
+    transfer_to_filled = transfer_to.where(transfer_to != "", acc_v)
+    debit_account = transfer_from_filled
+    credit_account = transfer_to_filled
+    type_vals = transfer_to_filled
 
     no_series = pd.to_numeric(col_or_empty(no_col), errors="coerce")
     if no_series.fillna(0).eq(0).all():
@@ -239,7 +239,7 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
     out["TrxHarsh"] = col_or_empty(trx_hash_col)
     # Debit account for Journal/Expense.
     out["Account Fr"] = debit_account
-    out["Account To"] = col_or_empty(transfer_to_col)
+    out["Account To"] = transfer_to_filled
     out["Currency"] = currency
     out["Amount Fr"] = amount
     out["Currency To"] = ""
@@ -251,10 +251,10 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
     out["USD - QBO"] = amount
     out["Reclass"] = ""
     out["QBO Method"] = col_or_empty(method_col)
-    # Credit/source account for Journal/Expense: W -> V.
+    # Credit/source account for Journal/Expense: X -> V (reversed for KZDW).
     out["If Journal/Expense Method"] = credit_account
-    out["QBO Transfer Fr"] = credit_account
-    out["QBO Transfer To"] = transfer_to
+    out["QBO Transfer Fr"] = transfer_from_filled
+    out["QBO Transfer To"] = transfer_to_filled
     out["Check (Internal use)"] = col_or_empty(check_col)
     out["No"] = no_series
 
