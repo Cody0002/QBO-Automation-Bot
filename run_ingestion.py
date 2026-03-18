@@ -466,16 +466,9 @@ def process_client_control_sheet(
 
             # 7. Date Filtering (Strict Month Match)
             target_start, target_end = get_month_date_range(raw_month, last_month_date)
-            future_pending_nos: set[int] = set()
             if target_start and target_end:
                 # Robust Parse
                 raw_df["_TempDate"] = parse_mixed_date(raw_df["Date"])
-
-                # Track all future-dated rows so they can be retried later
-                # even though date filter removes them from this run.
-                no_numeric = pd.to_numeric(raw_df["No"], errors="coerce").fillna(0)
-                future_late_mask = (raw_df["_TempDate"] > target_end) & (no_numeric > 0)
-                future_pending_nos = set(int(x) for x in no_numeric[future_late_mask].astype(int).tolist())
                 
                 # Filter
                 month_mask = (raw_df["_TempDate"] >= target_start) & (raw_df["_TempDate"] <= target_end)
@@ -490,8 +483,6 @@ def process_client_control_sheet(
                     f"({target_start.date()} -> {target_end.date()}) -> "
                     f"Kept: {after_date_count} | Dropped: {dropped_date}"
                 )
-                if future_pending_nos:
-                    logger.info(f"   [{client_name}] Step 7a: Future-date rows saved to pending: {len(future_pending_nos)}")
                 # ---------------------------
 
                 if raw_df.empty:
@@ -525,8 +516,6 @@ def process_client_control_sheet(
             current_pending_nos = set(
                 int(x) for x in raw_df.loc[pending_amount_mask, "No"].astype(int).tolist() if int(x) > 0
             )
-            current_pending_nos.update(previous_pending_nos)
-            current_pending_nos.update(future_pending_nos)
 
             # ---> B. Identify Ready Rows (Method exists, and amount is NOT 0)
             ready_mask = method_non_blank & (amt_numeric != 0)
