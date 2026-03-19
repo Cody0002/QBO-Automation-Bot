@@ -24,7 +24,7 @@ from src.connectors.qbo_client import QBOClient
 from src.logic.syncing import QBOSync
 from src.logic.transformer import transform_raw
 from src.utils.logger import setup_logger
-from src.logic.raw_adapter import standardize_raw_df
+from src.logic.raw_adapter import standardize_raw_df, RAW_STANDARD_COLUMNS
 from src.utils.run_lock import single_instance_lock
 
 logger = setup_logger("ingestion")
@@ -450,17 +450,8 @@ def process_client_control_sheet(
                 _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {settings.CTRL_COL_ACTIVE: "DONE (Empty)"})
                 continue
             
-            raw_df = raw_df.iloc[:, :25]  # Keep first 25 columns
-            
-            # Apply Standard Columns
-            raw_df.columns = [
-                "CO", "COY", "Date", "Category", "Type", "Item Description", 
-                "TrxHarsh", "Account Fr", "Account To", "Currency", "Amount Fr", 
-                "Currency To", "Amount To", "Budget", "USD - Raw", "USD - Actual", 
-                "USD - Loss", "USD - QBO", "Reclass", "QBO Method", 
-                "If Journal/Expense Method", "QBO Transfer Fr", "QBO Transfer To", 
-                "Check (Internal use)", "No"
-            ]
+            # Keep canonical raw schema from raw_adapter (supports KZDW Currency Rate).
+            raw_df = raw_df.reindex(columns=RAW_STANDARD_COLUMNS, fill_value="")
 
             raw_df["CO"] = raw_df["CO"].astype(str).str.replace("GRP", "GROUP").str.strip()
 

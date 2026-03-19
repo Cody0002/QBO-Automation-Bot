@@ -2,6 +2,7 @@ from __future__ import annotations
 import base64
 import os
 import time
+import random
 import requests
 import urllib.parse  # <--- ADD THIS IMPORT
 import pandas as pd
@@ -168,9 +169,43 @@ class QBOClient:
     def _url(self, path: str) -> str:
         return f"{settings.QBO_BASE_URL}{path}"
 
-    def _get(self, path: str) -> Dict[str, Any]:
+    def _request_with_retries(self, method: str, path: str, **kwargs) -> requests.Response:
         url = self._url(path)
-        resp = requests.get(url, headers=self._headers(), timeout=60)
+        max_attempts = 4
+        backoff_base = 1.0
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if method.lower() == 'get':
+                    resp = requests.get(url, headers=self._headers(), timeout=60, **kwargs)
+                elif method.lower() == 'post':
+                    resp = requests.post(url, headers=self._headers(), timeout=60, **kwargs)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+
+                if 200 <= resp.status_code < 300:
+                    return resp
+
+                # Retry for rate limits and server errors
+                if resp.status_code in {429, 500, 502, 503, 504}:
+                    msg = f"HTTP {resp.status_code} on {method.upper()} {url}: {resp.text}"
+                else:
+                    resp.raise_for_status()
+
+            except requests.RequestException as e:
+                msg = str(e)
+
+            if attempt == max_attempts:
+                raise RuntimeError(f"QBO request failed after {max_attempts} attempts: {msg}")
+
+            wait = backoff_base * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+            print(f"⚠️ QBO transient error (attempt {attempt}/{max_attempts}): {msg}. Retrying in {wait:.2f}s...")
+            time.sleep(wait)
+
+        raise RuntimeError("QBO request retry logic fell through unexpectedly.")
+
+    def _get(self, path: str) -> Dict[str, Any]:
+        resp = self._request_with_retries('get', path)
         resp.raise_for_status()
         return resp.json()
 
@@ -198,14 +233,13 @@ class QBOClient:
         return all_results
 
     def post(self, path: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
-        url = self._url(path)
-        resp = requests.post(url, headers=self._headers(), json=json_body, timeout=60)
-        
+        resp = self._request_with_retries('post', path, json=json_body)
+
         # --- NEW: DETAILED ERROR REPORTING ---
         if resp.status_code >= 400:
             print(f"❌ QBO API ERROR ({resp.status_code}): {resp.text}")
-            
-        resp.raise_for_status()
+            resp.raise_for_status()
+
         return resp.json()
 
     def get_exchange_rate(

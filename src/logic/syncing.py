@@ -26,6 +26,18 @@ def _parse_amount(val) -> float:
     except:
         return 0.0
 
+def _parse_exchange_rate(val) -> float | None:
+    if pd.isna(val) or str(val).strip() == "":
+        return None
+    text = str(val).replace(",", "").strip()
+    parsed = pd.to_numeric(text, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    rate = float(parsed)
+    if rate <= 0:
+        return None
+    return rate
+
 def _normalize_currency_code(val) -> str:
     text = str(val).strip().upper()
     if not text:
@@ -89,13 +101,26 @@ class QBOSync:
         if not page: return ""
         return f"https://qbo.intuit.com/app/{page}?txnId={txn_id}"
 
-    def _attach_exchange_rate_if_needed(self, payload: dict, txn_currency: str, txn_date: str, context: str) -> None:
+    def _attach_exchange_rate_if_needed(
+        self,
+        payload: dict,
+        txn_currency: str,
+        txn_date: str,
+        context: str,
+        transformed_rate=None,
+    ) -> None:
         """
         Attach ExchangeRate for foreign-currency transactions.
-        Raises when FX is unavailable to avoid implicit 1:1 postings.
+        Priority:
+        1) transformed Currency Exchange value (when valid)
+        2) fallback to QBO historical FX lookup
         """
         ccy = _normalize_currency_code(txn_currency)
         if ccy == "USD":
+            return
+        transformed_fx = _parse_exchange_rate(transformed_rate)
+        if transformed_fx is not None:
+            payload["ExchangeRate"] = transformed_fx
             return
         fx_rate = self.client.get_exchange_rate(
             source_currency_code=ccy,
@@ -278,7 +303,13 @@ class QBOSync:
             "PrivateNote": str(first_row.get('Memo', '')),
             "CurrencyRef": {"value": txn_currency}
         }
-        self._attach_exchange_rate_if_needed(payload, txn_currency, txn_date, f"Journal {journal_no}")
+        self._attach_exchange_rate_if_needed(
+            payload,
+            txn_currency,
+            txn_date,
+            f"Journal {journal_no}",
+            transformed_rate=first_row.get("Currency Exchange"),
+        )
         return self.client.post(f"/v3/company/{self.client.realm_id}/journalentry", payload)
 
     def push_expense(self, exp_ref_no: str, row: pd.Series):
@@ -321,7 +352,13 @@ class QBOSync:
             payload["EntityRef"] = entity_ref
         if loc_id: payload["DepartmentRef"] = {"value": loc_id}
         if pm_id: payload["PaymentMethodRef"] = {"value": pm_id}
-        self._attach_exchange_rate_if_needed(payload, txn_currency, txn_date, f"Expense {exp_ref_no}")
+        self._attach_exchange_rate_if_needed(
+            payload,
+            txn_currency,
+            txn_date,
+            f"Expense {exp_ref_no}",
+            transformed_rate=row.get("Currency Exchange"),
+        )
 
         return self.client.post(f"/v3/company/{self.client.realm_id}/purchase", payload)
 
@@ -386,15 +423,19 @@ class QBOSync:
         if txn_currency != "USD":
             payload["CurrencyRef"] = {"value": txn_currency}
             txn_date = payload["TxnDate"]
-            fx_rate = self.client.get_exchange_rate(
-                source_currency_code=txn_currency,
-                as_of_date=txn_date,
-                target_currency_code="USD",
-            )
-            if fx_rate is None:
-                raise ValueError(
-                    f"Missing FX rate for {txn_currency}->USD on {txn_date}; "
-                    "skipped to avoid 1:1 exchange posting."
+            transformed_fx = _parse_exchange_rate(row.get("Currency Exchange"))
+            if transformed_fx is not None:
+                payload["ExchangeRate"] = transformed_fx
+            else:
+                fx_rate = self.client.get_exchange_rate(
+                    source_currency_code=txn_currency,
+                    as_of_date=txn_date,
+                    target_currency_code="USD",
                 )
-            payload["ExchangeRate"] = fx_rate
+                if fx_rate is None:
+                    raise ValueError(
+                        f"Missing FX rate for {txn_currency}->USD on {txn_date}; "
+                        "skipped to avoid 1:1 exchange posting."
+                    )
+                payload["ExchangeRate"] = fx_rate
         return self.client.post(f"/v3/company/{self.client.realm_id}/transfer", payload)

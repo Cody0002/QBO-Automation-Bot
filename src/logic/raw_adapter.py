@@ -31,6 +31,7 @@ RAW_STANDARD_COLUMNS = [
     "QBO Transfer To",
     "Check (Internal use)",
     "No",
+    "Currency Rate",
 ]
 
 
@@ -77,7 +78,7 @@ def _parse_amount_series(series: pd.Series) -> pd.Series:
 
 def _coerce_standard_numeric_cols(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    for col in ["USD - QBO", "Amount Fr", "Amount To"]:
+    for col in ["USD - QBO", "Amount Fr", "Amount To", "Currency Rate"]:
         if col in out.columns:
             out[col] = _parse_amount_series(out[col])
     if "No" in out.columns:
@@ -177,6 +178,7 @@ def _standardize_kzp(df: pd.DataFrame, raw_month: str) -> pd.DataFrame:
     out["QBO Transfer To"] = col_or_empty(bank_col)
     out["Check (Internal use)"] = col_or_empty(check_col)
     out["No"] = no_series
+    out["Currency Rate"] = 0.0
 
     # Remove month/header separator rows from exports (if present), keep real data rows.
     if month_col:
@@ -199,6 +201,7 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
     trx_hash_col = _find_col(df, ["Trx Hash", "TrxHarsh"])
     amount_col = _find_col(df, ["Final Amount to be take (different currency)", "USD - QBO", "USD"])
     currency_col = _find_col(df, ["Currency"])
+    currency_rate_col = _find_col(df, ["Currency Rate", "Currency Exchange", "Exchange Rate"])
     method_col = _find_col(df, ["QBO Import", "QBO Method", "QBO Import Method (Journal/Expenses/Transfer)"])
     acc_debit_col = _find_col(df, ["If Journal/Expense method: Another records", "If Journal/Expense Method"])
     transfer_from_col = _find_col(df, ["Transfer from", "Transfer From", "If Transfer method: Fund Transfer From", "Fund Transfer From"])
@@ -212,6 +215,7 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
         return pd.Series([""] * len(df), index=idx)
 
     amount = _parse_amount_series(col_or_empty(amount_col))
+    currency_rate = _parse_amount_series(col_or_empty(currency_rate_col))
     currency = _normalize_currency_series(col_or_empty(currency_col))
     acc_v = _value_series(col_or_empty(acc_debit_col))
     transfer_to = _value_series(col_or_empty(transfer_to_col))
@@ -257,6 +261,7 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
     out["QBO Transfer To"] = transfer_to_filled
     out["Check (Internal use)"] = col_or_empty(check_col)
     out["No"] = no_series
+    out["Currency Rate"] = currency_rate
 
     if sub_category_col:
         out["Category"] = out["Category"].where(
@@ -269,7 +274,7 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
 
 def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -> pd.DataFrame:
     """
-    Convert incoming raw data into the canonical 25-column schema expected by
+    Convert incoming raw data into the canonical schema expected by
     transform/reconcile logic. Handles legacy KZO layout and simplified KZP layout.
     """
     if raw_df is None or raw_df.empty:

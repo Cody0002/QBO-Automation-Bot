@@ -173,6 +173,22 @@ def _normalize_currency_code(value: Any) -> str:
         return "USD"
     return text[:3]
 
+def _build_currency_exchange_series(
+    df: pd.DataFrame,
+    currency_col: str,
+    rate_col: str = "Currency Rate",
+) -> pd.Series:
+    out = pd.Series(np.nan, index=df.index, dtype="float64")
+    if rate_col in df.columns:
+        raw_vals = df[rate_col].astype(str).str.replace(",", "", regex=False).str.strip()
+        parsed = pd.to_numeric(raw_vals, errors="coerce")
+        out = parsed.where(parsed > 0)
+
+    if currency_col in df.columns:
+        usd_mask = df[currency_col].apply(_normalize_currency_code) == "USD"
+        out.loc[usd_mask & out.isna()] = 1.0
+    return out
+
 def _account_currency_from_id(qbo_mappings: Dict[str, dict], account_id: str | None) -> str | None:
     if not account_id:
         return None
@@ -266,12 +282,20 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         # Keep source row order so debit/credit lines can be written as grouped pairs.
         df_std["_LineGroupOrder"] = range(len(df_std))
         jv_prefix, _ = _build_id_prefixes(client_name)
-        is_kzo_workspace = _is_kzo_case(client_name) and not _is_kzp_case(client_name)
-        kzo_date_map = {}
-        if is_kzo_workspace and COL_DATE in df_std.columns:
-            kzo_dates = pd.to_datetime(df_std[COL_DATE], errors="coerce").dt.normalize()
+        is_date_group_workspace = (
+            (_is_kzo_case(client_name) and not _is_kzp_case(client_name))
+            or _is_kzdw_case(client_name)
+        )
+        date_group_map = {}
+        if is_date_group_workspace and COL_DATE in df_std.columns:
+            grouped_dates = pd.to_datetime(df_std[COL_DATE], errors="coerce").dt.normalize()
         else:
-            kzo_dates = pd.Series(pd.NaT, index=df_std.index)
+            grouped_dates = pd.Series(pd.NaT, index=df_std.index)
+
+        if _is_kzdw_case(client_name):
+            currency_codes = df_std["Currency"].apply(_normalize_currency_code) if "Currency" in df_std.columns else pd.Series("USD", index=df_std.index)
+        else:
+            currency_codes = pd.Series("USD", index=df_std.index)
 
         reimbursements_in_std = pd.Series(False, index=df_std.index)
         reimburse_date_map = {}
@@ -292,17 +316,19 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
             if existing_ids and s_no in existing_ids:
                 existing_id = existing_ids[s_no]
                 generated_ids.append(existing_id)
-                if is_kzo_workspace:
-                    dt = kzo_dates.loc[idx]
+                if is_date_group_workspace:
+                    dt = grouped_dates.loc[idx]
                     if pd.notna(dt):
-                        kzo_date_map[dt] = existing_id
-            elif is_kzo_workspace:
-                dt = kzo_dates.loc[idx]
+                        key = (dt, currency_codes.loc[idx]) if _is_kzdw_case(client_name) else dt
+                        date_group_map[key] = existing_id
+            elif is_date_group_workspace:
+                dt = grouped_dates.loc[idx]
                 if pd.notna(dt):
-                    if dt not in kzo_date_map:
+                    key = (dt, currency_codes.loc[idx]) if _is_kzdw_case(client_name) else dt
+                    if key not in date_group_map:
                         current_max += 1
-                        kzo_date_map[dt] = f"{jv_prefix}{str(current_max).zfill(4)}"
-                    generated_ids.append(kzo_date_map[dt])
+                        date_group_map[key] = f"{jv_prefix}{str(current_max).zfill(4)}"
+                    generated_ids.append(date_group_map[key])
                 else:
                     current_max += 1
                     generated_ids.append(f"{jv_prefix}{str(current_max).zfill(4)}")
@@ -321,10 +347,12 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                 generated_ids.append(f"{jv_prefix}{str(current_max).zfill(4)}")
 
         df_std["Journal No"] = generated_ids
-        if _is_kzdw_case(client_name) and "Currency" in df_std.columns:
-            df_std["Currency Code"] = df_std["Currency"].apply(_normalize_currency)
+        if _is_kzdw_case(client_name):
+            df_std["Currency Code"] = currency_codes
+            df_std["Currency Exchange"] = _build_currency_exchange_series(df_std, "Currency Code")
         else:
             df_std["Currency Code"] = "USD"
+            df_std["Currency Exchange"] = ""
         df_std["Name"] = df_std[COL_ITEM_DESC]
         
         # Standard mapping:
@@ -392,21 +420,37 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         if COL_CO in df_reclass.columns: _fix_grp_location(df_reclass, COL_CO)
         
         df_reclass["_GroupDate"] = pd.to_datetime(df_reclass[COL_DATE]).dt.normalize()
-        unique_dates = sorted(df_reclass["_GroupDate"].dropna().unique())
-        
+        if _is_kzdw_case(client_name):
+            df_reclass["_CurrencyCode"] = df_reclass["Currency"].apply(_normalize_currency_code) if "Currency" in df_reclass.columns else "USD"
+            unique_groups = sorted(df_reclass[["_GroupDate", "_CurrencyCode"]].dropna().drop_duplicates().to_records(index=False))
+        else:
+            unique_groups = sorted(df_reclass["_GroupDate"].dropna().unique())
+
         date_map = {}
-        for dt in unique_dates:
+        for grp in unique_groups:
             current_max += 1
-            date_map[dt] = f"{jv_prefix}{str(current_max).zfill(4)}"
-        
-        df_reclass["Journal No"] = df_reclass["_GroupDate"].map(date_map)
-        df_reclass.drop(columns=["_GroupDate"], inplace=True, errors='ignore')
+            if _is_kzdw_case(client_name):
+                date_map[grp] = f"{jv_prefix}{str(current_max).zfill(4)}"
+            else:
+                date_map[grp] = f"{jv_prefix}{str(current_max).zfill(4)}"
+
+        if _is_kzdw_case(client_name):
+            df_reclass["Journal No"] = df_reclass.apply(
+                lambda r: date_map.get((r["_GroupDate"], r["_CurrencyCode"]), "") if pd.notna(r["_GroupDate"]) else "",
+                axis=1,
+            )
+        else:
+            df_reclass["Journal No"] = df_reclass["_GroupDate"].map(date_map)
+
+        df_reclass.drop(columns=["_GroupDate", "_CurrencyCode"], inplace=True, errors='ignore')
 
         df_reclass["Amount"] = pd.to_numeric(df_reclass[COL_USD], errors='coerce').fillna(0.0)
-        if _is_kzdw_case(client_name) and "Currency" in df_reclass.columns:
-            df_reclass["Currency Code"] = df_reclass["Currency"].apply(_normalize_currency)
+        if _is_kzdw_case(client_name):
+            df_reclass["Currency Code"] = df_reclass["Currency"].apply(_normalize_currency_code) if "Currency" in df_reclass.columns else "USD"
+            df_reclass["Currency Exchange"] = _build_currency_exchange_series(df_reclass, "Currency Code")
         else:
             df_reclass["Currency Code"] = "USD"
+            df_reclass["Currency Exchange"] = ""
         df_reclass["Class"] = ""
         df_reclass["Name"] = df_reclass[COL_ITEM_DESC]
         df_reclass = df_reclass.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
@@ -422,7 +466,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         df_reclass["_LineGroupOrder"] = range(len(df_reclass))
         df_reclass["_LineRole"] = 0
 
-        processed_reclass = df_reclass[["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class", "_LineGroupOrder", "_LineRole"]]
+        processed_reclass = df_reclass[["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Currency Exchange", "Class", "_LineGroupOrder", "_LineRole"]]
 
     # --- 3. Safe Combination ---
     total_journals = pd.concat([processed_std, processed_reclass], ignore_index=True)
@@ -494,7 +538,10 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     total_journals["Remarks"] = total_journals.apply(validate_journal_row, axis=1)
     total_journals["Class"] = total_journals.get("Location", "").fillna("")
 
-    cols_order = ["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class", "Remarks"]
+    if _is_kzdw_case(client_name):
+        cols_order = ["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Currency Exchange", "Class", "Remarks"]
+    else:
+        cols_order = ["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class", "Remarks"]
     for c in cols_order:
         if c not in total_journals.columns: total_journals[c] = ""
     
@@ -542,8 +589,10 @@ def process_expenses(df: pd.DataFrame, country: str,
     d["Payment Method"] = "Cash"
     if _is_kzdw_case(client_name) and "Currency" in d.columns:
         d["Currency Code"] = d["Currency"].apply(_normalize_currency)
+        d["Currency Exchange"] = _build_currency_exchange_series(d, "Currency Code")
     else:
         d["Currency Code"] = "USD"
+        d["Currency Exchange"] = ""
     # Expense source account:
     # Prefer Transfer From (W) and fall back to If Journal/Expense Method (V).
     if COL_TR_FROM in d.columns:
@@ -646,7 +695,10 @@ def process_expenses(df: pd.DataFrame, country: str,
 
     d["Remarks"] = d.apply(validate_expense_row, axis=1)
 
-    cols_order = ["No", "Exp Ref. No", "Account (Cr)", "Payee (Dummy)", "Memo", "Payment Date", "Payment Method", "Expense Account (Dr)", "Expense Description", "Expense Line Amount", "Currency", "Location", "Class", "Remarks"]
+    if _is_kzdw_case(client_name):
+        cols_order = ["No", "Exp Ref. No", "Account (Cr)", "Payee (Dummy)", "Memo", "Payment Date", "Payment Method", "Expense Account (Dr)", "Expense Description", "Expense Line Amount", "Currency", "Currency Exchange", "Location", "Class", "Remarks"]
+    else:
+        cols_order = ["No", "Exp Ref. No", "Account (Cr)", "Payee (Dummy)", "Memo", "Payment Date", "Payment Method", "Expense Account (Dr)", "Expense Description", "Expense Line Amount", "Currency", "Location", "Class", "Remarks"]
     for c in cols_order:
         if c not in d.columns: d[c] = ""
     
@@ -717,8 +769,10 @@ def process_transfers(df: pd.DataFrame, country: str,
     transfers["Transfer Amount"] = pd.to_numeric(transfers[COL_USD], errors="coerce").fillna(0.0).abs()
     if _is_kzdw_case(client_name) and "Currency" in transfers.columns:
         transfers["Currency"] = transfers["Currency"].apply(_normalize_currency)
+        transfers["Currency Exchange"] = _build_currency_exchange_series(transfers, "Currency")
     else:
         transfers["Currency"] = "USD"
+        transfers["Currency Exchange"] = ""
     transfers["Memo"] = transfers["Ref No"] + " - " + transfers["Memo"].astype(str)
     
     _fix_grp_location(transfers, "Location")
@@ -777,7 +831,10 @@ def process_transfers(df: pd.DataFrame, country: str,
 
     transfers["Remarks"] = transfers.apply(validate_transfer_row, axis=1)
 
-    cols_order = ["No", "Ref No", "Transfer Funds From", "Transfer Funds To", "Transfer Amount", "Memo", COL_DATE, "Location", "Class", "Currency", COL_TYPE, "Remarks"]
+    if _is_kzdw_case(client_name):
+        cols_order = ["No", "Ref No", "Transfer Funds From", "Transfer Funds To", "Transfer Amount", "Memo", COL_DATE, "Location", "Class", "Currency", "Currency Exchange", COL_TYPE, "Remarks"]
+    else:
+        cols_order = ["No", "Ref No", "Transfer Funds From", "Transfer Funds To", "Transfer Amount", "Memo", COL_DATE, "Location", "Class", "Currency", COL_TYPE, "Remarks"]
     for c in cols_order:
         if c not in transfers.columns: transfers[c] = ""
     
