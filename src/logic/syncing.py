@@ -86,6 +86,10 @@ def _infer_currency_from_text(val) -> str | None:
 
     return None
 
+
+def _is_kzdw_workspace(client_name: str | None) -> bool:
+    return "kzdw" in str(client_name or "").lower()
+
 class QBOSync:
     def __init__(self, client: QBOClient):
         self.client = client
@@ -371,44 +375,56 @@ class QBOSync:
         
         if not from_id or not to_id: raise ValueError("Source or Destination Account missing.")
 
-        accounts_meta = self.mappings.get("accounts_meta", {})
-        from_ccy = _normalize_currency_code((accounts_meta.get(from_id) or {}).get("currency", "USD"))
-        to_ccy = _normalize_currency_code((accounts_meta.get(to_id) or {}).get("currency", "USD"))
+        is_kzdw_workspace = _is_kzdw_workspace(self.client.client_name)
         row_ccy = _normalize_currency_code(row.get("Currency", "USD"))
+        from_ccy = "USD"
+        to_ccy = "USD"
 
-        # Fallback for cases where Account query did not return reliable CurrencyRef.
-        inferred_from_ccy = _infer_currency_from_text(from_name)
-        inferred_to_ccy = _infer_currency_from_text(to_name)
-        if from_ccy == "USD" and inferred_from_ccy and inferred_from_ccy != "USD":
-            from_ccy = inferred_from_ccy
-        if to_ccy == "USD" and inferred_to_ccy and inferred_to_ccy != "USD":
-            to_ccy = inferred_to_ccy
-        
         ref_no = str(row.get("Ref No", ""))
         memo = str(row.get("Memo", ""))
         # full_memo = f"{ref_no} - {memo}"
 
         txn_currency = "USD"
-        if from_ccy == to_ccy:
-            txn_currency = from_ccy
-        elif from_ccy == "USD" and to_ccy != "USD":
-            txn_currency = to_ccy
-        elif to_ccy == "USD" and from_ccy != "USD":
-            txn_currency = from_ccy
-        else:
-            raise ValueError(
-                f"Transfer currency conflict ({from_ccy} -> {to_ccy}). "
-                "QBO allows only one foreign currency per transfer."
-            )
+        if is_kzdw_workspace:
+            accounts_meta = self.mappings.get("accounts_meta", {})
+            from_ccy = _normalize_currency_code((accounts_meta.get(from_id) or {}).get("currency", "USD"))
+            to_ccy = _normalize_currency_code((accounts_meta.get(to_id) or {}).get("currency", "USD"))
 
-        # Respect sheet currency if it aligns with account currencies.
-        if row_ccy == "USD":
-            txn_currency = "USD"
-        elif row_ccy in {from_ccy, to_ccy}:
-            txn_currency = row_ccy
+            # Fallback for cases where Account query did not return reliable CurrencyRef.
+            inferred_from_ccy = _infer_currency_from_text(from_name)
+            inferred_to_ccy = _infer_currency_from_text(to_name)
+            if from_ccy == "USD" and inferred_from_ccy and inferred_from_ccy != "USD":
+                from_ccy = inferred_from_ccy
+            if to_ccy == "USD" and inferred_to_ccy and inferred_to_ccy != "USD":
+                to_ccy = inferred_to_ccy
+
+            if from_ccy == to_ccy:
+                txn_currency = from_ccy
+            elif from_ccy == "USD" and to_ccy != "USD":
+                txn_currency = to_ccy
+            elif to_ccy == "USD" and from_ccy != "USD":
+                txn_currency = from_ccy
+            else:
+                raise ValueError(
+                    f"Transfer currency conflict ({from_ccy} -> {to_ccy}). "
+                    "QBO allows only one foreign currency per transfer."
+                )
+
+            # Respect sheet currency if it aligns with account currencies.
+            if row_ccy == "USD":
+                txn_currency = "USD"
+            elif row_ccy in {from_ccy, to_ccy}:
+                txn_currency = row_ccy
+
+        elif row_ccy != "USD":
+            logger.warning(
+                f"      [Transfer Currency] Non-KZDW workspace '{self.client.client_name}' "
+                f"received row currency '{row_ccy}'. Falling back to USD."
+            )
 
         logger.info(
             f"      [Transfer Currency] Ref={row.get('Ref No','')} "
+            f"Workspace={self.client.client_name} "
             f"From={from_ccy} To={to_ccy} Row={row_ccy} -> Txn={txn_currency}"
         )
 
@@ -419,8 +435,8 @@ class QBOSync:
             "ToAccountRef": {"value": to_id},
             "PrivateNote": memo 
         }
-        # Keep existing behavior for USD-only workspaces; include CurrencyRef only when foreign.
-        if txn_currency != "USD":
+        # Only KZDW handles non-USD transfer + FX attachment.
+        if is_kzdw_workspace and txn_currency != "USD":
             payload["CurrencyRef"] = {"value": txn_currency}
             txn_date = payload["TxnDate"]
             transformed_fx = _parse_exchange_rate(row.get("Currency Exchange"))
