@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv("config/secrets.env")
 
 import pandas as pd
+import calendar
 from datetime import datetime
 from config import settings
 from src.connectors.gsheets_client import GSheetsClient
@@ -72,6 +73,43 @@ def write_raw_check_results(gs, spreadsheet_url, tab_name, df, updates_list):
     # print("Add Raw Reconcile")
     
     gs.batch_update_cells(spreadsheet_url, tab_name, batch_payload)
+
+
+def _filter_raw_df_by_month(raw_df: pd.DataFrame, month_str: str, client_name: str) -> pd.DataFrame:
+    """
+    Keep only raw rows within the reconciliation month.
+    This prevents cross-month duplicate 'No' values from affecting raw reconcile.
+    """
+    if raw_df is None or raw_df.empty or "Date" not in raw_df.columns:
+        return raw_df
+
+    month_dt = pd.to_datetime(month_str, errors="coerce")
+    if pd.isna(month_dt):
+        logger.warning(f"   ⚠️ [{client_name}] Raw month filter skipped: invalid month '{month_str}'")
+        return raw_df
+
+    last_day = calendar.monthrange(int(month_dt.year), int(month_dt.month))[1]
+    start = pd.Timestamp(year=int(month_dt.year), month=int(month_dt.month), day=1)
+    end = pd.Timestamp(year=int(month_dt.year), month=int(month_dt.month), day=last_day)
+
+    date_raw = raw_df["Date"]
+    parsed = pd.to_datetime(date_raw, errors="coerce")
+
+    # Fallback for Excel serial dates if present.
+    numeric_dates = pd.to_numeric(date_raw, errors="coerce")
+    excel_dates = pd.to_datetime(numeric_dates, unit="D", origin="1899-12-30", errors="coerce")
+    parsed = parsed.fillna(excel_dates)
+
+    in_month = parsed.between(start, end, inclusive="both")
+    filtered = raw_df.loc[in_month].copy()
+
+    dropped = int(len(raw_df) - len(filtered))
+    if dropped > 0:
+        logger.info(
+            f"   🧹 [{client_name}] Raw month filter: kept {len(filtered)}/{len(raw_df)} rows "
+            f"for {start.strftime('%Y-%m')}."
+        )
+    return filtered
 # ==============================================================================
 # LOGIC: PROCESS ONE CLIENT
 # ==============================================================================
@@ -170,6 +208,9 @@ def process_client_reconcile(
                     for col in ["No", "USD - QBO", "Amount Fr", "Amount To"]:
                         if col in raw_df.columns:
                             raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0)
+
+                    # Keep only rows in the target month to avoid cross-month duplicate "No".
+                    raw_df = _filter_raw_df_by_month(raw_df, month_str, client_name)
 
             except Exception as e:
                 logger.error(f"   ⚠️ Failed to read Raw Source: {e}")
