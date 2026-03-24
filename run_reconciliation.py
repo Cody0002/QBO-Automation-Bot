@@ -98,15 +98,40 @@ def _filter_raw_df_by_month(raw_df: pd.DataFrame, month_str: str, client_name: s
         return raw_df
     date_raw = date_candidates.iloc[:, 0]
 
-    # Parse common formats; day-first helps KZO-like sheets.
-    parsed = pd.to_datetime(date_raw, errors="coerce")
-    parsed_dayfirst = pd.to_datetime(date_raw, errors="coerce", dayfirst=True)
-    parsed = parsed.fillna(parsed_dayfirst)
+    # Parse common text formats first.
+    date_text = date_raw.astype(str).str.strip()
+    slash_like = date_text.str.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", na=False)
 
-    # Fallback for Excel serial dates if present.
+    # For slash dates, enforce m/d/yyyy (or m/d/yy).
+    parsed_slash_mdy = pd.to_datetime(date_text.where(slash_like), format="%m/%d/%Y", errors="coerce")
+    parsed_slash_mdy_short = pd.to_datetime(date_text.where(slash_like), format="%m/%d/%y", errors="coerce")
+
+    parsed_mdy = pd.to_datetime(date_text, errors="coerce", dayfirst=False)
+    parsed_dmy = pd.to_datetime(date_text, errors="coerce", dayfirst=True)
+    parsed = parsed_slash_mdy.fillna(parsed_slash_mdy_short).fillna(parsed_mdy).fillna(parsed_dmy)
+
+    # Numeric date strategies:
+    # 1) Excel serial days
+    # 2) yyyymmdd integers
+    # 3) Unix epoch seconds / milliseconds
     numeric_dates = pd.to_numeric(date_raw, errors="coerce")
-    excel_dates = pd.to_datetime(numeric_dates, unit="D", origin="1899-12-30", errors="coerce")
+
+    excel_base = numeric_dates.where((numeric_dates >= 20000) & (numeric_dates <= 90000))
+    excel_dates = pd.to_datetime(excel_base, unit="D", origin="1899-12-30", errors="coerce")
     parsed = parsed.fillna(excel_dates)
+
+    yyyymmdd_base = numeric_dates.where((numeric_dates >= 19000101) & (numeric_dates <= 20991231))
+    yyyymmdd_int = yyyymmdd_base.round().astype("Int64")
+    yyyymmdd_dates = pd.to_datetime(yyyymmdd_int.astype(str), format="%Y%m%d", errors="coerce")
+    parsed = parsed.fillna(yyyymmdd_dates)
+
+    epoch_s_base = numeric_dates.where((numeric_dates >= 946684800) & (numeric_dates <= 4102444800))
+    epoch_s_dates = pd.to_datetime(epoch_s_base, unit="s", errors="coerce")
+    parsed = parsed.fillna(epoch_s_dates)
+
+    epoch_ms_base = numeric_dates.where((numeric_dates >= 946684800000) & (numeric_dates <= 4102444800000))
+    epoch_ms_dates = pd.to_datetime(epoch_ms_base, unit="ms", errors="coerce")
+    parsed = parsed.fillna(epoch_ms_dates)
 
     parsed_count = int(parsed.notna().sum())
     if parsed_count == 0:
@@ -125,6 +150,13 @@ def _filter_raw_df_by_month(raw_df: pd.DataFrame, month_str: str, client_name: s
             f"for {start.strftime('%Y-%m')}."
         )
     if filtered.empty:
+        valid_dates = parsed.dropna()
+        if not valid_dates.empty:
+            logger.warning(
+                f"   ⚠️ [{client_name}] Raw Date parsed range: "
+                f"{valid_dates.min().strftime('%Y-%m-%d')} -> {valid_dates.max().strftime('%Y-%m-%d')} "
+                f"(target month: {start.strftime('%Y-%m')})."
+            )
         logger.warning(
             f"   ⚠️ [{client_name}] Raw month filter produced 0 rows for {start.strftime('%Y-%m')}; "
             "Raw Reconcile will be skipped."
