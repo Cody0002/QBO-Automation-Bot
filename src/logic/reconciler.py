@@ -14,9 +14,59 @@ class Reconciler:
         self._qbo_entity_cache: dict[tuple[str, str, str], tuple[dict, dict]] = {}
         self._qbo_transfer_cache: dict[tuple[str, str], list] = {}
 
+    def _coerce_scalar(self, val):
+        """Collapse Series/DataFrame values (from duplicate columns) into one scalar."""
+        if isinstance(val, pd.DataFrame):
+            if val.empty:
+                return ""
+            flat_vals = pd.Series(val.to_numpy().ravel())
+            if flat_vals.empty:
+                return ""
+            non_na = flat_vals[flat_vals.notna()]
+            return non_na.iloc[0] if not non_na.empty else flat_vals.iloc[0]
+
+        if isinstance(val, pd.Series):
+            if val.empty:
+                return ""
+            non_na = val[val.notna()]
+            return non_na.iloc[0] if not non_na.empty else val.iloc[0]
+
+        return val
+
+    def _row_get_scalar(self, row: pd.Series, key: str, default=""):
+        """Safe cell getter that tolerates duplicate column names."""
+        if key not in row:
+            return default
+        try:
+            val = row.get(key, default)
+        except Exception:
+            return default
+        val = self._coerce_scalar(val)
+        try:
+            if pd.isna(val):
+                return default
+        except Exception:
+            pass
+        return val
+
+    def _has_value(self, val) -> bool:
+        v = self._coerce_scalar(val)
+        try:
+            if pd.isna(v):
+                return False
+        except Exception:
+            pass
+        return str(v).strip().lower() not in {"", "nan", "none", "null"}
+
     def _safe_float(self, val) -> float:
         """Converts string with commas '1,234.56' to float 1234.56"""
-        if pd.isna(val) or val == "": return 0.0
+        val = self._coerce_scalar(val)
+        try:
+            if pd.isna(val) or val == "":
+                return 0.0
+        except Exception:
+            if val == "":
+                return 0.0
         if isinstance(val, (int, float)): return float(val)
         try:
             clean_val = str(val).replace(",", "").strip()
@@ -157,8 +207,9 @@ class Reconciler:
             
             # 1. FIND QBO RECORD
             qbo_record = None
-            if "QBO ID" in first_row and pd.notna(first_row["QBO ID"]):
-                qbo_record = map_id.get(self._normalize_qbo_id(first_row["QBO ID"]))
+            qbo_id_val = self._row_get_scalar(first_row, "QBO ID", "")
+            if self._has_value(qbo_id_val):
+                qbo_record = map_id.get(self._normalize_qbo_id(qbo_id_val))
             if not qbo_record:
                 qbo_record = map_doc.get(str(jv_no).strip())
 
@@ -172,13 +223,13 @@ class Reconciler:
             header_errors = []
             
             # Date Check
-            sheet_date = pd.to_datetime(first_row["Date"]).strftime("%Y-%m-%d")
+            sheet_date = pd.to_datetime(self._row_get_scalar(first_row, "Date", "")).strftime("%Y-%m-%d")
             qbo_date = qbo_record.get("TxnDate")
             if sheet_date != qbo_date:
                 header_errors.append(f"Date Mismatch ({sheet_date} vs {qbo_date})")
 
             # Memo Check (Loose Match)
-            sheet_memo = str(first_row.get("Memo", "")).strip().lower()
+            sheet_memo = str(self._row_get_scalar(first_row, "Memo", "")).strip().lower()
             qbo_memo = str(qbo_record.get("PrivateNote", "")).strip().lower()
             if sheet_memo and sheet_memo not in qbo_memo:
                  header_errors.append(f"Memo Mismatch")
@@ -211,11 +262,8 @@ class Reconciler:
                 if header_errors:
                     row_status = f"⚠️ Header: {'; '.join(header_errors)}"
 
-                sheet_acc_raw = str(row["Account"])
-                try:
-                    sheet_amt = float(row["Amount"])
-                except:
-                    sheet_amt = 0.0
+                sheet_acc_raw = str(self._row_get_scalar(row, "Account", ""))
+                sheet_amt = self._safe_float(self._row_get_scalar(row, "Amount", 0))
 
                 found_match = False
                 
@@ -285,10 +333,11 @@ class Reconciler:
 
         for idx, row in df.iterrows():
             qbo_record = None
-            if "QBO ID" in row and pd.notna(row["QBO ID"]):
-                qbo_record = map_id.get(self._normalize_qbo_id(row["QBO ID"]))
+            qbo_id_val = self._row_get_scalar(row, "QBO ID", "")
+            if self._has_value(qbo_id_val):
+                qbo_record = map_id.get(self._normalize_qbo_id(qbo_id_val))
             if not qbo_record:
-                qbo_record = map_doc.get(str(row.get("Exp Ref. No", "")).strip())
+                qbo_record = map_doc.get(str(self._row_get_scalar(row, "Exp Ref. No", "")).strip())
 
             if not qbo_record:
                 updates.append({"row_idx": idx, "status": "❌ Not found in QBO"})
@@ -297,19 +346,19 @@ class Reconciler:
             errors = []
             
             # 1. Date Check
-            s_date = pd.to_datetime(row["Payment Date"]).strftime("%Y-%m-%d")
+            s_date = pd.to_datetime(self._row_get_scalar(row, "Payment Date", "")).strftime("%Y-%m-%d")
             q_date = qbo_record.get("TxnDate")
             if s_date != q_date: errors.append(f"Date: {s_date} != {q_date}")
 
             # 2. Amount Check
-            s_amt = abs(float(row.get("Expense Line Amount", 0)))
+            s_amt = abs(self._safe_float(self._row_get_scalar(row, "Expense Line Amount", 0)))
             q_amt = float(qbo_record.get("TotalAmt", 0))
             if abs(s_amt - q_amt) > 0.01:
                 errors.append(f"Amount: {s_amt:,.2f} != {q_amt:,.2f}")
 
             # 3. PAYMENT ACCOUNT CHECK (Account Cr)
             # This checks the main 'AccountRef' on the Purchase object (where money came FROM)
-            sheet_pay_acc = str(row.get("Account (Cr)", ""))
+            sheet_pay_acc = str(self._row_get_scalar(row, "Account (Cr)", ""))
             qbo_pay_acc = qbo_record.get("AccountRef", {}).get("name", "")
             
             # Use robust match
@@ -333,11 +382,12 @@ class Reconciler:
 
         for idx, row in df.iterrows():
             qbo_record = None
-            if "QBO ID" in row and pd.notna(row["QBO ID"]) and str(row["QBO ID"]).strip():
-                qbo_record = map_id.get(self._normalize_qbo_id(row["QBO ID"]))
+            qbo_id_val = self._row_get_scalar(row, "QBO ID", "")
+            if self._has_value(qbo_id_val):
+                qbo_record = map_id.get(self._normalize_qbo_id(qbo_id_val))
             
             if not qbo_record:
-                ref_no = str(row.get("Ref No", "")).strip()
+                ref_no = str(self._row_get_scalar(row, "Ref No", "")).strip()
                 qbo_record = next((item for item in qbo_list if ref_no in item.get("PrivateNote", "")), None)
 
             if not qbo_record:
@@ -345,13 +395,13 @@ class Reconciler:
                 continue
 
             errors = []
-            s_amt = abs(float(row.get("Transfer Amount", 0)))
+            s_amt = abs(self._safe_float(self._row_get_scalar(row, "Transfer Amount", 0)))
             q_amt = float(qbo_record.get("Amount", 0))
             
             if abs(s_amt - q_amt) > 0.01:
                 errors.append(f"Amount: {s_amt:,.2f} != {q_amt:,.2f}")
             
-            s_date = pd.to_datetime(row["Date"]).strftime("%Y-%m-%d")
+            s_date = pd.to_datetime(self._row_get_scalar(row, "Date", "")).strftime("%Y-%m-%d")
             q_date = qbo_record.get("TxnDate")
             if s_date != q_date:
                 errors.append(f"Date: {s_date} != {q_date}")
@@ -368,13 +418,26 @@ class Reconciler:
             logger.warning("⚠️ Raw Comparison Skipped: Empty DataFrame or missing 'No' column")
             return []
         
+        if transform_df.empty or "No" not in transform_df.columns:
+            logger.warning("Raw Comparison Skipped: Transform DataFrame missing 'No' column")
+            return []
+
         # 1. Clean & Index Raw
         raw_clean = raw_df.copy()
-        raw_clean["_Key"] = pd.to_numeric(raw_clean["No"], errors="coerce").fillna(0).astype(int)
+        raw_no_cols = raw_clean.loc[:, raw_clean.columns == "No"]
+        if raw_no_cols.empty:
+            logger.warning("Raw Comparison Skipped: Raw DataFrame has no usable 'No' column")
+            return []
+        raw_clean["_Key"] = pd.to_numeric(raw_no_cols.iloc[:, 0], errors="coerce").fillna(0).astype(int)
         raw_clean = raw_clean[raw_clean["_Key"] > 0].set_index("_Key")
 
         # 2. Group Transform (Aggregate Max Abs Value)
-        transform_df["_Key"] = pd.to_numeric(transform_df["No"], errors="coerce").fillna(0).astype(int)
+        transform_df = transform_df.copy()
+        transform_no_cols = transform_df.loc[:, transform_df.columns == "No"]
+        if transform_no_cols.empty:
+            logger.warning("Raw Comparison Skipped: Transform DataFrame has no usable 'No' column")
+            return []
+        transform_df["_Key"] = pd.to_numeric(transform_no_cols.iloc[:, 0], errors="coerce").fillna(0).astype(int)
         
         # --- FIX: Restore Dynamic Column Selection for Transform DF ---
         # The Transform DataFrame (output of transformer.py) does NOT have "USD - QBO".
@@ -383,7 +446,22 @@ class Reconciler:
         if entity_type == "Purchase": amt_col = "Expense Line Amount"
         elif entity_type == "Transfer": amt_col = "Transfer Amount"
         
-        transform_agg = transform_df.groupby("_Key")[amt_col].apply(lambda x: x.apply(self._safe_float).abs().max())
+        if amt_col not in transform_df.columns:
+            logger.warning(f"Raw Comparison Skipped: missing amount column '{amt_col}' for {entity_type}")
+            return []
+
+        amt_candidates = transform_df.loc[:, transform_df.columns == amt_col]
+        if amt_candidates.empty:
+            logger.warning(f"Raw Comparison Skipped: no usable '{amt_col}' column for {entity_type}")
+            return []
+
+        if amt_candidates.shape[1] == 1:
+            recon_amt = amt_candidates.iloc[:, 0].apply(self._safe_float).abs()
+        else:
+            recon_amt = amt_candidates.apply(lambda col: col.apply(self._safe_float)).abs().max(axis=1)
+
+        transform_df["_ReconAmt"] = recon_amt
+        transform_agg = transform_df.groupby("_Key")["_ReconAmt"].max()
 
         # 3. Compare & Assign Status
         status_map = {}
@@ -396,8 +474,16 @@ class Reconciler:
 
             raw_row = raw_clean.loc[no_val]
             
-            # --- FIX: STRICTLY use "USD - QBO" from Raw ---
-            final_raw_val = raw_row.get("USD - QBO", 0)
+            if isinstance(raw_row, pd.DataFrame):
+                usd_cols = raw_row.loc[:, raw_row.columns == "USD - QBO"]
+                if not usd_cols.empty:
+                    flat_vals = pd.Series(usd_cols.to_numpy().ravel())
+                    final_raw_val = flat_vals.apply(self._safe_float).abs().max() if not flat_vals.empty else 0
+                else:
+                    final_raw_val = 0
+            else:
+                # --- FIX: STRICTLY use "USD - QBO" from Raw ---
+                final_raw_val = self._coerce_scalar(raw_row.get("USD - QBO", 0))
             
             raw_abs = abs(self._safe_float(final_raw_val))
             sheet_abs = abs(self._safe_float(sheet_amt))
@@ -414,7 +500,7 @@ class Reconciler:
 
         # 4. Broadcast
         for idx, row in transform_df.iterrows():
-            no_val = int(row.get("_Key", 0))
+            no_val = int(self._safe_float(self._row_get_scalar(row, "_Key", 0)))
             if no_val == 0: continue
             status = status_map.get(no_val, "Skipped")
             updates.append({"row_idx": idx, "status": status})

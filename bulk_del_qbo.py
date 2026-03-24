@@ -112,12 +112,11 @@ if __name__ == "__main__":
     # TARGET_REALM_ID = "9341455236413167"  
     
     # PASTE YOUR IDs HERE (as strings or numbers)
-    # ids_to_delete = [616, 617, 618, 619, 620, 621, 622]
-    
-    ids_to_delete =list(range(2936, 3106))
-    # SELECT THE TYPE (Must match the IDs above)
+    ids_to_delete = [
+       3282,3283,3284,3285,3286,3287,3288,3289,3290,3291,3292,3293,3294,3295,
+    ]
     # Options: "JournalEntry", "Purchase" (Expense), "Transfer", "Deposit"
-    ENTITY_TYPE = "Transfer" 
+    ENTITY_TYPE = "JournalEntry" 
     
     # -------------------------------------------
     # 2. EXECUTION

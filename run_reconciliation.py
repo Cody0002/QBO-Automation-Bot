@@ -199,7 +199,7 @@ def process_client_reconcile(
                 else:
                     row_updates[COL_QBO_JV] = "SYNCED"
         except Exception as e:
-            logger.error(f"   ❌ JV Reconcile Error: {e}")
+            logger.exception(f"   ❌ JV Reconcile Error: {e}")
             has_issue = True
 
         # 2. Reconcile Expenses
@@ -224,7 +224,7 @@ def process_client_reconcile(
                 else:
                     row_updates[COL_QBO_EXP] = "SYNCED"
         except Exception as e:
-            logger.error(f"   ❌ Exp Reconcile Error: {e}")
+            logger.exception(f"   ❌ Exp Reconcile Error: {e}")
             has_issue = True
 
         # 3. Reconcile Transfers
@@ -249,7 +249,7 @@ def process_client_reconcile(
                 else:
                     row_updates[COL_QBO_TR] = "SYNCED"
         except Exception as e:
-            logger.error(f"   ❌ Trf Reconcile Error: {e}")
+            logger.exception(f"   ❌ Trf Reconcile Error: {e}")
             has_issue = True
 
         final = "DONE (Issues Found)" if has_issue else "DONE"
@@ -361,3 +361,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     main(target_client=args.client)
+
