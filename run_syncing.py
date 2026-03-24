@@ -41,22 +41,47 @@ def _env_float(name: str, default: float) -> float:
 # - patch size for status updates to sheet
 # - delay after each QBO call
 # - delay after each sheet patch flush
-SYNC_PATCH_SIZE = _env_int("QBO_SYNC_PATCH_SIZE", 10)
-QBO_SYNC_CALL_DELAY_SEC = _env_float("QBO_SYNC_CALL_DELAY_SEC", 0.35)
-QBO_SYNC_PATCH_DELAY_SEC = _env_float("QBO_SYNC_PATCH_DELAY_SEC", 0.8)
+SYNC_PATCH_SIZE = _env_int("QBO_SYNC_PATCH_SIZE", 20)
+QBO_SYNC_CALL_DELAY_SEC = _env_float("QBO_SYNC_CALL_DELAY_SEC", 0.20)
+QBO_SYNC_PATCH_DELAY_SEC = _env_float("QBO_SYNC_PATCH_DELAY_SEC", 0.25)
+SYNC_PROGRESS_LOG_EVERY = _env_int("QBO_SYNC_PROGRESS_LOG_EVERY", 10)
 
 def _throttle_qbo_call():
     if QBO_SYNC_CALL_DELAY_SEC > 0:
         time.sleep(QBO_SYNC_CALL_DELAY_SEC)
 
-def _flush_updates(gs, spreadsheet_url, tab_name, updates: list):
+def _flush_updates(gs, spreadsheet_url, tab_name, updates: list, col_ctx: dict | None = None):
     if not updates:
         return []
     logger.info(f"   >>> Flushing {len(updates)} updates to Sheet...")
-    _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates)
+    _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates, col_ctx=col_ctx)
     if QBO_SYNC_PATCH_DELAY_SEC > 0:
         time.sleep(QBO_SYNC_PATCH_DELAY_SEC)
     return []
+
+def _build_status_col_ctx(gs, spreadsheet_url, tab_name, headers: list[str]) -> dict:
+    """
+    Resolve and cache column positions once per tab to avoid repeated sheet header reads.
+    Ensures Remarks/QBO ID/QBO Link exist.
+    """
+    working_headers = list(headers or [])
+    required = ["Remarks", "QBO ID", "QBO Link"]
+    for col_name in required:
+        if col_name not in working_headers:
+            col_idx = len(working_headers) + 1
+            gs.update_cell(spreadsheet_url, tab_name, 1, col_idx, col_name)
+            working_headers.append(col_name)
+    return {
+        "col_rem": working_headers.index("Remarks") + 1,
+        "col_id": working_headers.index("QBO ID") + 1,
+        "col_link": working_headers.index("QBO Link") + 1,
+    }
+
+def _should_log_progress(i: int, total: int) -> bool:
+    pos = i + 1
+    if pos == 1 or pos == total:
+        return True
+    return (pos % SYNC_PROGRESS_LOG_EVERY) == 0
 
 def _batch_update_control(gs, sheet_id, tab_name, row_num, columns, updates_dict):
     headers = list(columns)
@@ -68,7 +93,7 @@ def _batch_update_control(gs, sheet_id, tab_name, row_num, columns, updates_dict
     if batch_data:
         gs.batch_update_cells(sheet_id, tab_name, batch_data)
 
-def _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates: list):
+def _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates: list, col_ctx: dict | None = None):
     """
     Updates:
     - Remarks
@@ -79,12 +104,13 @@ def _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates: list):
         return
 
     try:
-        df_header = gs.read_as_df(spreadsheet_url, tab_name)
-        headers = df_header.columns.tolist()
+        if not col_ctx:
+            df_header = gs.read_as_df(spreadsheet_url, tab_name)
+            col_ctx = _build_status_col_ctx(gs, spreadsheet_url, tab_name, df_header.columns.tolist())
 
-        col_rem = headers.index("Remarks") + 1 if "Remarks" in headers else len(headers) + 1
-        col_id  = headers.index("QBO ID") + 1 if "QBO ID" in headers else len(headers) + 1
-        col_link = headers.index("QBO Link") + 1 if "QBO Link" in headers else len(headers) + 1
+        col_rem = col_ctx["col_rem"]
+        col_id = col_ctx["col_id"]
+        col_link = col_ctx["col_link"]
 
         batch_payload = []
 
@@ -186,6 +212,7 @@ def process_client_sync(
             except: df_jv = pd.DataFrame()
 
             if not df_jv.empty and "Remarks" in df_jv.columns:
+                col_ctx = _build_status_col_ctx(gs, transform_url, tab_jv, df_jv.columns.tolist())
                 to_sync = df_jv[df_jv["Remarks"].astype(str).str.contains("Ready to sync", case=False, na=False)]
                 
                 if to_sync.empty:
@@ -203,7 +230,7 @@ def process_client_sync(
                             for idx in group.index:
                                 updates.append({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
                             if len(updates) >= BATCH_SIZE:
-                                updates = _flush_updates(gs, transform_url, tab_jv, updates)
+                                updates = _flush_updates(gs, transform_url, tab_jv, updates, col_ctx=col_ctx)
                             continue
 
                         try:
@@ -229,10 +256,10 @@ def process_client_sync(
                                 updates.append({"row_idx": idx, "status": msg, "qbo_id": "", "qbo_link": ""})
 
                         if len(updates) >= BATCH_SIZE:
-                            updates = _flush_updates(gs, transform_url, tab_jv, updates)
+                            updates = _flush_updates(gs, transform_url, tab_jv, updates, col_ctx=col_ctx)
 
                     if updates:
-                        updates = _flush_updates(gs, transform_url, tab_jv, updates)
+                        updates = _flush_updates(gs, transform_url, tab_jv, updates, col_ctx=col_ctx)
                     jv_status = "SYNC FAIL" if section_fail else "SYNCED"
         except Exception as e:
             logger.error(f"   ❌ Journal Sync Fail: {e}")
@@ -248,6 +275,7 @@ def process_client_sync(
             except: df_exp = pd.DataFrame()
 
             if not df_exp.empty and "Remarks" in df_exp.columns:
+                col_ctx = _build_status_col_ctx(gs, transform_url, tab_exp, df_exp.columns.tolist())
                 to_sync = df_exp[df_exp["Remarks"].astype(str).str.contains("Ready to sync", case=False, na=False)]
                 
                 if to_sync.empty:
@@ -262,8 +290,8 @@ def process_client_sync(
 
                     # Use enumerate to track progress count
                     for i, (idx, row_data) in enumerate(to_sync.iterrows()):
-                        # LOG PROGRESS to Console
-                        logger.info(f"   [Expense {i+1}/{total_rows}] Processing Ref: {row_data.get('Exp Ref. No')}...")
+                        if _should_log_progress(i, total_rows):
+                            logger.info(f"   [Expense {i+1}/{total_rows}] Processing Ref: {row_data.get('Exp Ref. No')}...")
 
                         ref_no = str(row_data.get("Exp Ref. No", ""))
                         
@@ -298,11 +326,11 @@ def process_client_sync(
                         # --- NEW: BATCH UPDATE ---
                         # If we hit the batch size, write to Sheet immediately and clear memory
                         if len(updates) >= BATCH_SIZE:
-                            updates = _flush_updates(gs, transform_url, tab_exp, updates)
+                            updates = _flush_updates(gs, transform_url, tab_exp, updates, col_ctx=col_ctx)
 
                     # Flush any remaining updates after the loop finishes
                     if updates:
-                        updates = _flush_updates(gs, transform_url, tab_exp, updates)
+                        updates = _flush_updates(gs, transform_url, tab_exp, updates, col_ctx=col_ctx)
 
                     exp_status = "SYNC FAIL" if section_fail else "SYNCED"
         except Exception as e:
@@ -319,6 +347,7 @@ def process_client_sync(
             except: df_tr = pd.DataFrame()
 
             if not df_tr.empty and "Remarks" in df_tr.columns:
+                col_ctx = _build_status_col_ctx(gs, transform_url, tab_tr, df_tr.columns.tolist())
                 to_sync = df_tr[df_tr["Remarks"].astype(str).str.contains("Ready to sync", case=False, na=False)]
                 
                 if to_sync.empty:
@@ -332,7 +361,8 @@ def process_client_sync(
                     total_rows = len(to_sync)
 
                     for i, (idx, row_data) in enumerate(to_sync.iterrows()):
-                        logger.info(f"   [Transfer {i+1}/{total_rows}] Processing Ref: {row_data.get('Ref No')}...")
+                        if _should_log_progress(i, total_rows):
+                            logger.info(f"   [Transfer {i+1}/{total_rows}] Processing Ref: {row_data.get('Ref No')}...")
 
                         ref_no = str(row_data.get("Ref No", ""))
 
@@ -363,10 +393,10 @@ def process_client_sync(
 
                         # --- NEW: BATCH UPDATE ---
                         if len(updates) >= BATCH_SIZE:
-                            updates = _flush_updates(gs, transform_url, tab_tr, updates)
+                            updates = _flush_updates(gs, transform_url, tab_tr, updates, col_ctx=col_ctx)
 
                     if updates:
-                        updates = _flush_updates(gs, transform_url, tab_tr, updates)
+                        updates = _flush_updates(gs, transform_url, tab_tr, updates, col_ctx=col_ctx)
 
                     tr_status = "SYNC FAIL" if section_fail else "SYNCED"
         except Exception as e:

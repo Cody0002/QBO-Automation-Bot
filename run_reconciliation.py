@@ -92,13 +92,28 @@ def _filter_raw_df_by_month(raw_df: pd.DataFrame, month_str: str, client_name: s
     start = pd.Timestamp(year=int(month_dt.year), month=int(month_dt.month), day=1)
     end = pd.Timestamp(year=int(month_dt.year), month=int(month_dt.month), day=last_day)
 
-    date_raw = raw_df["Date"]
+    # Handle duplicate "Date" headers by taking the first usable one.
+    date_candidates = raw_df.loc[:, raw_df.columns == "Date"]
+    if date_candidates.empty:
+        return raw_df
+    date_raw = date_candidates.iloc[:, 0]
+
+    # Parse common formats; day-first helps KZO-like sheets.
     parsed = pd.to_datetime(date_raw, errors="coerce")
+    parsed_dayfirst = pd.to_datetime(date_raw, errors="coerce", dayfirst=True)
+    parsed = parsed.fillna(parsed_dayfirst)
 
     # Fallback for Excel serial dates if present.
     numeric_dates = pd.to_numeric(date_raw, errors="coerce")
     excel_dates = pd.to_datetime(numeric_dates, unit="D", origin="1899-12-30", errors="coerce")
     parsed = parsed.fillna(excel_dates)
+
+    parsed_count = int(parsed.notna().sum())
+    if parsed_count == 0:
+        logger.warning(
+            f"   ⚠️ [{client_name}] Raw month filter skipped: no parseable Date values; keeping all {len(raw_df)} rows."
+        )
+        return raw_df
 
     in_month = parsed.between(start, end, inclusive="both")
     filtered = raw_df.loc[in_month].copy()
@@ -108,6 +123,11 @@ def _filter_raw_df_by_month(raw_df: pd.DataFrame, month_str: str, client_name: s
         logger.info(
             f"   🧹 [{client_name}] Raw month filter: kept {len(filtered)}/{len(raw_df)} rows "
             f"for {start.strftime('%Y-%m')}."
+        )
+    if filtered.empty:
+        logger.warning(
+            f"   ⚠️ [{client_name}] Raw month filter produced 0 rows for {start.strftime('%Y-%m')}; "
+            "Raw Reconcile will be skipped."
         )
     return filtered
 # ==============================================================================
