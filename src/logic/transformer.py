@@ -27,6 +27,7 @@ COL_ITEM_DESC = "Item Description"
 COL_CO = "CO"
 COL_IN_OUT = "In/Out"
 COL_BANK = "Account Fr"
+COL_SUBCATE = "Sub Category"
 
 def parse_mixed_date(series: pd.Series) -> pd.Series:
     """Parse Excel serial dates and regular date strings safely."""

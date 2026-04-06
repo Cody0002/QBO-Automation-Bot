@@ -32,6 +32,7 @@ RAW_STANDARD_COLUMNS = [
     "Check (Internal use)",
     "No",
     "Currency Rate",
+    "Sub Category"
 ]
 
 
