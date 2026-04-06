@@ -32,7 +32,6 @@ RAW_STANDARD_COLUMNS = [
     "Check (Internal use)",
     "No",
     "Currency Rate",
-    "Sub Category"
 ]
 
 
@@ -196,7 +195,6 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
     coy_col = _find_col(df, ["COY"])
     date_col = _find_col(df, ["Date"])
     category_col = _find_col(df, ["Category"])
-    sub_category_col = _find_col(df, ["Sub Category"])
     type_col = _find_col(df, ["Type"])
     desc_col = _find_col(df, ["Item Description"])
     trx_hash_col = _find_col(df, ["Trx Hash", "TrxHarsh"])

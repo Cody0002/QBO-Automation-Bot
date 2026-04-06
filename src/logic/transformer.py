@@ -27,7 +27,6 @@ COL_ITEM_DESC = "Item Description"
 COL_CO = "CO"
 COL_IN_OUT = "In/Out"
 COL_BANK = "Account Fr"
-COL_SUBCATE = "Sub Category"
 
 def parse_mixed_date(series: pd.Series) -> pd.Series:
     """Parse Excel serial dates and regular date strings safely."""
@@ -380,7 +379,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         elif _is_kzo_case(client_name):
             deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
             # Strictly use 'Sub Category' for the debit side, ignoring 'From Account'
-            deb["Account"] = deb.get("Sub Category", "") 
+            deb["Account"] = deb.get(COL_TYPE, "") 
         # ---------------------
         
         else:

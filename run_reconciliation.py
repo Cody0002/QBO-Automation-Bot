@@ -253,7 +253,7 @@ def process_client_reconcile(
                         "Currency To", "Amount To", "Budget", "USD - Raw", "USD - Actual", 
                         "USD - Loss", "USD - QBO", "Reclass", "QBO Method", 
                         "If Journal/Expense Method", "QBO Transfer Fr", "QBO Transfer To", 
-                        "Check (Internal use)", "No", "Sub Category" # <--- ADD THIS
+                        "Check (Internal use)", "No",# <--- ADD THIS
                     ]
                     
                     # 8. Numeric Cleanup
