@@ -219,7 +219,7 @@ class Reconciler:
                     updates.append({"row_idx": idx, "status": "❌ Journal Not Found in QBO"})
                 continue
 
-            # 3. CHECK HEADER (Date & Memo)
+            # 3. CHECK HEADER (Date only; memo check intentionally skipped)
             header_errors = []
             
             # Date Check
@@ -227,12 +227,6 @@ class Reconciler:
             qbo_date = qbo_record.get("TxnDate")
             if sheet_date != qbo_date:
                 header_errors.append(f"Date Mismatch ({sheet_date} vs {qbo_date})")
-
-            # Memo Check (Loose Match)
-            sheet_memo = str(self._row_get_scalar(first_row, "Memo", "")).strip().lower()
-            qbo_memo = str(qbo_record.get("PrivateNote", "")).strip().lower()
-            if sheet_memo and sheet_memo not in qbo_memo:
-                 header_errors.append(f"Memo Mismatch")
 
             header_status_prefix = "⚠️ " + "; ".join(header_errors) + " | " if header_errors else ""
 
@@ -506,3 +500,4 @@ class Reconciler:
             updates.append({"row_idx": idx, "status": status})
 
         return updates
+

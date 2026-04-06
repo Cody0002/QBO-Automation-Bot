@@ -261,8 +261,12 @@ def process_client_reconcile(
                         if col in raw_df.columns:
                             raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0)
 
-                    # Keep only rows in the target month to avoid cross-month duplicate "No".
-                    raw_df = _filter_raw_df_by_month(raw_df, month_str, client_name)
+                    # Keep only KZP raw rows in the target month to avoid cross-month duplicate "No".
+                    # KZO uses mixed historical layouts, so date filtering is skipped there.
+                    if "kzp" in str(client_name).lower():
+                        raw_df = _filter_raw_df_by_month(raw_df, month_str, client_name)
+                    else:
+                        logger.info(f"   ⏭️ [{client_name}] Raw month filter skipped (enabled only for KZP).")
 
             except Exception as e:
                 logger.error(f"   ⚠️ Failed to read Raw Source: {e}")
