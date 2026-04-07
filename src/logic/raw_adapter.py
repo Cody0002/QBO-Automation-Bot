@@ -262,6 +262,8 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
     out["No"] = no_series
     out["Currency Rate"] = currency_rate
 
+    sub_category_col = "Type"
+    
     if sub_category_col:
         out["Category"] = out["Category"].where(
             _value_series(out["Category"]) != "",
