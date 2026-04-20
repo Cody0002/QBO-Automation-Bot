@@ -356,76 +356,75 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         df_std["Name"] = df_std[COL_ITEM_DESC]
         
         # Standard mapping:
-        # - KZP: Debit uses Type, Credit uses Bank/Account Fr
+        # - KZP: split by sign and use Transfer From/To accounts
         # - KZO: Debit uses Sub Category, Credit uses If Journal/Expense Method
         # - Others: Debit uses Bank/Account Fr, Credit uses If Journal/Expense Method
-        deb = df_std.copy()
-        deb["Amount"] =  safe_to_float(deb[COL_USD]) * -1
-        
         if _is_kzp_case(client_name):
-            deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
-            if COL_TYPE in deb.columns:
-                deb["Account"] = deb[COL_TYPE]
-            else:
-                deb["Account"] = ""
-            if COL_BANK in deb.columns:
-                deb["Account"] = deb["Account"].where(
-                    deb["Account"].astype(str).str.strip() != "",
-                    deb[COL_BANK],
-                )
-                deb["Account"] = deb["Account"].fillna(deb[COL_BANK])
-                
-        # --- NEW KZO LOGIC ---
-        elif _is_kzo_case(client_name):
-            deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
-            # Strictly use 'Sub Category' for the debit side, ignoring 'From Account'
-            deb["Account"] = deb.get(COL_TYPE, "") 
-        # ---------------------
-        
-        else:
-            deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
-            # Fallback for old layouts where debit account sits in Type.
-            if COL_TYPE in deb.columns:
-                deb["Account"] = deb["Account"].where(
-                    deb["Account"].astype(str).str.strip() != "",
-                    deb[COL_TYPE],
-                )
-                deb["Account"] = deb["Account"].fillna(deb[COL_TYPE])
+            kzp_base = df_std.copy().rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
+            amount_abs = safe_to_float(kzp_base[COL_USD]).abs()
 
-        # Fill NA locations with raw CO value
-        deb["Location"] = deb["Location"].fillna(df_std[COL_CO])
-        deb["_LineRole"] = 0
-        
-        # Credit
-        cred = df_std.copy()
-        cred["Amount"] = pd.to_numeric(cred[COL_USD], errors='coerce').fillna(0.0)
-        if _is_kzp_case(client_name):
-            cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
-            if COL_BANK in cred.columns:
-                cred["Account"] = cred[COL_BANK]
-            elif COL_ACC_CR in cred.columns:
-                cred["Account"] = cred[COL_ACC_CR]
-            else:
-                cred["Account"] = ""
-            if COL_ACC_CR in cred.columns:
-                cred["Account"] = cred["Account"].where(
-                    cred["Account"].astype(str).str.strip() != "",
-                    cred[COL_ACC_CR],
+            neg_line = kzp_base.copy()
+            neg_line["Amount"] = -amount_abs
+            neg_line["Account"] = neg_line[COL_TR_FROM] if COL_TR_FROM in neg_line.columns else ""
+            if COL_BANK in neg_line.columns:
+                neg_line["Account"] = neg_line["Account"].where(
+                    neg_line["Account"].astype(str).str.strip() != "",
+                    neg_line[COL_BANK],
                 )
-                cred["Account"] = cred["Account"].fillna(cred[COL_ACC_CR])
-        # --- NEW KZO LOGIC ---
-        elif _is_kzo_case(client_name):
-            cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
-            # Strictly use 'If Journal/Expense Method' for the credit side
-            cred["Account"] = cred.get(COL_ACC_CR, "")
-        # ---------------------
+                neg_line["Account"] = neg_line["Account"].fillna(neg_line[COL_BANK])
+            neg_line["Location"] = neg_line["Location"].fillna(df_std[COL_CO])
+            neg_line["_LineRole"] = 0
+
+            pos_line = kzp_base.copy()
+            pos_line["Amount"] = amount_abs
+            pos_line["Account"] = pos_line[COL_TR_TO] if COL_TR_TO in pos_line.columns else ""
+            if COL_TYPE in pos_line.columns:
+                pos_line["Account"] = pos_line["Account"].where(
+                    pos_line["Account"].astype(str).str.strip() != "",
+                    pos_line[COL_TYPE],
+                )
+                pos_line["Account"] = pos_line["Account"].fillna(pos_line[COL_TYPE])
+            pos_line["Location"] = pos_line["Location"].fillna(df_std[COL_CO])
+            pos_line["_LineRole"] = 1
+
+            processed_std = pd.concat([neg_line, pos_line], ignore_index=True)
         else:
-            cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_ACC_CR: "Account", COL_CO: "Location"})
-        # Fill NA locations with raw CO value
-        cred["Location"] = cred["Location"].fillna(df_std[COL_CO])
-        cred["_LineRole"] = 1
-        
-        processed_std = pd.concat([deb, cred], ignore_index=True)
+            deb = df_std.copy()
+            deb["Amount"] = safe_to_float(deb[COL_USD]) * -1
+
+            if _is_kzo_case(client_name):
+                deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
+                # Strictly use 'Sub Category' for the debit side, ignoring 'From Account'
+                deb["Account"] = deb.get(COL_TYPE, "")
+            else:
+                deb = deb.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
+                # Fallback for old layouts where debit account sits in Type.
+                if COL_TYPE in deb.columns:
+                    deb["Account"] = deb["Account"].where(
+                        deb["Account"].astype(str).str.strip() != "",
+                        deb[COL_TYPE],
+                    )
+                    deb["Account"] = deb["Account"].fillna(deb[COL_TYPE])
+
+            # Fill NA locations with raw CO value
+            deb["Location"] = deb["Location"].fillna(df_std[COL_CO])
+            deb["_LineRole"] = 0
+
+            # Credit
+            cred = df_std.copy()
+            cred["Amount"] = pd.to_numeric(cred[COL_USD], errors='coerce').fillna(0.0)
+            if _is_kzo_case(client_name):
+                cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
+                # Strictly use 'If Journal/Expense Method' for the credit side
+                cred["Account"] = cred.get(COL_ACC_CR, "")
+            else:
+                cred = cred.rename(columns={COL_ITEM_DESC: "Memo", COL_ACC_CR: "Account", COL_CO: "Location"})
+            # Fill NA locations with raw CO value
+            cred["Location"] = cred["Location"].fillna(df_std[COL_CO])
+            cred["_LineRole"] = 1
+
+            processed_std = pd.concat([deb, cred], ignore_index=True)
+
         processed_std = processed_std.sort_values(
             by=["Journal No", "_LineGroupOrder", "_LineRole"],
             kind="stable",
