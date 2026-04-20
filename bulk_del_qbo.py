@@ -148,7 +148,7 @@ if __name__ == "__main__":
     # 1. SETTINGS
     # -------------------------------------------
     # Enter your Company Realm ID here
-    TARGET_REALM_ID = "9341455236416310"  
+    # TARGET_REALM_ID = "9341455236416310"  
     
     # PASTE YOUR IDs HERE (as strings or numbers)
     ids_to_delete = [

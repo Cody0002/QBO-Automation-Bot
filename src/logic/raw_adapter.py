@@ -152,22 +152,13 @@ def _standardize_kzp(df: pd.DataFrame, raw_month: str) -> pd.DataFrame:
     type_vals = col_or_empty(type_col)
     type_vals = type_vals.where(_value_series(type_vals) != "", account_to_filled)
 
-    # For KZP raw, keep COY as-is and only fall back to CO when COY is blank.
-    # This prevents losing values such as "Partners"/"KZO" in Location.
-    location_src = col_or_empty(coy_col)
-    co_src = col_or_empty(co_col)
-    location = location_src.fillna(co_src).astype(str).str.strip()
-    blank_loc = location.eq("") | location.str.lower().isin(["nan", "none", "nat"])
-    fallback = co_src.astype(str).str.strip()
-    location = location.where(~blank_loc, fallback)
-    location = location.replace({"nan": "", "None": "", "NaT": ""})
-
     no_series = pd.to_numeric(col_or_empty(no_col), errors="coerce")
     if no_series.fillna(0).eq(0).all():
         no_series = pd.Series(range(1, len(df) + 1), index=idx, dtype="float64")
 
     out = pd.DataFrame(index=idx)
-    out["CO"] = location
+    # KZP Location/Class should come from CO (not COY).
+    out["CO"] = col_or_empty(co_col)
     out["COY"] = col_or_empty(coy_col)
     out["Date"] = date_series
     out["Category"] = col_or_empty(category_col)
