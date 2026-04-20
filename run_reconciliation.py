@@ -236,7 +236,13 @@ def process_client_reconcile(
             try:
                 if source_url and raw_tab_name:
                     logger.info(f"   📥 [{client_name}] Fetching Raw Source for Validation...")
-                    source_header_row = 5 if "kzdw" in str(client_name).lower() else 1
+                    client_name_lower = str(client_name).lower()
+                    if "kzdw" in client_name_lower:
+                        source_header_row = 5
+                    elif "kzp" in client_name_lower:
+                        source_header_row = 4
+                    else:
+                        source_header_row = 1
                     raw_df = gs.read_as_df(
                         source_url,
                         raw_tab_name,
@@ -458,4 +464,3 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     main(target_client=args.client)
-

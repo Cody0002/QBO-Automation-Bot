@@ -431,7 +431,13 @@ def process_client_control_sheet(
             retry_nos = list(set([k for sub in preserved_ids.values() for k in sub.keys()]))
 
             # 6. Read & Clean Source Data
-            source_header_row = 5 if "kzdw" in client_name.lower() else 1
+            client_name_lower = client_name.lower()
+            if "kzdw" in client_name_lower:
+                source_header_row = 5
+            elif "kzp" in client_name_lower:
+                source_header_row = 4
+            else:
+                source_header_row = 1
             raw_df = gs.read_as_df(
                 source_url,
                 raw_tab_name,

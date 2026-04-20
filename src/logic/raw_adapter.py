@@ -119,14 +119,20 @@ def _standardize_kzp(df: pd.DataFrame, raw_month: str) -> pd.DataFrame:
     coy_col = _find_col(df, ["COY"])
     date_col = _find_col(df, ["Date"])
     category_col = _find_col(df, ["Category"])
-    type_col = _find_col(df, ["Type"])
+    type_col = _find_col(df, ["Type", "Sub Category"])
     desc_col = _find_col(df, ["Item Description"])
-    currency_col = _find_col(df, ["Currency"])
-    transfer_from_col = _find_col(df, ["Fund Transfer From"])
-    bank_col = _find_col(df, ["Bank", "Bank ( To )", "Bank (To)", "Bank To"])
-    amount_col = _find_col(df, ["In/Out (USD)", "In/Out"])
+    trx_hash_col = _find_col(df, ["Trx Hash", "TrxHarsh"])
+    currency_col = _find_col(df, ["Currency", "Currency From"])
+    transfer_from_col = _find_col(
+        df,
+        ["Fund Transfer From", "Transfer from", "Transfer From", "If Transfer method: Fund Transfer From", "From Account"],
+    )
+    transfer_to_col = _find_col(df, ["Transfer to", "Transfer To", "Transfer to ((Can copy from column H )", "To Account"])
+    bank_col = _find_col(df, ["From Account", "Bank", "Bank ( To )", "Bank (To)", "Bank To"])
+    account_to_col = _find_col(df, ["To Account", "If Journal/Expense method: Another records", "If Journal/Expense Method"])
+    amount_col = _find_col(df, ["USD - QBO", "In/Out (USD)", "In/Out", "Amount From", "USD"])
     check_col = _find_col(df, ["Check", "Checking ( For our use only )"])
-    method_col = _find_col(df, ["QBO Import Method (Journal/Expenses/Transfer)", "QBO Method"])
+    method_col = _find_col(df, ["QBO Import", "QBO Import Method (Journal/Expenses/Transfer)", "QBO Method"])
     no_col = _find_col(df, ["No"])
 
     def col_or_empty(col_name: str | None) -> pd.Series:
@@ -136,6 +142,15 @@ def _standardize_kzp(df: pd.DataFrame, raw_month: str) -> pd.DataFrame:
 
     amount = _parse_amount_series(col_or_empty(amount_col))
     date_series = _normalize_kzp_date(col_or_empty(date_col), raw_month)
+    account_from = _value_series(col_or_empty(bank_col))
+    account_to = _value_series(col_or_empty(account_to_col))
+    account_to_filled = account_to.where(account_to != "", account_from)
+    transfer_from = _value_series(col_or_empty(transfer_from_col))
+    transfer_to = _value_series(col_or_empty(transfer_to_col))
+    transfer_from_filled = transfer_from.where(transfer_from != "", account_from)
+    transfer_to_filled = transfer_to.where(transfer_to != "", account_to_filled)
+    type_vals = col_or_empty(type_col)
+    type_vals = type_vals.where(_value_series(type_vals) != "", account_to_filled)
 
     # For KZP raw, keep COY as-is and only fall back to CO when COY is blank.
     # This prevents losing values such as "Partners"/"KZO" in Location.
@@ -156,12 +171,12 @@ def _standardize_kzp(df: pd.DataFrame, raw_month: str) -> pd.DataFrame:
     out["COY"] = col_or_empty(coy_col)
     out["Date"] = date_series
     out["Category"] = col_or_empty(category_col)
-    out["Type"] = col_or_empty(type_col)
+    out["Type"] = type_vals
     out["Item Description"] = col_or_empty(desc_col)
-    out["TrxHarsh"] = ""
-    # KZP journals/expenses should source account from Bank.
-    out["Account Fr"] = col_or_empty(bank_col)
-    out["Account To"] = col_or_empty(bank_col)
+    out["TrxHarsh"] = col_or_empty(trx_hash_col)
+    # KZP journals/expenses should source account from the "from" side.
+    out["Account Fr"] = account_from
+    out["Account To"] = account_to_filled
     out["Currency"] = col_or_empty(currency_col).replace("", "USD")
     out["Amount Fr"] = amount
     out["Currency To"] = ""
@@ -173,9 +188,9 @@ def _standardize_kzp(df: pd.DataFrame, raw_month: str) -> pd.DataFrame:
     out["USD - QBO"] = amount
     out["Reclass"] = ""
     out["QBO Method"] = col_or_empty(method_col)
-    out["If Journal/Expense Method"] = col_or_empty(bank_col)
-    out["QBO Transfer Fr"] = col_or_empty(transfer_from_col)
-    out["QBO Transfer To"] = col_or_empty(bank_col)
+    out["If Journal/Expense Method"] = account_from.where(account_from != "", account_to_filled)
+    out["QBO Transfer Fr"] = transfer_from_filled
+    out["QBO Transfer To"] = transfer_to_filled
     out["Check (Internal use)"] = col_or_empty(check_col)
     out["No"] = no_series
     out["Currency Rate"] = 0.0
@@ -286,9 +301,16 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
     is_kzp_client = "kzp" in client_lower
     is_kzdw_client = "kzdw" in client_lower
     has_kzp_shape = (
-        _find_col(cleaned, ["In/Out (USD)"]) is not None
-        and _find_col(cleaned, ["Bank"]) is not None
-        and _find_col(cleaned, ["USD - QBO"]) is None
+        (
+            _find_col(cleaned, ["In/Out (USD)"]) is not None
+            and _find_col(cleaned, ["Bank"]) is not None
+            and _find_col(cleaned, ["USD - QBO"]) is None
+        )
+        or (
+            _find_col(cleaned, ["USD - QBO"]) is not None
+            and _find_col(cleaned, ["QBO Import"]) is not None
+            and _find_col(cleaned, ["From Account"]) is not None
+        )
     )
     has_kzdw_shape = (
         _find_col(cleaned, ["Final Amount to be take (different currency)"]) is not None
