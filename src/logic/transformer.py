@@ -12,6 +12,8 @@ DEFAULT_JV_PREFIX = "KZO-JV"
 DEFAULT_DOC_PREFIX = "KZO"
 KZP_JV_PREFIX = "KZP-JV"
 KZP_DOC_PREFIX = "KZP"
+S5_JV_PREFIX = "S5-JV"
+S5_DOC_PREFIX = "S5"
 KZDW_JV_PREFIX = "KZDW-JV"
 KZDW_DOC_PREFIX = "KZDW"
 
@@ -142,6 +144,12 @@ def _is_blank(value: Any) -> bool:
 def _is_kzp_case(client_name: str = "") -> bool:
     return "kzp" in str(client_name).lower()
 
+def _is_s5_case(client_name: str = "") -> bool:
+    return "s5" in str(client_name).lower()
+
+def _is_kzp_like_case(client_name: str = "") -> bool:
+    return _is_kzp_case(client_name) or _is_s5_case(client_name)
+
 
 def _is_kzo_case(client_name: str = "") -> bool:
     return "kzo" in str(client_name).lower()
@@ -225,6 +233,8 @@ def _currency_mismatch_error(
 def _build_id_prefixes(client_name: str = "") -> tuple[str, str]:
     if _is_kzp_case(client_name):
         return KZP_JV_PREFIX, KZP_DOC_PREFIX
+    if _is_s5_case(client_name):
+        return S5_JV_PREFIX, S5_DOC_PREFIX
     if _is_kzdw_case(client_name):
         return KZDW_JV_PREFIX, KZDW_DOC_PREFIX
     return DEFAULT_JV_PREFIX, DEFAULT_DOC_PREFIX
@@ -359,7 +369,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         # - KZP: split by sign and use Transfer From/To accounts
         # - KZO: Debit uses Sub Category, Credit uses If Journal/Expense Method
         # - Others: Debit uses Bank/Account Fr, Credit uses If Journal/Expense Method
-        if _is_kzp_case(client_name):
+        if _is_kzp_like_case(client_name):
             kzp_base = df_std.copy().rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
             amount_abs = safe_to_float(kzp_base[COL_USD]).abs()
 
@@ -635,7 +645,7 @@ def process_expenses(df: pd.DataFrame, country: str,
         else:
             mm_yy = row["Payment Date"].strftime("%m%y") if pd.notna(row["Payment Date"]) else "0000"
             start_no += 1 
-            if _is_kzp_case(client_name):
+            if _is_kzp_case(client_name) or _is_s5_case(client_name):
                 ref_nos.append(f"{doc_prefix}{mm_yy}E{str(start_no).zfill(4)}")
             elif _is_kzdw_case(client_name):
                 ref_nos.append(f"{doc_prefix}{mm_yy}E{str(start_no).zfill(4)}")
@@ -757,7 +767,7 @@ def process_transfers(df: pd.DataFrame, country: str,
             dt = pd.to_datetime(row[COL_DATE], errors='coerce')
             date_str = dt.strftime('%m%y') if pd.notna(dt) else "0000"
             start_no += 1
-            if _is_kzp_case(client_name):
+            if _is_kzp_case(client_name) or _is_s5_case(client_name):
                 ref_nos.append(f"{doc_prefix}{date_str}T{str(start_no).zfill(4)}")
             elif _is_kzdw_case(client_name):
                 ref_nos.append(f"{doc_prefix}{date_str}T{str(start_no).zfill(4)}")

@@ -373,6 +373,8 @@ def process_client_control_sheet(
             client_lower = client_name.lower()
             if "kzp" in client_lower:
                 journal_prefix = "KZP-JV"
+            elif "s5" in client_lower:
+                journal_prefix = "S5-JV"
             elif "kzdw" in client_lower:
                 journal_prefix = "KZDW-JV"
             else:
@@ -436,6 +438,8 @@ def process_client_control_sheet(
                 source_header_row = 5
             elif "kzp" in client_name_lower:
                 source_header_row = 4
+            elif "s5" in client_name_lower:
+                source_header_row = 19
             else:
                 source_header_row = 1
             raw_df = gs.read_as_df(

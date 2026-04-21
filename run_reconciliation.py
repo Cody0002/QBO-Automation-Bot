@@ -241,6 +241,8 @@ def process_client_reconcile(
                         source_header_row = 5
                     elif "kzp" in client_name_lower:
                         source_header_row = 4
+                    elif "s5" in client_name_lower:
+                        source_header_row = 19
                     else:
                         source_header_row = 1
                     raw_df = gs.read_as_df(
@@ -267,12 +269,12 @@ def process_client_reconcile(
                         if col in raw_df.columns:
                             raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0)
 
-                    # Keep only KZP raw rows in the target month to avoid cross-month duplicate "No".
+                    # Keep only KZP/S5 raw rows in the target month to avoid cross-month duplicate "No".
                     # KZO uses mixed historical layouts, so date filtering is skipped there.
-                    if "kzp" in str(client_name).lower():
+                    if any(x in str(client_name).lower() for x in ["kzp", "s5"]):
                         raw_df = _filter_raw_df_by_month(raw_df, month_str, client_name)
                     else:
-                        logger.info(f"   ⏭️ [{client_name}] Raw month filter skipped (enabled only for KZP).")
+                        logger.info(f"   ⏭️ [{client_name}] Raw month filter skipped (enabled for KZP/S5 only).")
 
             except Exception as e:
                 logger.error(f"   ⚠️ Failed to read Raw Source: {e}")
