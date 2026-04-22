@@ -295,6 +295,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         is_date_group_workspace = (
             (_is_kzo_case(client_name) and not _is_kzp_case(client_name))
             or _is_kzdw_case(client_name)
+            or _is_s5_case(client_name)
         )
         date_group_map = {}
         if is_date_group_workspace and COL_DATE in df_std.columns:
