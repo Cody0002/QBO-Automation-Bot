@@ -157,19 +157,38 @@ def webhook_listener():
             "client_name",
             "workspace",
             "target",
-            "country",
         ],
     )
+    country = _first_present(data, ["country"])
+    execution_target = target_client or sheet_key
 
-    print(f"\n[Webhook] event={event_type} | sheet_key={sheet_key} | target={target_client}")
+    print(
+        f"\n[Webhook] event={event_type} | sheet_key={sheet_key} | "
+        f"target={target_client} | exec_target={execution_target} | country={country}"
+    )
+
+    if event_type in EVENT_SCRIPT_MAP and (not execution_target):
+        return jsonify(
+            {
+                "status": "error",
+                "message": (
+                    "Invalid payload: no execution target found. "
+                    "Please send 'client_name' (preferred) or 'spreadsheet_id'."
+                ),
+            }
+        ), 400
 
     # 3. Handle Events by queueing per sheet key.
     if event_type in EVENT_SCRIPT_MAP:
-        job_id, queue_key, position = _enqueue_job(event_type, target_client, sheet_key=sheet_key)
+        job_id, queue_key, position = _enqueue_job(
+            event_type,
+            execution_target,
+            sheet_key=sheet_key,
+        )
         return jsonify(
             {
                 "status": "queued",
-                "message": f"Queued {event_type} for {target_client or 'ALL'}",
+                "message": f"Queued {event_type} for {execution_target or 'ALL'}",
                 "job_id": job_id,
                 "sheet_key": queue_key,
                 "position_in_sheet_queue": position,
