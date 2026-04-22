@@ -73,6 +73,17 @@ def _normalize_qbo_method_series(series: pd.Series) -> pd.Series:
 def _clean_headers(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out.columns = [re.sub(r"\s+", " ", str(c).replace("\n", " ").strip()) for c in out.columns]
+    # Deduplicate column names: keep first occurrence, rename subsequent ones with suffix
+    seen: dict[str, int] = {}
+    new_cols = []
+    for col in out.columns:
+        if col in seen:
+            seen[col] += 1
+            new_cols.append(f"{col}._dup{seen[col]}")
+        else:
+            seen[col] = 0
+            new_cols.append(col)
+    out.columns = new_cols
     return out
 
 
@@ -360,7 +371,7 @@ def _standardize_s5(df: pd.DataFrame) -> pd.DataFrame:
     out["TrxHarsh"] = col_or_empty(trx_hash_col)
     out["Account Fr"] = bank_vals.where(bank_vals != "", transfer_from_filled)
     out["Account To"] = transfer_to_filled
-    out["Currency"] = _normalize_currency_series(col_or_empty(currency_col))
+    out["Currency"] = "USD"  # S5 always uses USD in QBO
     out["Amount Fr"] = amount
     out["Currency To"] = ""
     out["Amount To"] = 0.0
