@@ -2,6 +2,8 @@ from __future__ import annotations
 import argparse
 import os
 import time
+import threading
+import queue
 from contextlib import nullcontext
 # --- FIX 1: Load Secrets ---
 from dotenv import load_dotenv
@@ -50,14 +52,74 @@ def _throttle_qbo_call():
     if QBO_SYNC_CALL_DELAY_SEC > 0:
         time.sleep(QBO_SYNC_CALL_DELAY_SEC)
 
-def _flush_updates(gs, spreadsheet_url, tab_name, updates: list, col_ctx: dict | None = None):
-    if not updates:
-        return []
-    logger.info(f"   >>> Flushing {len(updates)} updates to Sheet...")
-    _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates, col_ctx=col_ctx)
-    if QBO_SYNC_PATCH_DELAY_SEC > 0:
-        time.sleep(QBO_SYNC_PATCH_DELAY_SEC)
-    return []
+class AsyncSheetUpdater:
+    """
+    Writes row updates to a sheet on a background thread so QBO push and
+    sheet write-back can run in parallel. Any unrecoverable write error is
+    propagated on close() to avoid false "SYNCED" results.
+    """
+    _STOP = object()
+
+    def __init__(self, gs, spreadsheet_url: str, tab_name: str, col_ctx: dict, batch_size: int):
+        self.gs = gs
+        self.spreadsheet_url = spreadsheet_url
+        self.tab_name = tab_name
+        self.col_ctx = col_ctx
+        self.batch_size = max(1, int(batch_size))
+        self._queue: queue.Queue = queue.Queue()
+        self._error: Exception | None = None
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def enqueue(self, item: dict):
+        self._queue.put(item)
+
+    def _flush_batch(self, batch: list[dict]):
+        if not batch:
+            return
+        logger.info(f"   >>> Flushing {len(batch)} updates to Sheet...")
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                _update_row_status_and_id(
+                    self.gs,
+                    self.spreadsheet_url,
+                    self.tab_name,
+                    batch,
+                    col_ctx=self.col_ctx,
+                )
+                if QBO_SYNC_PATCH_DELAY_SEC > 0:
+                    time.sleep(QBO_SYNC_PATCH_DELAY_SEC)
+                return
+            except Exception as e:
+                last_err = e
+                logger.error(f"Sheet flush failed (attempt {attempt}/3): {e}")
+                time.sleep(0.5 * attempt)
+        raise RuntimeError(
+            f"Failed to write {len(batch)} updates to sheet tab '{self.tab_name}'"
+        ) from last_err
+
+    def _worker(self):
+        batch = []
+        try:
+            while True:
+                item = self._queue.get()
+                if item is self._STOP:
+                    break
+                batch.append(item)
+                if len(batch) >= self.batch_size:
+                    self._flush_batch(batch)
+                    batch = []
+            if batch:
+                self._flush_batch(batch)
+        except Exception as e:
+            self._error = e
+
+    def close(self):
+        self._queue.put(self._STOP)
+        self._thread.join()
+        if self._error:
+            raise self._error
 
 def _build_status_col_ctx(gs, spreadsheet_url, tab_name, headers: list[str]) -> dict:
     """
@@ -103,47 +165,43 @@ def _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates: list, col_
     if not updates:
         return
 
-    try:
-        if not col_ctx:
-            df_header = gs.read_as_df(spreadsheet_url, tab_name)
-            col_ctx = _build_status_col_ctx(gs, spreadsheet_url, tab_name, df_header.columns.tolist())
+    if not col_ctx:
+        df_header = gs.read_as_df(spreadsheet_url, tab_name)
+        col_ctx = _build_status_col_ctx(gs, spreadsheet_url, tab_name, df_header.columns.tolist())
 
-        col_rem = col_ctx["col_rem"]
-        col_id = col_ctx["col_id"]
-        col_link = col_ctx["col_link"]
+    col_rem = col_ctx["col_rem"]
+    col_id = col_ctx["col_id"]
+    col_link = col_ctx["col_link"]
 
-        batch_payload = []
+    batch_payload = []
 
-        for item in updates:
-            row_no = item["row_idx"] + 2
+    for item in updates:
+        row_no = item["row_idx"] + 2
 
-            # Remarks
+        # Remarks
+        batch_payload.append({
+            "row": row_no,
+            "col": col_rem,
+            "val": item["status"]
+        })
+
+        # QBO ID
+        if item.get("qbo_id"):
             batch_payload.append({
                 "row": row_no,
-                "col": col_rem,
-                "val": item["status"]
+                "col": col_id,
+                "val": str(item["qbo_id"])
             })
 
-            # QBO ID
-            if item.get("qbo_id"):
-                batch_payload.append({
-                    "row": row_no,
-                    "col": col_id,
-                    "val": str(item["qbo_id"])
-                })
+        # QBO Link (RAW URL)
+        if item.get("qbo_link"):
+            batch_payload.append({
+                "row": row_no,
+                "col": col_link,
+                "val": item["qbo_link"]
+            })
 
-            # QBO Link (RAW URL)
-            if item.get("qbo_link"):
-                batch_payload.append({
-                    "row": row_no,
-                    "col": col_link,
-                    "val": item["qbo_link"]
-                })
-
-        gs.batch_update_cells(spreadsheet_url, tab_name, batch_payload)
-
-    except Exception as e:
-        logger.error(f"Failed to update status in sheet: {e}")
+    gs.batch_update_cells(spreadsheet_url, tab_name, batch_payload)
 
 def process_client_sync(
     gs: GSheetsClient,
@@ -220,46 +278,39 @@ def process_client_sync(
                 else:
                     all_jv_nos = to_sync["Journal No"].unique().tolist()
                     existing_docs = sync_engine.get_existing_duplicates("JournalEntry", all_jv_nos)
-                    
-                    updates = []
+                    updater = AsyncSheetUpdater(gs, transform_url, tab_jv, col_ctx=col_ctx, batch_size=BATCH_SIZE)
                     section_fail = False
-                    
-                    for jv_no, group in to_sync.groupby("Journal No"):
-                        if str(jv_no) in existing_docs:
-                            already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
-                            for idx in group.index:
-                                updates.append({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
-                            if len(updates) >= BATCH_SIZE:
-                                updates = _flush_updates(gs, transform_url, tab_jv, updates, col_ctx=col_ctx)
-                            continue
+                    try:
+                        for jv_no, group in to_sync.groupby("Journal No"):
+                            if str(jv_no) in existing_docs:
+                                already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+                                for idx in group.index:
+                                    updater.enqueue({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
+                                continue
 
-                        try:
-                            resp = sync_engine.push_journal(jv_no, group)
-                            _throttle_qbo_call()
-                            new_id = resp.get("JournalEntry", {}).get("Id", "")
-                            qbo_link = sync_engine.build_qbo_url("JournalEntry", new_id) if new_id else ""
-                            msg = f"Synced at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                            try:
+                                resp = sync_engine.push_journal(jv_no, group)
+                                _throttle_qbo_call()
+                                new_id = resp.get("JournalEntry", {}).get("Id", "")
+                                qbo_link = sync_engine.build_qbo_url("JournalEntry", new_id) if new_id else ""
+                                msg = f"Synced at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
-                            for idx in group.index:
-                                updates.append({
-                                    "row_idx": idx,
-                                    "status": msg,
-                                    "qbo_id": new_id,
-                                    "qbo_link": qbo_link
-                                })
-                        except Exception as e:
-                            msg = f"ERROR: {str(e)}"
-                            has_error = True
-                            section_fail = True
-                            _throttle_qbo_call()
-                            for idx in group.index:
-                                updates.append({"row_idx": idx, "status": msg, "qbo_id": "", "qbo_link": ""})
-
-                        if len(updates) >= BATCH_SIZE:
-                            updates = _flush_updates(gs, transform_url, tab_jv, updates, col_ctx=col_ctx)
-
-                    if updates:
-                        updates = _flush_updates(gs, transform_url, tab_jv, updates, col_ctx=col_ctx)
+                                for idx in group.index:
+                                    updater.enqueue({
+                                        "row_idx": idx,
+                                        "status": msg,
+                                        "qbo_id": new_id,
+                                        "qbo_link": qbo_link
+                                    })
+                            except Exception as e:
+                                msg = f"ERROR: {str(e)}"
+                                has_error = True
+                                section_fail = True
+                                _throttle_qbo_call()
+                                for idx in group.index:
+                                    updater.enqueue({"row_idx": idx, "status": msg, "qbo_id": "", "qbo_link": ""})
+                    finally:
+                        updater.close()
                     jv_status = "SYNC FAIL" if section_fail else "SYNCED"
         except Exception as e:
             logger.error(f"   ❌ Journal Sync Fail: {e}")
@@ -284,53 +335,47 @@ def process_client_sync(
                     all_exp_nos = to_sync["Exp Ref. No"].unique().tolist()
                     existing_docs = sync_engine.get_existing_duplicates("Purchase", all_exp_nos)
 
-                    updates = []
+                    updater = AsyncSheetUpdater(gs, transform_url, tab_exp, col_ctx=col_ctx, batch_size=BATCH_SIZE)
                     section_fail = False
                     total_rows = len(to_sync)
 
                     # Use enumerate to track progress count
-                    for i, (idx, row_data) in enumerate(to_sync.iterrows()):
-                        if _should_log_progress(i, total_rows):
-                            logger.info(f"   [Expense {i+1}/{total_rows}] Processing Ref: {row_data.get('Exp Ref. No')}...")
+                    try:
+                        for i, (idx, row_data) in enumerate(to_sync.iterrows()):
+                            if _should_log_progress(i, total_rows):
+                                logger.info(f"   [Expense {i+1}/{total_rows}] Processing Ref: {row_data.get('Exp Ref. No')}...")
 
-                        ref_no = str(row_data.get("Exp Ref. No", ""))
-                        
-                        # --- Logic: Check Duplicates ---
-                        if ref_no in existing_docs:
-                            already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
-                            updates.append({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
-                        
-                        # --- Logic: Push to QBO ---
-                        else:
-                            try:
-                                resp = sync_engine.push_expense(ref_no, row_data)
-                                _throttle_qbo_call()
-                                new_id = resp.get("Purchase", {}).get("Id", "")
-                                qbo_link = sync_engine.build_qbo_url("Purchase", new_id) if new_id else ""
-                                msg = f"Synced at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                            ref_no = str(row_data.get("Exp Ref. No", ""))
+                            
+                            # --- Logic: Check Duplicates ---
+                            if ref_no in existing_docs:
+                                already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+                                updater.enqueue({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
+                            
+                            # --- Logic: Push to QBO ---
+                            else:
+                                try:
+                                    resp = sync_engine.push_expense(ref_no, row_data)
+                                    _throttle_qbo_call()
+                                    new_id = resp.get("Purchase", {}).get("Id", "")
+                                    qbo_link = sync_engine.build_qbo_url("Purchase", new_id) if new_id else ""
+                                    msg = f"Synced at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
-                                updates.append({
-                                    "row_idx": idx,
-                                    "status": msg,
-                                    "qbo_id": new_id,
-                                    "qbo_link": qbo_link
-                                })
-                            except Exception as e:
-                                error_msg = f"ERROR: {str(e)}"
-                                logger.error(f"      -> Failed: {error_msg}")
-                                updates.append({"row_idx": idx, "status": error_msg, "qbo_id": "", "qbo_link": ""})
-                                has_error = True
-                                section_fail = True
-                                _throttle_qbo_call()
-                        
-                        # --- NEW: BATCH UPDATE ---
-                        # If we hit the batch size, write to Sheet immediately and clear memory
-                        if len(updates) >= BATCH_SIZE:
-                            updates = _flush_updates(gs, transform_url, tab_exp, updates, col_ctx=col_ctx)
-
-                    # Flush any remaining updates after the loop finishes
-                    if updates:
-                        updates = _flush_updates(gs, transform_url, tab_exp, updates, col_ctx=col_ctx)
+                                    updater.enqueue({
+                                        "row_idx": idx,
+                                        "status": msg,
+                                        "qbo_id": new_id,
+                                        "qbo_link": qbo_link
+                                    })
+                                except Exception as e:
+                                    error_msg = f"ERROR: {str(e)}"
+                                    logger.error(f"      -> Failed: {error_msg}")
+                                    updater.enqueue({"row_idx": idx, "status": error_msg, "qbo_id": "", "qbo_link": ""})
+                                    has_error = True
+                                    section_fail = True
+                                    _throttle_qbo_call()
+                    finally:
+                        updater.close()
 
                     exp_status = "SYNC FAIL" if section_fail else "SYNCED"
         except Exception as e:
@@ -356,47 +401,43 @@ def process_client_sync(
                     all_tr_nos = to_sync["Ref No"].unique().tolist()
                     existing_docs = sync_engine.get_existing_duplicates("Transfer", all_tr_nos)
 
-                    updates = []
+                    updater = AsyncSheetUpdater(gs, transform_url, tab_tr, col_ctx=col_ctx, batch_size=BATCH_SIZE)
                     section_fail = False
                     total_rows = len(to_sync)
 
-                    for i, (idx, row_data) in enumerate(to_sync.iterrows()):
-                        if _should_log_progress(i, total_rows):
-                            logger.info(f"   [Transfer {i+1}/{total_rows}] Processing Ref: {row_data.get('Ref No')}...")
+                    try:
+                        for i, (idx, row_data) in enumerate(to_sync.iterrows()):
+                            if _should_log_progress(i, total_rows):
+                                logger.info(f"   [Transfer {i+1}/{total_rows}] Processing Ref: {row_data.get('Ref No')}...")
 
-                        ref_no = str(row_data.get("Ref No", ""))
+                            ref_no = str(row_data.get("Ref No", ""))
 
-                        if ref_no in existing_docs:
-                            already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
-                            updates.append({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
-                        else:
-                            try:
-                                resp = sync_engine.push_transfer(row_data)
-                                _throttle_qbo_call()
-                                new_id = resp.get("Transfer", {}).get("Id", "")
-                                qbo_link = sync_engine.build_qbo_url("Transfer", new_id) if new_id else ""
-                                msg = f"Synced at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                            if ref_no in existing_docs:
+                                already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+                                updater.enqueue({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
+                            else:
+                                try:
+                                    resp = sync_engine.push_transfer(row_data)
+                                    _throttle_qbo_call()
+                                    new_id = resp.get("Transfer", {}).get("Id", "")
+                                    qbo_link = sync_engine.build_qbo_url("Transfer", new_id) if new_id else ""
+                                    msg = f"Synced at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
-                                updates.append({
-                                    "row_idx": idx,
-                                    "status": msg,
-                                    "qbo_id": new_id,
-                                    "qbo_link": qbo_link
-                                })
-                            except Exception as e:
-                                error_msg = f"ERROR: {str(e)}"
-                                logger.error(f"      -> Failed: {error_msg}")
-                                updates.append({"row_idx": idx, "status": error_msg, "qbo_id": "", "qbo_link": ""})
-                                has_error = True
-                                section_fail = True
-                                _throttle_qbo_call()
-
-                        # --- NEW: BATCH UPDATE ---
-                        if len(updates) >= BATCH_SIZE:
-                            updates = _flush_updates(gs, transform_url, tab_tr, updates, col_ctx=col_ctx)
-
-                    if updates:
-                        updates = _flush_updates(gs, transform_url, tab_tr, updates, col_ctx=col_ctx)
+                                    updater.enqueue({
+                                        "row_idx": idx,
+                                        "status": msg,
+                                        "qbo_id": new_id,
+                                        "qbo_link": qbo_link
+                                    })
+                                except Exception as e:
+                                    error_msg = f"ERROR: {str(e)}"
+                                    logger.error(f"      -> Failed: {error_msg}")
+                                    updater.enqueue({"row_idx": idx, "status": error_msg, "qbo_id": "", "qbo_link": ""})
+                                    has_error = True
+                                    section_fail = True
+                                    _throttle_qbo_call()
+                    finally:
+                        updater.close()
 
                     tr_status = "SYNC FAIL" if section_fail else "SYNCED"
         except Exception as e:
