@@ -301,19 +301,20 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
     return _coerce_standard_numeric_cols(out)
 
 
-def _standardize_s5(df: pd.DataFrame) -> pd.DataFrame:
+def _standardize_s5(df: pd.DataFrame, prefer_secondary_date: bool = False) -> pd.DataFrame:
     idx = df.index
 
     co_col = _find_col(df, ["CO"])
     coy_col = _find_col(df, ["COY"])
     date_col = _find_col(df, ["Date"])
+    date_col_secondary = _find_col(df, ["Date._dup1", "Date.1"])
     category_col = _find_col(df, ["Category"])
-    type_col = _find_col(df, ["Type", "Sub Category"])
+    type_col = _find_col(df, ["Type", "Sub Category", "Sub-category"])
     desc_col = _find_col(df, ["Item Description"])
     trx_hash_col = _find_col(df, ["Trx Hash", "TrxHarsh"])
     currency_col = _find_col(df, ["Currency", "Currency From"])
-    bank_col = _find_col(df, ["Bank", "From Account", "Bank ( To )", "Bank (To)", "Bank To"])
-    amount_final_col = _find_col(df, ["Final Amount to be take (different currency)", "USD - QBO"])
+    bank_col = _find_col(df, ["Bank", "Bank/Crypto", "From Account", "Bank ( To )", "Bank (To)", "Bank To"])
+    amount_final_col = _find_col(df, ["Final Amount to be take (different currency)", "Final Amount", "USD - QBO"])
     amount_inout_col = _find_col(df, ["In/Out (USD)", "In/Out", "Amount From", "USD"])
     transfer_from_col = _find_col(
         df,
@@ -330,6 +331,8 @@ def _standardize_s5(df: pd.DataFrame) -> pd.DataFrame:
         if col_name and col_name in df.columns:
             return df[col_name]
         return pd.Series([""] * len(df), index=idx)
+    
+    chosen_date_col = date_col_secondary if (prefer_secondary_date and date_col_secondary) else date_col
 
     amount_final_raw = col_or_empty(amount_final_col)
     amount_inout_raw = col_or_empty(amount_inout_col)
@@ -364,7 +367,7 @@ def _standardize_s5(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=idx)
     out["CO"] = co_vals
     out["COY"] = coy_vals
-    out["Date"] = col_or_empty(date_col)
+    out["Date"] = col_or_empty(chosen_date_col)
     out["Category"] = col_or_empty(category_col)
     out["Type"] = col_or_empty(type_col)
     out["Item Description"] = col_or_empty(desc_col)
@@ -409,6 +412,7 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
     is_kzp_client = "kzp" in client_lower
     is_s5_client = "s5" in client_lower
     is_kzdw_client = "kzdw" in client_lower
+    is_umber_client = "umber" in client_lower
     has_kzp_shape = (
         (
             _find_col(cleaned, ["In/Out (USD)"]) is not None
@@ -428,13 +432,22 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
     )
     has_s5_shape = (
         _find_col(cleaned, ["CO"]) is not None
-        and _find_col(cleaned, ["QBO Way"]) is not None
-        and _find_col(cleaned, ["Bank"]) is not None
-        and _find_col(cleaned, ["Final Amount to be take (different currency)"]) is not None
+        and (
+            _find_col(cleaned, ["QBO Way"]) is not None
+            or _find_col(cleaned, ["QBO Import"]) is not None
+        )
+        and _find_col(cleaned, ["Bank", "Bank/Crypto"]) is not None
+        and (
+            _find_col(cleaned, ["Final Amount to be take (different currency)"]) is not None
+            or _find_col(cleaned, ["Final Amount"]) is not None
+        )
     )
 
     if is_kzdw_client:
         return _standardize_kzdw(cleaned)
+    if is_umber_client:
+        # Umber exports have two "Date" columns; Q (the second Date) is the source-of-truth date.
+        return _standardize_s5(cleaned, prefer_secondary_date=True)
     if is_s5_client or has_s5_shape:
         return _standardize_s5(cleaned)
     if is_kzp_client or has_kzp_shape:

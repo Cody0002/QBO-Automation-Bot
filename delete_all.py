@@ -100,7 +100,7 @@ if __name__ == "__main__":
     # 1. SETTINGS
     # -------------------------------------------
     # Workspace/Realm ID you provided
-    TARGET_REALM_ID = "9341455236392142"  
+    # TARGET_REALM_ID = "9341455236392142"  
     
     # List of all entity types you want to completely wipe.
     # Note: Adjust this list depending on exactly what you want to wipe. 

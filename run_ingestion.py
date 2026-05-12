@@ -375,6 +375,8 @@ def process_client_control_sheet(
                 journal_prefix = "KZP-JV"
             elif "s5" in client_lower:
                 journal_prefix = "S5-JV"
+            elif "umber" in client_lower:
+                journal_prefix = "UMBER-JV"
             elif "kzdw" in client_lower:
                 journal_prefix = "KZDW-JV"
             else:
@@ -437,6 +439,8 @@ def process_client_control_sheet(
             if "kzdw" in client_name_lower:
                 source_header_row = 5
             elif "kzp" in client_name_lower:
+                source_header_row = 4
+            elif "umber" in client_name_lower:
                 source_header_row = 4
             elif "s5" in client_name_lower:
                 source_header_row = 19
