@@ -10,6 +10,8 @@ import re
 # --- CONSTANTS ---
 DEFAULT_JV_PREFIX = "KZO-JV"
 DEFAULT_DOC_PREFIX = "KZO"
+UMBER_JV_PREFIX = "UMBER-"
+UMBER_DOC_PREFIX = "UMBER"
 KZP_JV_PREFIX = "KZP-JV"
 KZP_DOC_PREFIX = "KZP"
 S5_JV_PREFIX = "S5-JV"
@@ -237,6 +239,8 @@ def _currency_mismatch_error(
 
 
 def _build_id_prefixes(client_name: str = "") -> tuple[str, str]:
+    if _is_umber_case(client_name):
+        return UMBER_JV_PREFIX, UMBER_DOC_PREFIX
     if _is_kzp_case(client_name):
         return KZP_JV_PREFIX, KZP_DOC_PREFIX
     if _is_s5_case(client_name):
@@ -655,7 +659,7 @@ def process_expenses(df: pd.DataFrame, country: str,
         else:
             mm_yy = row["Payment Date"].strftime("%m%y") if pd.notna(row["Payment Date"]) else "0000"
             start_no += 1 
-            if _is_kzp_case(client_name) or _is_s5_case(client_name):
+            if _is_kzp_case(client_name) or _is_s5_case(client_name) or _is_umber_case(client_name):
                 ref_nos.append(f"{doc_prefix}{mm_yy}E{str(start_no).zfill(4)}")
             elif _is_kzdw_case(client_name):
                 ref_nos.append(f"{doc_prefix}{mm_yy}E{str(start_no).zfill(4)}")
@@ -782,7 +786,7 @@ def process_transfers(df: pd.DataFrame, country: str,
             dt = pd.to_datetime(row[COL_DATE], errors='coerce')
             date_str = dt.strftime('%m%y') if pd.notna(dt) else "0000"
             start_no += 1
-            if _is_kzp_case(client_name) or _is_s5_case(client_name):
+            if _is_kzp_case(client_name) or _is_s5_case(client_name) or _is_umber_case(client_name):
                 ref_nos.append(f"{doc_prefix}{date_str}T{str(start_no).zfill(4)}")
             elif _is_kzdw_case(client_name):
                 ref_nos.append(f"{doc_prefix}{date_str}T{str(start_no).zfill(4)}")
