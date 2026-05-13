@@ -147,8 +147,14 @@ def _is_kzp_case(client_name: str = "") -> bool:
 def _is_s5_case(client_name: str = "") -> bool:
     return "s5" in str(client_name).lower()
 
+def _is_umber_case(client_name: str = "") -> bool:
+    return "umber" in str(client_name).lower()
+
+def _is_s5_or_umber_case(client_name: str = "") -> bool:
+    return _is_s5_case(client_name) or _is_umber_case(client_name)
+
 def _is_kzp_like_case(client_name: str = "") -> bool:
-    return _is_kzp_case(client_name) or _is_s5_case(client_name)
+    return _is_kzp_case(client_name) or _is_s5_or_umber_case(client_name)
 
 
 def _is_kzo_case(client_name: str = "") -> bool:
@@ -383,7 +389,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                     neg_line[COL_BANK],
                 )
                 neg_line["Account"] = neg_line["Account"].fillna(neg_line[COL_BANK])
-            neg_line["Location"] = "" if _is_s5_case(client_name) else neg_line["Location"].fillna(df_std[COL_CO])
+            neg_line["Location"] = "" if _is_s5_or_umber_case(client_name) else neg_line["Location"].fillna(df_std[COL_CO])
             neg_line["_LineRole"] = 0
 
             pos_line = kzp_base.copy()
@@ -395,7 +401,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                     pos_line[COL_TYPE],
                 )
                 pos_line["Account"] = pos_line["Account"].fillna(pos_line[COL_TYPE])
-            pos_line["Location"] = "" if _is_s5_case(client_name) else pos_line["Location"].fillna(df_std[COL_CO])
+            pos_line["Location"] = "" if _is_s5_or_umber_case(client_name) else pos_line["Location"].fillna(df_std[COL_CO])
             pos_line["_LineRole"] = 1
 
             processed_std = pd.concat([neg_line, pos_line], ignore_index=True)
@@ -556,17 +562,17 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
             if mismatch_error:
                 return mismatch_error
              
-        if not _is_s5_case(client_name):
+        if not _is_s5_or_umber_case(client_name):
             loc_name = row.get("Location")
             if (not _is_blank(loc_name)) and not find_id_in_map(map_loc, loc_name):
                 return f"ERROR | Location not found: '{loc_name}' | Row No: {row_no}"
         
         return "Ready to sync"
 
-    if _is_s5_case(client_name):
+    if _is_s5_or_umber_case(client_name):
         total_journals["Location"] = ""
     total_journals["Remarks"] = total_journals.apply(validate_journal_row, axis=1)
-    total_journals["Class"] = ""  if _is_s5_case(client_name) else total_journals.get("Location", "").fillna("")
+    total_journals["Class"] = ""  if _is_s5_or_umber_case(client_name) else total_journals.get("Location", "").fillna("")
 
     if _is_kzdw_case(client_name):
         cols_order = ["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Currency Exchange", "Class", "Remarks"]
@@ -670,7 +676,7 @@ def process_expenses(df: pd.DataFrame, country: str,
     d = d.rename(columns=rename_map)
     d["Expense Description"] = d["Memo"]
 
-    if _is_s5_case(client_name):
+    if _is_s5_or_umber_case(client_name):
         d["Location"] = ""
         d["Class"] = ""
     else:
@@ -722,7 +728,7 @@ def process_expenses(df: pd.DataFrame, country: str,
             if mismatch_error:
                 return mismatch_error
              
-        if not _is_s5_case(client_name):
+        if not _is_s5_or_umber_case(client_name):
             loc_name = row.get("Location")
             if (not _is_blank(loc_name)) and not find_id_in_map(map_loc, loc_name):
                 return f"ERROR | Location not in QBO: '{loc_name}' | Row No: {row_no}"
@@ -810,7 +816,7 @@ def process_transfers(df: pd.DataFrame, country: str,
         transfers["Currency Exchange"] = ""
     transfers["Memo"] = transfers["Ref No"] + " - " + transfers["Memo"].astype(str)
     
-    if _is_s5_case(client_name):
+    if _is_s5_or_umber_case(client_name):
         transfers["Location"] = ""
         transfers["Class"] = ""
     else:
@@ -863,7 +869,7 @@ def process_transfers(df: pd.DataFrame, country: str,
         if row["Transfer Funds From"] == row["Transfer Funds To"]: 
             return f"ERROR | 'From' and 'To' Accounts cannot be the same | Row No: {row_no}"
             
-        if not _is_s5_case(client_name):
+        if not _is_s5_or_umber_case(client_name):
             loc_name = row.get("Location")
             if (not _is_blank(loc_name)) and not find_id_in_map(map_loc, loc_name):
                 return f"ERROR | Location not in QBO: '{loc_name}' | Row No: {row_no}"
