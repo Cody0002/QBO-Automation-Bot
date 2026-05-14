@@ -381,21 +381,23 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         # - KZP: split by sign and use Transfer From/To accounts
         # - KZO: Debit uses Sub Category, Credit uses If Journal/Expense Method
         # - Others: Debit uses Bank/Account Fr, Credit uses If Journal/Expense Method
-        if _is_kzp_like_case(client_name):
-            kzp_base = df_std.copy().rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
-            split_base = kzp_base
+        if _is_umber_case(client_name):
+            umber_base = df_std.copy().rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
+            if "Location" not in umber_base.columns:
+                umber_base["Location"] = ""
+            split_base = umber_base
             umber_transfer_lines = pd.DataFrame()
 
             # Umber special case:
             # Category=Transfer rows already come as one negative + one positive source row.
             # Keep each source row as a single journal line and map account from Transfer From/To.
-            if _is_umber_case(client_name) and "Category" in kzp_base.columns:
+            if "Category" in umber_base.columns:
                 transfer_mask = (
-                    kzp_base["Category"].fillna("").astype(str).str.strip().str.lower() == "transfer"
+                    umber_base["Category"].fillna("").astype(str).str.strip().str.lower() == "transfer"
                 )
                 if transfer_mask.any():
-                    umber_transfer_lines = kzp_base[transfer_mask].copy()
-                    split_base = kzp_base[~transfer_mask].copy()
+                    umber_transfer_lines = umber_base[transfer_mask].copy()
+                    split_base = umber_base[~transfer_mask].copy()
 
                     transfer_amount = safe_to_float(umber_transfer_lines[COL_USD])
                     from_vals = umber_transfer_lines[COL_TR_FROM] if COL_TR_FROM in umber_transfer_lines.columns else pd.Series("", index=umber_transfer_lines.index)
@@ -433,7 +435,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                         neg_line[COL_BANK],
                     )
                     neg_line["Account"] = neg_line["Account"].fillna(neg_line[COL_BANK])
-                neg_line["Location"] = "" if _is_s5_or_umber_case(client_name) else neg_line["Location"].fillna(split_base[COL_CO])
+                neg_line["Location"] = ""
                 neg_line["_LineRole"] = 0
 
                 pos_line = split_base.copy()
@@ -445,12 +447,45 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                         pos_line[COL_TYPE],
                     )
                     pos_line["Account"] = pos_line["Account"].fillna(pos_line[COL_TYPE])
-                pos_line["Location"] = "" if _is_s5_or_umber_case(client_name) else pos_line["Location"].fillna(split_base[COL_CO])
+                pos_line["Location"] = ""
                 pos_line["_LineRole"] = 1
 
                 split_lines = pd.concat([neg_line, pos_line], ignore_index=True)
 
             processed_std = pd.concat([split_lines, umber_transfer_lines], ignore_index=True)
+        elif _is_kzp_case(client_name) or _is_s5_case(client_name):
+            kzp_s5_base = df_std.copy().rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"})
+            if "Location" not in kzp_s5_base.columns:
+                kzp_s5_base["Location"] = ""
+            loc_fallback = kzp_s5_base[COL_CO] if COL_CO in kzp_s5_base.columns else ""
+
+            amount_abs = safe_to_float(kzp_s5_base[COL_USD]).abs()
+
+            neg_line = kzp_s5_base.copy()
+            neg_line["Amount"] = -amount_abs
+            neg_line["Account"] = neg_line[COL_TR_FROM] if COL_TR_FROM in neg_line.columns else ""
+            if COL_BANK in neg_line.columns:
+                neg_line["Account"] = neg_line["Account"].where(
+                    neg_line["Account"].astype(str).str.strip() != "",
+                    neg_line[COL_BANK],
+                )
+                neg_line["Account"] = neg_line["Account"].fillna(neg_line[COL_BANK])
+            neg_line["Location"] = "" if _is_s5_case(client_name) else neg_line["Location"].fillna(loc_fallback)
+            neg_line["_LineRole"] = 0
+
+            pos_line = kzp_s5_base.copy()
+            pos_line["Amount"] = amount_abs
+            pos_line["Account"] = pos_line[COL_TR_TO] if COL_TR_TO in pos_line.columns else ""
+            if COL_TYPE in pos_line.columns:
+                pos_line["Account"] = pos_line["Account"].where(
+                    pos_line["Account"].astype(str).str.strip() != "",
+                    pos_line[COL_TYPE],
+                )
+                pos_line["Account"] = pos_line["Account"].fillna(pos_line[COL_TYPE])
+            pos_line["Location"] = "" if _is_s5_case(client_name) else pos_line["Location"].fillna(loc_fallback)
+            pos_line["_LineRole"] = 1
+
+            processed_std = pd.concat([neg_line, pos_line], ignore_index=True)
         else:
             deb = df_std.copy()
             deb["Amount"] = safe_to_float(deb[COL_USD]) * -1
