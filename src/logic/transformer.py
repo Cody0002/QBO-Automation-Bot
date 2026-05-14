@@ -409,27 +409,24 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                     has_from = ~from_txt.isin(blank_tokens)
                     has_to = ~to_txt.isin(blank_tokens)
 
-                    # Umber transfer sign rule:
-                    # - row with Transfer From value => negative amount
-                    # - row with Transfer To value   => positive amount
-                    # - fallback to source sign when both/neither are present
-                    from_only = has_from & ~has_to
-                    to_only = has_to & ~has_from
-
+                    # Umber transfer rule (priority order):
+                    # 1) If Transfer From exists -> use Transfer From account, force negative.
+                    # 2) Else if Transfer To exists -> use Transfer To account, force positive.
+                    # 3) Else fallback to source sign/account inference.
                     umber_transfer_lines["Amount"] = np.where(
-                        from_only,
+                        has_from,
                         -transfer_amount.abs(),
                         np.where(
-                            to_only,
+                            has_to,
                             transfer_amount.abs(),
                             transfer_amount,
                         ),
                     )
                     umber_transfer_lines["Account"] = np.where(
-                        from_only,
+                        has_from,
                         from_vals,
                         np.where(
-                            to_only,
+                            has_to,
                             to_vals,
                             np.where(
                                 transfer_amount < 0,

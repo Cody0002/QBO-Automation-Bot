@@ -318,7 +318,7 @@ def _standardize_s5(df: pd.DataFrame, prefer_secondary_date: bool = False) -> pd
     amount_inout_col = _find_col(df, ["In/Out (USD)", "In/Out", "Amount From", "USD"])
     transfer_from_col = _find_col(
         df,
-        ["Transfer from", "Transfer From", "If Transfer method: Fund Transfer From", "Fund Transfer From"],
+        ["Transfer from", "Transfer From", "If Transfer method: Fund Transfer From", "Fund Transfer From", "Transfer from"],
     )
     transfer_to_col = _find_col(df, ["Transfer to", "Transfer To", "Transfer to ((Can copy from column H )", "To Account"])
     acc_cr_col = _find_col(df, ["If Journal/Expense method: Another records", "If Journal/Expense Method"])
