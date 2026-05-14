@@ -409,29 +409,50 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                     has_from = ~from_txt.isin(blank_tokens)
                     has_to = ~to_txt.isin(blank_tokens)
 
-                    # Umber transfer rule (priority order):
-                    # 1) If Transfer From exists -> use Transfer From account, force negative.
-                    # 2) Else if Transfer To exists -> use Transfer To account, force positive.
-                    # 3) Else fallback to source sign/account inference.
+                    # Umber transfer rule:
+                    # - from_only => negative
+                    # - to_only   => positive
+                    # - both set  => follow source sign (negative=from, positive=to)
+                    # This keeps transfer journal pairs balanced to zero.
+                    from_only = has_from & ~has_to
+                    to_only = has_to & ~has_from
+                    both_set = has_from & has_to
+
                     umber_transfer_lines["Amount"] = np.where(
-                        has_from,
+                        from_only,
                         -transfer_amount.abs(),
                         np.where(
-                            has_to,
+                            to_only,
                             transfer_amount.abs(),
-                            transfer_amount,
+                            np.where(
+                                both_set,
+                                np.where(
+                                    transfer_amount < 0,
+                                    -transfer_amount.abs(),
+                                    np.where(transfer_amount > 0, transfer_amount.abs(), transfer_amount),
+                                ),
+                                transfer_amount,
+                            ),
                         ),
                     )
                     umber_transfer_lines["Account"] = np.where(
-                        has_from,
+                        from_only,
                         from_vals,
                         np.where(
-                            has_to,
+                            to_only,
                             to_vals,
                             np.where(
-                                transfer_amount < 0,
-                                from_vals,
-                                np.where(transfer_amount > 0, to_vals, from_vals.where(has_from, to_vals)),
+                                both_set,
+                                np.where(
+                                    transfer_amount < 0,
+                                    from_vals,
+                                    np.where(transfer_amount > 0, to_vals, from_vals),
+                                ),
+                                np.where(
+                                    transfer_amount < 0,
+                                    from_vals,
+                                    np.where(transfer_amount > 0, to_vals, from_vals.where(has_from, to_vals)),
+                                ),
                             ),
                         ),
                     )
