@@ -402,27 +402,30 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                     transfer_amount = safe_to_float(umber_transfer_lines[COL_USD])
                     from_vals = umber_transfer_lines[COL_TR_FROM] if COL_TR_FROM in umber_transfer_lines.columns else pd.Series("", index=umber_transfer_lines.index)
                     to_vals = umber_transfer_lines[COL_TR_TO] if COL_TR_TO in umber_transfer_lines.columns else pd.Series("", index=umber_transfer_lines.index)
-                    has_from = from_vals.fillna("").astype(str).str.strip() != ""
-                    has_to = to_vals.fillna("").astype(str).str.strip() != ""
+                    from_txt = from_vals.fillna("").astype(str).str.strip().str.lower()
+                    to_txt = to_vals.fillna("").astype(str).str.strip().str.lower()
+                    blank_tokens = {"", "nan", "none", "null", "-"}
+                    has_from = ~from_txt.isin(blank_tokens)
+                    has_to = ~to_txt.isin(blank_tokens)
 
                     # Umber transfer sign rule:
                     # - row with Transfer From value => negative amount
                     # - row with Transfer To value   => positive amount
                     # - fallback to source sign when both/neither are present
                     umber_transfer_lines["Amount"] = np.where(
-                        has_from & ~has_to,
+                        has_from,
                         -transfer_amount.abs(),
                         np.where(
-                            has_to & ~has_from,
+                            has_to,
                             transfer_amount.abs(),
                             transfer_amount,
                         ),
                     )
                     umber_transfer_lines["Account"] = np.where(
-                        has_from & ~has_to,
+                        has_from,
                         from_vals,
                         np.where(
-                            has_to & ~has_from,
+                            has_to,
                             to_vals,
                             np.where(
                                 transfer_amount < 0,
