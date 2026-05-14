@@ -405,7 +405,19 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                     has_from = from_vals.fillna("").astype(str).str.strip() != ""
                     has_to = to_vals.fillna("").astype(str).str.strip() != ""
 
-                    umber_transfer_lines["Amount"] = transfer_amount
+                    # Umber transfer sign rule:
+                    # - row with Transfer From value => negative amount
+                    # - row with Transfer To value   => positive amount
+                    # - fallback to source sign when both/neither are present
+                    umber_transfer_lines["Amount"] = np.where(
+                        has_from & ~has_to,
+                        -transfer_amount.abs(),
+                        np.where(
+                            has_to & ~has_from,
+                            transfer_amount.abs(),
+                            transfer_amount,
+                        ),
+                    )
                     umber_transfer_lines["Account"] = np.where(
                         has_from & ~has_to,
                         from_vals,
