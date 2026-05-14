@@ -459,6 +459,20 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                     umber_transfer_lines["Location"] = ""
                     umber_transfer_lines["_LineRole"] = 0
 
+                    # TEMP DEBUG: inspect Umber transfer sign/account mapping row-by-row.
+                    debug_df = pd.DataFrame(
+                        {
+                            "No": umber_transfer_lines.get("No", ""),
+                            "TransferFr": from_vals,
+                            "TransferTo": to_vals,
+                            "SrcAmount": transfer_amount,
+                            "FinalAmount": umber_transfer_lines["Amount"],
+                            "PickedAccount": umber_transfer_lines["Account"],
+                        }
+                    )
+                    print("   [DEBUG][UMBER][Transfer Journal Mapping]")
+                    print(debug_df.to_string(index=False))
+
             split_lines = pd.DataFrame()
             if not split_base.empty:
                 amount_abs = safe_to_float(split_base[COL_USD]).abs()
