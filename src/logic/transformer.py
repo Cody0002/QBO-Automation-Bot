@@ -65,6 +65,7 @@ def _normalize_df_headers(df: pd.DataFrame) -> pd.DataFrame:
         "QBO Import Method (Journal/Expenses/Transfer)": COL_METHOD,
         "If Journal/Expense method: Another records": COL_ACC_CR,
         "If Transfer method: Fund Transfer From": COL_TR_FROM,
+        "Transfer from": COL_TR_FROM,
         "Transfer to ((Can copy from column H )": COL_TR_TO,
         "Transfer to": COL_TR_TO,
         "USD": COL_USD  
