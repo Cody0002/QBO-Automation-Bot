@@ -206,6 +206,126 @@ def _build_currency_exchange_series(
         out.loc[usd_mask & out.isna()] = 1.0
     return out
 
+
+def _format_no_with_suffix(no_value: Any, suffix: str) -> str:
+    raw = str(no_value).strip()
+    if raw == "" or raw.lower() in {"nan", "none", "null"}:
+        return suffix.lstrip(".")
+
+    numeric = pd.to_numeric(pd.Series([no_value]), errors="coerce").iloc[0]
+    if pd.notna(numeric):
+        if np.isclose(float(numeric), round(float(numeric)), atol=1e-9):
+            base = str(int(round(float(numeric))))
+        else:
+            base = raw.rstrip("0").rstrip(".")
+            if base == "":
+                base = raw
+    else:
+        base = raw
+    return f"{base}{suffix}"
+
+
+def _append_umber_transfer_residual_lines(umber_transfer_lines: pd.DataFrame) -> pd.DataFrame:
+    """
+    For Umber Journal Transfer rows in USDT/USDC:
+    - group by day
+    - when row count >= 2 and source USD sum != 0
+    - pair each positive with the closest negative by amount
+    - if positive remainder exists, append one extra line:
+      No=<base>.1, Account=Payment/Banking, Amount=<remainder>
+    """
+    if umber_transfer_lines is None or umber_transfer_lines.empty:
+        return umber_transfer_lines
+
+    required_cols = {COL_DATE, "Amount"}
+    if not required_cols.issubset(set(umber_transfer_lines.columns)):
+        return umber_transfer_lines
+
+    category_mask = pd.Series(True, index=umber_transfer_lines.index)
+    if "Category" in umber_transfer_lines.columns:
+        category_vals = umber_transfer_lines["Category"].fillna("").astype(str).str.strip().str.lower()
+        category_mask = category_vals.isin({"transfer", "transfers"})
+
+    if "Currency" in umber_transfer_lines.columns:
+        currency_vals = umber_transfer_lines["Currency"].fillna("").astype(str).str.strip().str.upper()
+        currency_mask = currency_vals.isin({"USDT", "USDC"})
+    else:
+        currency_mask = pd.Series(False, index=umber_transfer_lines.index)
+
+    eligible_mask = category_mask & currency_mask
+    eligible = umber_transfer_lines[eligible_mask].copy()
+    if eligible.empty:
+        return umber_transfer_lines
+
+    eligible["_DateKey"] = pd.to_datetime(eligible[COL_DATE], errors="coerce", dayfirst=True).dt.normalize()
+    residual_rows = []
+    suffix_counts: dict[str, int] = {}
+
+    for _, grp in eligible.groupby("_DateKey", sort=False):
+        if grp.empty or len(grp) < 2:
+            continue
+
+        if COL_USD in grp.columns:
+            day_sum = safe_to_float(grp[COL_USD]).sum()
+        else:
+            day_sum = safe_to_float(grp["Amount"]).sum()
+
+        if np.isclose(day_sum, 0.0, atol=1e-3):
+            continue
+
+        grp_sorted = grp.sort_values(by=["_LineGroupOrder"], kind="stable") if "_LineGroupOrder" in grp.columns else grp
+        positives: list[tuple[int, float]] = []
+        negatives: list[tuple[int, float]] = []
+        for idx, row in grp_sorted.iterrows():
+            amt = float(row.get("Amount", 0) or 0)
+            if amt > 1e-9:
+                positives.append((idx, amt))
+            elif amt < -1e-9:
+                negatives.append((idx, abs(amt)))
+
+        if not positives or not negatives:
+            continue
+
+        used_neg_positions: set[int] = set()
+        for pos_idx, pos_amt in positives:
+            best_pos = None
+            best_diff = None
+            for neg_pos, (_, neg_amt) in enumerate(negatives):
+                if neg_pos in used_neg_positions:
+                    continue
+                diff = abs(pos_amt - neg_amt)
+                if best_diff is None or diff < best_diff:
+                    best_diff = diff
+                    best_pos = neg_pos
+
+            if best_pos is None:
+                break
+
+            used_neg_positions.add(best_pos)
+            neg_amt = negatives[best_pos][1]
+            remain = round(abs(pos_amt - neg_amt), 2)
+            if remain <= 0:
+                continue
+
+            base_row = umber_transfer_lines.loc[pos_idx].copy()
+            base_no = str(base_row.get("No", "")).strip()
+            suffix_counts.setdefault(base_no, 0)
+            suffix_counts[base_no] += 1
+            suffix = f".{suffix_counts[base_no]}"
+
+            base_row["No"] = _format_no_with_suffix(base_row.get("No", ""), suffix)
+            base_row["Account"] = "Payment/Banking"
+            base_row["Amount"] = remain
+            base_row["Location"] = ""
+            base_row["_LineRole"] = 2
+            residual_rows.append(base_row)
+
+    if not residual_rows:
+        return umber_transfer_lines
+
+    residual_df = pd.DataFrame(residual_rows)
+    return pd.concat([umber_transfer_lines, residual_df], ignore_index=True)
+
 def _account_currency_from_id(qbo_mappings: Dict[str, dict], account_id: str | None) -> str | None:
     if not account_id:
         return None
@@ -311,7 +431,11 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         )
         date_group_map = {}
         if is_date_group_workspace and COL_DATE in df_std.columns:
-            grouped_dates = pd.to_datetime(df_std[COL_DATE], errors="coerce").dt.normalize()
+            grouped_dates = pd.to_datetime(
+                df_std[COL_DATE],
+                errors="coerce",
+                dayfirst=_is_umber_case(client_name),
+            ).dt.normalize()
         else:
             grouped_dates = pd.Series(pd.NaT, index=df_std.index)
 
@@ -394,7 +518,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
             # Keep each source row as a single journal line and map account from Transfer From/To.
             if "Category" in umber_base.columns:
                 transfer_mask = (
-                    umber_base["Category"].fillna("").astype(str).str.strip().str.lower() == "transfer"
+                    umber_base["Category"].fillna("").astype(str).str.strip().str.lower().isin({"transfer", "transfers"})
                 )
                 if transfer_mask.any():
                     umber_transfer_lines = umber_base[transfer_mask].copy()
@@ -489,6 +613,8 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
                     )
                     print("   [DEBUG][UMBER][Transfer Journal Mapping]")
                     print(debug_df.to_string(index=False))
+
+                    umber_transfer_lines = _append_umber_transfer_residual_lines(umber_transfer_lines)
 
             split_lines = pd.DataFrame()
             if not split_base.empty:

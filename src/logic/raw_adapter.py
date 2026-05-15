@@ -301,7 +301,11 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
     return _coerce_standard_numeric_cols(out)
 
 
-def _standardize_s5(df: pd.DataFrame, prefer_secondary_date: bool = False) -> pd.DataFrame:
+def _standardize_s5(
+    df: pd.DataFrame,
+    prefer_secondary_date: bool = False,
+    preserve_source_currency: bool = False,
+) -> pd.DataFrame:
     idx = df.index
 
     co_col = _find_col(df, ["CO"])
@@ -374,7 +378,11 @@ def _standardize_s5(df: pd.DataFrame, prefer_secondary_date: bool = False) -> pd
     out["TrxHarsh"] = col_or_empty(trx_hash_col)
     out["Account Fr"] = bank_vals.where(bank_vals != "", transfer_from_filled)
     out["Account To"] = transfer_to_filled
-    out["Currency"] = "USD"  # S5 always uses USD in QBO
+    if preserve_source_currency:
+        raw_currency = _value_series(col_or_empty(currency_col)).str.upper()
+        out["Currency"] = raw_currency.where(raw_currency != "", "USD")
+    else:
+        out["Currency"] = "USD"  # S5 always uses USD in QBO
     out["Amount Fr"] = amount
     out["Currency To"] = ""
     out["Amount To"] = 0.0
@@ -447,7 +455,7 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
         return _standardize_kzdw(cleaned)
     if is_umber_client:
         # Umber exports have two "Date" columns; Q (the second Date) is the source-of-truth date.
-        return _standardize_s5(cleaned, prefer_secondary_date=True)
+        return _standardize_s5(cleaned, prefer_secondary_date=True, preserve_source_currency=True)
     if is_s5_client or has_s5_shape:
         return _standardize_s5(cleaned)
     if is_kzp_client or has_kzp_shape:
