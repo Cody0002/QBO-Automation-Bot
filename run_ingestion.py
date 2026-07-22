@@ -29,6 +29,10 @@ from src.utils.run_lock import single_instance_lock
 
 logger = setup_logger("ingestion")
 
+# Temporary KZDW hold: keep these COY values in Pending Amount Nos until their
+# posting logic is confirmed. Clear this set to release them on the next run.
+KZDW_FORCED_PENDING_COY_VALUES = {"TD"}
+
 def parse_mixed_date(series: pd.Series) -> pd.Series:
     """Parse Excel serial dates and regular date strings safely."""
     numeric = pd.to_numeric(series, errors="coerce")
@@ -126,6 +130,24 @@ def _cap_pending_nos(vals: set[int], max_processed_no: int) -> set[int]:
     if max_processed_no <= 0:
         return set()
     return {x for x in vals if 0 < x <= max_processed_no}
+
+def _get_kzdw_forced_pending_mask(raw_df: pd.DataFrame, client_name: str) -> pd.Series:
+    """Return rows temporarily held from processing for KZDW."""
+    mask = pd.Series(False, index=raw_df.index, dtype=bool)
+    if "kzdw" not in str(client_name).lower() or "COY" not in raw_df.columns:
+        return mask
+
+    normalized_coy = raw_df["COY"].fillna("").astype(str).str.strip().str.upper()
+    return normalized_coy.isin(KZDW_FORCED_PENDING_COY_VALUES)
+
+def _pending_nos_for_control(
+    current_pending_nos: set[int],
+    max_processed_no: int,
+    forced_pending_nos: set[int],
+) -> set[int]:
+    """Keep ordinary pending Nos behind the checkpoint plus every forced hold."""
+    valid_forced_nos = {x for x in forced_pending_nos if x > 0}
+    return _cap_pending_nos(current_pending_nos, max_processed_no) | valid_forced_nos
 
 def _safe_int(val) -> int:
     """Coerce sheet values like 1234, 1234.0, '1,234' into int safely."""
@@ -516,14 +538,21 @@ def process_client_control_sheet(
             method_non_blank = raw_df[method_col].notna() & (raw_df[method_col].str.strip() != "")
             amt_numeric = raw_df[amount_col] # Already converted to numeric in Step 8
 
-            # ---> A. Identify Pending Rows (Method exists, but amount is 0)
+            # Temporary KZDW hold: COY=TD stays pending regardless of amount/method.
+            forced_pending_mask = _get_kzdw_forced_pending_mask(raw_df, client_name)
+
+            # ---> A. Identify Pending Rows (zero amount or a client-specific hold)
             pending_amount_mask = method_non_blank & (amt_numeric == 0)
+            pending_mask = pending_amount_mask | forced_pending_mask
             current_pending_nos = set(
-                int(x) for x in raw_df.loc[pending_amount_mask, "No"].astype(int).tolist() if int(x) > 0
+                int(x) for x in raw_df.loc[pending_mask, "No"].astype(int).tolist() if int(x) > 0
+            )
+            forced_pending_nos = set(
+                int(x) for x in raw_df.loc[forced_pending_mask, "No"].astype(int).tolist() if int(x) > 0
             )
 
-            # ---> B. Identify Ready Rows (Method exists, and amount is NOT 0)
-            ready_mask = method_non_blank & (amt_numeric != 0)
+            # ---> B. Identify Ready Rows (method/amount ready and not on hold)
+            ready_mask = method_non_blank & (amt_numeric != 0) & ~forced_pending_mask
             ready_df = raw_df[ready_mask].copy()
 
             # 10a. Strictly new rows (No > last_processed)
@@ -533,13 +562,15 @@ def process_client_control_sheet(
             late_filled_df = raw_df[
                 (raw_df["No"] <= last_processed) &
                 (raw_df["No"].isin(previous_pending_nos)) &
-                method_non_blank
+                method_non_blank &
+                ~forced_pending_mask
             ].copy()
 
             # 10c. Always retry old ERROR rows from transform outputs.
             retry_df = raw_df[
                 raw_df["No"].isin(retry_nos) &
-                method_non_blank
+                method_non_blank &
+                ~forced_pending_mask
             ].copy()
 
             processing_df = (
@@ -551,11 +582,13 @@ def process_client_control_sheet(
             no_numeric = pd.to_numeric(raw_df["No"], errors="coerce").fillna(0).astype(int)
             no_method_count = int((~method_non_blank).sum())
             zero_amount_count = int((method_non_blank & (amt_numeric == 0)).sum())
-            positive_amt_count = int((method_non_blank & (amt_numeric != 0)).sum())
+            forced_pending_count = int(forced_pending_mask.sum())
+            positive_amt_count = int(ready_mask.sum())
             eligible_old_done_count = int(
                 ((no_numeric <= last_processed) &
                  (~no_numeric.isin(previous_pending_nos)) &
                  (~no_numeric.isin(retry_nos)) &
+                 (~forced_pending_mask) &
                  (method_non_blank & (amt_numeric != 0))).sum()
             )
             logger.info(
@@ -566,13 +599,16 @@ def process_client_control_sheet(
             logger.info(
                 f"   🔍 [{client_name}] Step 10 Detail -> No Method: {no_method_count}, "
                 f"Zero Amount(Pending): {zero_amount_count}, Ready Rows: {positive_amt_count}, "
+                f"KZDW COY=TD(Pending): {forced_pending_count}, "
                 f"Eligible Old & done: {eligible_old_done_count}, Last Processed Row: {last_processed}"
             )
             # -------------------------
 
             if processing_df.empty:
                 logger.info(f"   [{client_name}] No new rows to process.")
-                pending_to_write = _cap_pending_nos(current_pending_nos, last_processed)
+                pending_to_write = _pending_nos_for_control(
+                    current_pending_nos, last_processed, forced_pending_nos
+                )
                 _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {
                     settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(), 
                     COL_PENDING_AMOUNT_NOS: _serialize_no_set(pending_to_write), # <-- ADDED
@@ -645,7 +681,9 @@ def process_client_control_sheet(
 
             # 15. Final Updates to Control Sheet
             final_last_row = max(last_processed, result.max_row_processed) if result.max_row_processed else last_processed
-            pending_to_write = _cap_pending_nos(current_pending_nos, final_last_row)
+            pending_to_write = _pending_nos_for_control(
+                current_pending_nos, final_last_row, forced_pending_nos
+            )
 
             updates = {
                 settings.CTRL_COL_LAST_PROCESSED_ROW: final_last_row,
