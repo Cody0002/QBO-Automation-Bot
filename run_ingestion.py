@@ -30,8 +30,9 @@ from src.utils.run_lock import single_instance_lock
 logger = setup_logger("ingestion")
 
 # Temporary KZDW hold: keep these COY values in Pending Amount Nos until their
-# posting logic is confirmed. Clear this set to release them on the next run.
-KZDW_FORCED_PENDING_COY_VALUES = {"TD"}
+# posting logic is confirmed. Empty = nothing held; add a COY value (e.g. "TD")
+# to hold it again. COY=TD was released after its posting logic was confirmed.
+KZDW_FORCED_PENDING_COY_VALUES: set[str] = set()
 
 def parse_mixed_date(series: pd.Series) -> pd.Series:
     """Parse Excel serial dates and regular date strings safely."""
@@ -538,7 +539,7 @@ def process_client_control_sheet(
             method_non_blank = raw_df[method_col].notna() & (raw_df[method_col].str.strip() != "")
             amt_numeric = raw_df[amount_col] # Already converted to numeric in Step 8
 
-            # Temporary KZDW hold: COY=TD stays pending regardless of amount/method.
+            # Temporary KZDW hold: held COY values stay pending regardless of amount/method.
             forced_pending_mask = _get_kzdw_forced_pending_mask(raw_df, client_name)
 
             # ---> A. Identify Pending Rows (zero amount or a client-specific hold)
@@ -599,7 +600,7 @@ def process_client_control_sheet(
             logger.info(
                 f"   🔍 [{client_name}] Step 10 Detail -> No Method: {no_method_count}, "
                 f"Zero Amount(Pending): {zero_amount_count}, Ready Rows: {positive_amt_count}, "
-                f"KZDW COY=TD(Pending): {forced_pending_count}, "
+                f"KZDW Held COY(Pending): {forced_pending_count}, "
                 f"Eligible Old & done: {eligible_old_done_count}, Last Processed Row: {last_processed}"
             )
             # -------------------------
