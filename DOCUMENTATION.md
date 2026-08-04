@@ -216,7 +216,7 @@ All entry points load `config/secrets.env` via `python-dotenv`.
 3. For each Control row where **Transform** = `READY`:
    - **Create Transform File** if Transform File URL is missing (and copy permissions from Control Sheet).
    - **Retry handling:** Detect rows with Remarks containing "ERROR" or "Unbalance" in Journals/Expenses/Transfers tabs; collect row numbers to delete and existing IDs to preserve.
-   - **Read raw data** from Source File, specified Tab Name (header row 1, unformatted values). Restrict to first 25 columns and assign standard column names (CO, COY, Date, Category, Type, Item Description, … USD - QBO, QBO Method, … No).
+   - **Read raw data** from Source File, specified Tab Name (header row 1 for KZO, unformatted values), then normalize it to the canonical raw schema. Legacy KZO tabs retain their positional mapping; KZP, KZDW, S5, UMBER, and the KZO Thailand AA layout use header-based mappings.
    - **Filters:** Exclude rows where "Check (Internal use)" contains "exclude"; filter by month (from Month column) using date range.
    - **Selection:** New rows (No > Last Processed Row) plus retry rows; then **delete** bad rows from output tabs and **run** `transform_raw(...)` with `last_jv`, `last_exp`, `last_tr`, `qbo_mappings`, and `existing_ids`.
    - **Write outputs** to Transform File: append or create tabs `{Country} {Month} - Journals`, `- Expenses`, `- Transfers` (using template tabs from Control Sheet if present).
@@ -230,6 +230,10 @@ All entry points load `config/secrets.env` via `python-dotenv`.
 - **Expenses:** Rows with QBO Method containing "Expense"; generates Exp Ref. No, Account (Cr), Expense Account (Dr), Payment Date, Expense Line Amount; validates and sets Remarks.
 - **Transfers:** Rows with QBO Method containing "Transfer"; generates Ref No, Transfer Funds From/To, Transfer Amount; validates and sets Remarks.
 - **ID generation:** Journals use prefix `KZO-JV` and running number; expenses `KZO{country}{mm yy}E…`; transfers `KZO{country}{mm yy}T…`. Retry rows keep existing IDs from `existing_ids`.
+
+### KZO Thailand source layout
+
+The KZO Thailand (`COY = TH`) source format has 27 columns (`A:AA`). Its final fields are `Transfer from` (X), `Transfer to` (Y), `Checking ( For our use only )` (Z), and `No.` (AA). The adapter maps this format by normalized header name, so the additional `Transacted Amount Check` and `Variance Check` columns do not shift `USD - QBO`, QBO method/account fields, or `No.`. The legacy KZO positional format remains supported.
 
 ---
 

@@ -133,6 +133,48 @@ def _standardize_legacy(df: pd.DataFrame) -> pd.DataFrame:
     return _coerce_standard_numeric_cols(out)
 
 
+def _standardize_kzo_th(df: pd.DataFrame) -> pd.DataFrame:
+    """Map the header-based KZO Thailand layout, where ``No.`` is column AA."""
+    idx = df.index
+
+    aliases = {
+        "CO": ["CO"],
+        "COY": ["COY"],
+        "Date": ["Date"],
+        "Category": ["Category"],
+        "Type": ["Sub Category", "Type"],
+        "Item Description": ["Item Description"],
+        "TrxHarsh": ["Trx Hash", "TrxHarsh"],
+        "Account Fr": ["From Account"],
+        "Account To": ["To Account"],
+        "Currency": ["Currency From", "Currency"],
+        "Amount Fr": ["Amount From"],
+        "Currency To": ["Currency To"],
+        "Amount To": ["Amount To"],
+        "Budget": ["Budget Rate"],
+        "USD - Raw": ["USD"],
+        "USD - Actual": ["Actual USD Transacted"],
+        "USD - Loss": ["Realised Loss"],
+        "USD - QBO": ["USD - QBO"],
+        "Reclass": ["Reclass/To check"],
+        "QBO Method": ["QBO Import Method (Journal/Expenses/Transfer)"],
+        "If Journal/Expense Method": ["If Journal/Expense method: Another records"],
+        "QBO Transfer Fr": ["Transfer from"],
+        "QBO Transfer To": ["Transfer to"],
+        "Check (Internal use)": ["Checking ( For our use only )"],
+        "No": ["No", "No."],
+    }
+
+    out = pd.DataFrame(index=idx)
+    for canonical_name, source_aliases in aliases.items():
+        source_col = _find_col(df, source_aliases)
+        out[canonical_name] = df[source_col] if source_col else ""
+
+    # KZO posts in USD; exchange rates are only consumed by the KZDW path.
+    out["Currency Rate"] = 0.0
+    return _coerce_standard_numeric_cols(out.reindex(columns=RAW_STANDARD_COLUMNS, fill_value=""))
+
+
 def _standardize_kzp(df: pd.DataFrame, raw_month: str) -> pd.DataFrame:
     idx = df.index
 
@@ -421,6 +463,14 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
     is_s5_client = "s5" in client_lower
     is_kzdw_client = "kzdw" in client_lower
     is_umber_client = "umber" in client_lower
+    is_kzo_client = "kzo" in client_lower
+    has_kzo_th_shape = (
+        _find_col(cleaned, ["Transacted Amount Check"]) is not None
+        and _find_col(cleaned, ["Variance Check"]) is not None
+        and _find_col(cleaned, ["USD - QBO"]) is not None
+        and _find_col(cleaned, ["QBO Import Method (Journal/Expenses/Transfer)"]) is not None
+        and _find_col(cleaned, ["No", "No."]) is not None
+    )
     has_kzp_shape = (
         (
             _find_col(cleaned, ["In/Out (USD)"]) is not None
@@ -453,6 +503,8 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
 
     if is_kzdw_client:
         return _standardize_kzdw(cleaned)
+    if is_kzo_client and has_kzo_th_shape:
+        return _standardize_kzo_th(cleaned)
     if is_umber_client:
         # Umber exports have two "Date" columns; Q (the second Date) is the source-of-truth date.
         return _standardize_s5(cleaned, prefer_secondary_date=True, preserve_source_currency=True)
