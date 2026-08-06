@@ -216,7 +216,7 @@ All entry points load `config/secrets.env` via `python-dotenv`.
 3. For each Control row where **Transform** = `READY`:
    - **Create Transform File** if Transform File URL is missing (and copy permissions from Control Sheet).
    - **Retry handling:** Detect rows with Remarks containing "ERROR" or "Unbalance" in Journals/Expenses/Transfers tabs; collect row numbers to delete and existing IDs to preserve.
-   - **Read raw data** from Source File, specified Tab Name (header row 1 for KZO, unformatted values), then normalize it to the canonical raw schema. Legacy KZO tabs retain their positional mapping; KZP, KZDW, S5, UMBER, and the KZO Thailand AA layout use header-based mappings.
+   - **Read raw data** from Source File, specified Tab Name (header row 1 for KZO, unformatted values), then normalize it to the canonical raw schema. KZO (all countries), KZP, KZDW, S5, and UMBER use header-based mappings; only unrecognizable legacy tabs fall back to positional mapping.
    - **Filters:** Exclude rows where "Check (Internal use)" contains "exclude"; filter by month (from Month column) using date range.
    - **Selection:** New rows (No > Last Processed Row) plus retry rows; then **delete** bad rows from output tabs and **run** `transform_raw(...)` with `last_jv`, `last_exp`, `last_tr`, `qbo_mappings`, and `existing_ids`.
    - **Write outputs** to Transform File: append or create tabs `{Country} {Month} - Journals`, `- Expenses`, `- Transfers` (using template tabs from Control Sheet if present).
@@ -231,9 +231,33 @@ All entry points load `config/secrets.env` via `python-dotenv`.
 - **Transfers:** Rows with QBO Method containing "Transfer"; generates Ref No, Transfer Funds From/To, Transfer Amount; validates and sets Remarks.
 - **ID generation:** Journals use prefix `KZO-JV` and running number; expenses `KZO{country}{mm yy}E…`; transfers `KZO{country}{mm yy}T…`. Retry rows keep existing IDs from `existing_ids`.
 
-### KZO Thailand source layout
+### KZO source layout (all countries)
 
-The KZO Thailand (`COY = TH`) source format has 27 columns (`A:AA`). Its final fields are `Transfer from` (X), `Transfer to` (Y), `Checking ( For our use only )` (Z), and `No.` (AA). The adapter maps this format by normalized header name, so the additional `Transacted Amount Check` and `Variance Check` columns do not shift `USD - QBO`, QBO method/account fields, or `No.`. The legacy KZO positional format remains supported.
+Every KZO country tab (BR, TH, …) shares one header set, so `standardize_raw_df` maps KZO by **normalized header name**, never by column position. The 2026 layout spans `A:AA`:
+
+| Col | Header | Col | Header |
+| --- | --- | --- | --- |
+| A | `CO` | O | `Actual USD Transacted` |
+| B | `COY` | P | `Realised Loss` |
+| C | `Date` | Q | `Transacted Amount Check` |
+| D | `Category` | R | `Variance Check` |
+| E | `Sub Category` | S | `USD - QBO` |
+| F | `Item Description` | T | `Reclass/To check` |
+| G | `TrxHash` | U | `QBO Import Method (Journal/Expenses/Transfer)` |
+| H | `From Account` | V | `If Journal/Expense method: Another records` |
+| I | `To Account` | W | `Transfer from` |
+| J | `Currency From` | X | `Transfer to` |
+| K | `Amount From` | Y | *(reserved)* |
+| L | `Currency To` | Z | `Checking ( For our use only )` |
+| M | `Amount To` | AA | row number (**header cell is blank**) |
+| N | `Budget Rate` / `USD` | | |
+
+Two properties of this layout drive the adapter:
+
+- `Transacted Amount Check` (Q) and `Variance Check` (R) were inserted mid-sheet in 2026. Header-based mapping means they do **not** shift `USD - QBO`, the QBO method/account fields, or the row number.
+- The row-number column at `AA` normally ships with an **empty header cell**, so it cannot be found by name. `_resolve_kzo_no_col()` takes the column immediately right of `Checking ( For our use only )` when no `No` / `No.` header exists; a real `No.` header still wins when present. Columns from `AB` onward hold dropdown-helper values and are ignored.
+
+Pre-2026 KZO tabs (same headers, without `Transacted Amount Check` / `Variance Check`) go through the same header-based path. Tabs whose headers are not recognizable at all still fall back to the legacy positional mapping (first 26 columns → `RAW_STANDARD_COLUMNS`).
 
 ---
 

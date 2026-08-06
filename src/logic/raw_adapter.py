@@ -43,7 +43,8 @@ def _find_col(df: pd.DataFrame, aliases: Iterable[str]) -> str | None:
     by_norm = {_norm_name(c): c for c in df.columns}
     for alias in aliases:
         real = by_norm.get(_norm_name(alias))
-        if real:
+        # Column names can legitimately be "" (blank header cell), so test for None.
+        if real is not None:
             return real
     return None
 
@@ -133,42 +134,80 @@ def _standardize_legacy(df: pd.DataFrame) -> pd.DataFrame:
     return _coerce_standard_numeric_cols(out)
 
 
-def _standardize_kzo_th(df: pd.DataFrame) -> pd.DataFrame:
-    """Map the header-based KZO Thailand layout, where ``No.`` is column AA."""
+KZO_CHECK_ALIASES = ["Checking ( For our use only )", "Check (Internal use)", "Check"]
+
+KZO_METHOD_ALIASES = [
+    "QBO Import Method (Journal/Expenses/Transfer)",
+    "QBO Import Method",
+    "QBO Method",
+]
+
+# Canonical name -> source header aliases for the KZO country tabs. Mapping by header
+# name (instead of position) keeps the pipeline stable when analysts insert helper
+# columns such as "Transacted Amount Check" / "Variance Check" mid-sheet.
+KZO_COLUMN_ALIASES: dict[str, list[str]] = {
+    "CO": ["CO"],
+    "COY": ["COY"],
+    "Date": ["Date"],
+    "Category": ["Category"],
+    "Type": ["Sub Category", "Type"],
+    "Item Description": ["Item Description"],
+    "TrxHarsh": ["TrxHash", "Trx Hash", "TrxHarsh"],
+    "Account Fr": ["From Account", "Account Fr"],
+    "Account To": ["To Account", "Account To"],
+    "Currency": ["Currency From", "Currency"],
+    "Amount Fr": ["Amount From", "Amount Fr"],
+    "Currency To": ["Currency To"],
+    "Amount To": ["Amount To"],
+    "Budget": ["Budget Rate", "Budget"],
+    "USD - Raw": ["USD", "USD - Raw"],
+    "USD - Actual": ["Actual USD Transacted", "USD - Actual"],
+    "USD - Loss": ["Realised Loss", "Realized Loss", "USD - Loss"],
+    "USD - QBO": ["USD - QBO"],
+    "Reclass": ["Reclass/To check", "Reclass"],
+    "QBO Method": KZO_METHOD_ALIASES,
+    "If Journal/Expense Method": [
+        "If Journal/Expense method: Another records",
+        "If Journal/Expense Method",
+    ],
+    "QBO Transfer Fr": ["Transfer from", "Transfer From", "QBO Transfer Fr"],
+    "QBO Transfer To": ["Transfer to", "Transfer To", "QBO Transfer To"],
+    "Check (Internal use)": KZO_CHECK_ALIASES,
+}
+
+
+def _resolve_kzo_no_col(df: pd.DataFrame) -> str | None:
+    """Locate the row-number column of a KZO country tab.
+
+    Exports frequently ship the row-number column with an empty header cell (it sits
+    right of "Checking ( For our use only )"), so a name lookup alone is not enough.
+    """
+    named = _find_col(df, ["No", "No."])
+    if named is not None:
+        return named
+
+    columns = list(df.columns)
+    anchor = _find_col(df, KZO_CHECK_ALIASES)
+    if anchor is None or anchor not in columns:
+        return None
+
+    position = columns.index(anchor) + 1
+    if position >= len(columns):
+        return None
+    return columns[position]
+
+
+def _standardize_kzo(df: pd.DataFrame) -> pd.DataFrame:
+    """Map the header-based KZO country layout (BR/TH/... share the same headers)."""
     idx = df.index
 
-    aliases = {
-        "CO": ["CO"],
-        "COY": ["COY"],
-        "Date": ["Date"],
-        "Category": ["Category"],
-        "Type": ["Sub Category", "Type"],
-        "Item Description": ["Item Description"],
-        "TrxHarsh": ["Trx Hash", "TrxHarsh"],
-        "Account Fr": ["From Account"],
-        "Account To": ["To Account"],
-        "Currency": ["Currency From", "Currency"],
-        "Amount Fr": ["Amount From"],
-        "Currency To": ["Currency To"],
-        "Amount To": ["Amount To"],
-        "Budget": ["Budget Rate"],
-        "USD - Raw": ["USD"],
-        "USD - Actual": ["Actual USD Transacted"],
-        "USD - Loss": ["Realised Loss"],
-        "USD - QBO": ["USD - QBO"],
-        "Reclass": ["Reclass/To check"],
-        "QBO Method": ["QBO Import Method (Journal/Expenses/Transfer)"],
-        "If Journal/Expense Method": ["If Journal/Expense method: Another records"],
-        "QBO Transfer Fr": ["Transfer from"],
-        "QBO Transfer To": ["Transfer to"],
-        "Check (Internal use)": ["Checking ( For our use only )"],
-        "No": ["No", "No."],
-    }
-
     out = pd.DataFrame(index=idx)
-    for canonical_name, source_aliases in aliases.items():
+    for canonical_name, source_aliases in KZO_COLUMN_ALIASES.items():
         source_col = _find_col(df, source_aliases)
-        out[canonical_name] = df[source_col] if source_col else ""
+        out[canonical_name] = df[source_col] if source_col is not None else ""
+
+    no_col = _resolve_kzo_no_col(df)
+    out["No"] = df[no_col] if no_col is not None else ""
 
     # KZO posts in USD; exchange rates are only consumed by the KZDW path.
     out["Currency Rate"] = 0.0
@@ -452,7 +491,8 @@ def _standardize_s5(
 def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -> pd.DataFrame:
     """
     Convert incoming raw data into the canonical schema expected by
-    transform/reconcile logic. Handles legacy KZO layout and custom KZP/S5 layouts.
+    transform/reconcile logic. Handles the header-based KZO country layout, the
+    legacy positional KZO layout, and custom KZP/KZDW/S5/UMBER layouts.
     """
     if raw_df is None or raw_df.empty:
         return pd.DataFrame(columns=RAW_STANDARD_COLUMNS)
@@ -464,12 +504,15 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
     is_kzdw_client = "kzdw" in client_lower
     is_umber_client = "umber" in client_lower
     is_kzo_client = "kzo" in client_lower
-    has_kzo_th_shape = (
-        _find_col(cleaned, ["Transacted Amount Check"]) is not None
-        and _find_col(cleaned, ["Variance Check"]) is not None
+    # All KZO country tabs share one header set, so map them by name rather than by
+    # position. "No" is deliberately not required here: its header cell is usually blank
+    # and it is resolved positionally from the "Checking" anchor instead.
+    has_kzo_header_shape = (
+        _find_col(cleaned, ["CO"]) is not None
+        and _find_col(cleaned, ["COY"]) is not None
         and _find_col(cleaned, ["USD - QBO"]) is not None
-        and _find_col(cleaned, ["QBO Import Method (Journal/Expenses/Transfer)"]) is not None
-        and _find_col(cleaned, ["No", "No."]) is not None
+        and _find_col(cleaned, KZO_METHOD_ALIASES) is not None
+        and _find_col(cleaned, KZO_CHECK_ALIASES) is not None
     )
     has_kzp_shape = (
         (
@@ -503,8 +546,8 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
 
     if is_kzdw_client:
         return _standardize_kzdw(cleaned)
-    if is_kzo_client and has_kzo_th_shape:
-        return _standardize_kzo_th(cleaned)
+    if is_kzo_client and has_kzo_header_shape:
+        return _standardize_kzo(cleaned)
     if is_umber_client:
         # Umber exports have two "Date" columns; Q (the second Date) is the source-of-truth date.
         return _standardize_s5(cleaned, prefer_secondary_date=True, preserve_source_currency=True)

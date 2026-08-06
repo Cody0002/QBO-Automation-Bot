@@ -69,6 +69,21 @@ A raw row is held in `Pending Amount Nos` (not pushed to QBO) when it has a `QBO
 but `USD - QBO` is 0. Once the amount is filled in, the next run picks the row up
 automatically, even though its `No.` is already below `Last Processed Row`.
 
+### KZO source tabs (all countries)
+
+KZO country tabs (BR, TH, …) share one header set and are mapped **by header name**, not by
+column position, so analysts can insert helper columns without breaking ingestion. The 2026
+layout added `Transacted Amount Check` (Q) and `Variance Check` (R) mid-sheet; these no longer
+shift `USD - QBO`, the QBO method/account fields, or the row number.
+
+The row-number column sits at **AA**, immediately right of `Checking ( For our use only )`, and
+its header cell is usually **blank**. The adapter resolves it from that position when no `No` /
+`No.` header exists. Columns from `AB` onward are dropdown-helper values and are ignored.
+
+Pre-2026 KZO tabs (same headers, without the two check columns) work unchanged. See
+`src/logic/raw_adapter.py` (`_standardize_kzo`, `_resolve_kzo_no_col`) and the
+"KZO source layout" section in `DOCUMENTATION.md`.
+
 ### KZDW temporary COY hold
 
 `run_ingestion.py` has a manual switch for holding KZDW rows by `COY` value:
