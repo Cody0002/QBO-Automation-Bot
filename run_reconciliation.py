@@ -162,6 +162,41 @@ def _filter_raw_df_by_month(raw_df: pd.DataFrame, month_str: str, client_name: s
             "Raw Reconcile will be skipped."
         )
     return filtered
+
+def _summarize_orphan_rows(orphan_rows: list[dict], last_processed_no: int, max_note_len: int = 2000) -> tuple[str, list[str]]:
+    """
+    Groups Reconciler.find_orphaned_raw_rows() results by (entity, date, amount) into one
+    line per group instead of one per row. A single batch of identical rows is almost always
+    the same underlying cause, and listing every row individually both floods the logs and
+    can blow past Sheets' 50,000-char/cell limit for a large batch -- which previously failed
+    the whole control-sheet write and aborted the rest of that client's reconcile run.
+
+    Returns (control_sheet_note, log_lines).
+    """
+    groups: dict[tuple[str, str, float], list[int]] = {}
+    for o in orphan_rows:
+        groups.setdefault((o["entity_type"], o["date"], o["amount"]), []).append(o["no"])
+
+    note_parts = []
+    log_lines = []
+    for (etype, o_date, amount), nos in sorted(groups.items()):
+        nos.sort()
+        no_label = str(nos[0]) if len(nos) == 1 else f"{nos[0]}-{nos[-1]}"
+        count_label = "" if len(nos) == 1 else f" x{len(nos)}"
+        log_lines.append(
+            f"Possible skipped row(s): No {no_label}{count_label} ({etype}, {o_date}, "
+            f"${amount:,.2f}) have no matching entry in transform but are at/below the "
+            f"checkpoint (Last Processed Row {last_processed_no}). Add "
+            f"{'these Nos' if len(nos) > 1 else 'this No'} to 'Pending Amount Nos' to safely "
+            f"reprocess without touching Last Processed Row."
+        )
+        note_parts.append(f"{no_label}{count_label} ({etype}, {o_date}, ${amount:,.2f})")
+
+    note = "; ".join(note_parts)
+    if len(note) > max_note_len:
+        note = note[: max_note_len - 25].rsplit(";", 1)[0] + "; ... (truncated, see logs)"
+    return note, log_lines
+
 # ==============================================================================
 # LOGIC: PROCESS ONE CLIENT
 # ==============================================================================
@@ -395,16 +430,10 @@ def process_client_reconcile(
             has_issue = True
 
         if orphan_rows:
-            note_parts = []
-            for o in orphan_rows:
-                logger.warning(
-                    f"   ⚠️ [{client_name}] Possible skipped row: No {o['no']} ({o['entity_type']}, "
-                    f"{o['date']}, ${o['amount']:,.2f}) has no matching entry in transform but is at/"
-                    f"below the checkpoint (Last Processed Row {last_processed_no}). Add {o['no']} to "
-                    f"'Pending Amount Nos' to safely reprocess it without touching Last Processed Row."
-                )
-                note_parts.append(f"{o['no']} ({o['entity_type']}, {o['date']}, ${o['amount']:,.2f})")
-            row_updates[settings.CTRL_COL_ORPHAN_ROWS_NOTE] = "; ".join(note_parts)
+            note, log_lines = _summarize_orphan_rows(orphan_rows, last_processed_no)
+            for line in log_lines:
+                logger.warning(f"   ⚠️ [{client_name}] {line}")
+            row_updates[settings.CTRL_COL_ORPHAN_ROWS_NOTE] = note
             has_issue = True
         else:
             row_updates[settings.CTRL_COL_ORPHAN_ROWS_NOTE] = ""
@@ -413,7 +442,12 @@ def process_client_reconcile(
         row_updates[CTRL_COL_RECONCILE] = final
         row_updates["Last Sync At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, row_updates)
+        try:
+            _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, row_updates)
+        except Exception as e:
+            # Never let a control-sheet write failure (e.g. a cell-size/API error) abort the
+            # rest of this client's rows -- log it and move on to the next row.
+            logger.error(f"   ❌ [{client_name}] Failed to write control-sheet updates for row {row_num}: {e}")
         logger.info(f"✅ [{client_name}] Reconcile Complete: {final}")
 
 

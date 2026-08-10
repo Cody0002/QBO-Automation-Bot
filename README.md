@@ -120,7 +120,12 @@ are unaffected):
   already in `Pending Amount Nos`) — the row is silently never posted. Every reconcile run,
   `Reconciler.find_orphaned_raw_rows` scans "ready" raw rows (real amount, method set) at or
   below the checkpoint and flags any whose Date+Amount don't appear anywhere in that month's
-  transform tab, e.g. `50 (Journal, 2026-07-10, $1,250.00)`. **To recover a flagged row:**
+  transform tab, e.g. `50 (Journal, 2026-07-10, $1,250.00)`. Flagged rows sharing the same
+  entity/date/amount are grouped into one line (e.g. `7310039-7310045 x7 (Transfer,
+  2026-07-31, $3,038.82)`) and the note is capped at ~2000 characters — a bare list, one line
+  per row, can blow past Sheets' 50,000-char/cell limit for a large batch and fail the whole
+  write; the run itself never aborts on a control-sheet write failure either way (that write
+  is wrapped separately from the per-entity reconcile steps). **To recover a flagged row:**
   add its `No.` to `Pending Amount Nos` on that Control Sheet row — `run_ingestion.py`'s
   existing late-filled path picks it up on the next run without touching `Last Processed Row`
   (which would otherwise reprocess the whole range and risk duplicate postings). The note
