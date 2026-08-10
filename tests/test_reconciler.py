@@ -90,6 +90,58 @@ class RawVsTransformEstNoTests(unittest.TestCase):
 
         self.assertEqual(updates[0]["status"], "Unmatched: Amt Diff (999.00 vs 50.00)")
 
+    def test_excel_serial_raw_dates_are_parsed(self):
+        # Raw is read with value_render_option='UNFORMATTED_VALUE', so real raw Date cells
+        # arrive as bare Excel serial numbers, not date strings. Naive pd.to_datetime()
+        # silently mis-parses a bare number as Unix-epoch nanoseconds instead of erroring,
+        # so this must be handled explicitly or every date+amount match silently fails.
+        serial = (pd.Timestamp("2026-07-31") - pd.Timestamp("1899-12-30")).days
+        raw_rows = [
+            {"No": 100, "Date": float(serial), "USD - QBO": 999.00},
+            {"No": 101, "Date": float(serial), "USD - QBO": 50.00},
+        ]
+        transform_rows = [
+            {"No": 100, "Date": "2026-07-31", "Amount": 50.00, "Account": "Bank"},
+        ]
+
+        updates = self._run(raw_rows, transform_rows)
+
+        self.assertIn("est. No: 101", updates[0]["status"])
+        self.assertNotIn("nearby match", updates[0]["status"])
+
+    def test_nearby_no_fallback_when_date_unparseable(self):
+        # Real source data isn't always clean; when the raw/transform Date can't be
+        # normalized, fall back to scanning Nos near the old No for an amount-only match
+        # -- the same manual check an analyst does by hand.
+        raw_rows = [
+            {"No": 7310129, "Date": "not-a-date", "USD - QBO": 999.00},
+            {"No": 7310130, "Date": "not-a-date", "USD - QBO": 111.00},
+            {"No": 7310132, "Date": "not-a-date", "USD - QBO": 14398.50},
+        ]
+        transform_rows = [
+            {"No": 7310131, "Date": "not-a-date", "Amount": 14398.50, "Account": "Bank"},
+        ]
+
+        updates = self._run(raw_rows, transform_rows)
+
+        self.assertIn("est. No: 7310132", updates[0]["status"])
+        self.assertIn("nearby match", updates[0]["status"])
+
+    def test_nearby_no_fallback_respects_window(self):
+        # A candidate far outside the neighborhood window should not be offered even if
+        # the amount happens to match -- too likely to be an unrelated coincidence.
+        raw_rows = [
+            {"No": 7310129, "Date": "not-a-date", "USD - QBO": 999.00},
+            {"No": 7320500, "Date": "not-a-date", "USD - QBO": 14398.50},
+        ]
+        transform_rows = [
+            {"No": 7310131, "Date": "not-a-date", "Amount": 14398.50, "Account": "Bank"},
+        ]
+
+        updates = self._run(raw_rows, transform_rows)
+
+        self.assertIn("est. No: not found", updates[0]["status"])
+
     def test_missing_client_name_is_unaffected(self):
         raw_rows = [
             {"No": 100, "Date": "2026-07-31", "USD - QBO": 999.00},

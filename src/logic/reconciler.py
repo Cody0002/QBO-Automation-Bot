@@ -98,9 +98,26 @@ class Reconciler:
         return raw
 
     def _normalize_date_str(self, val) -> str:
-        """Best-effort 'YYYY-MM-DD' normalization; '' if unparseable."""
+        """Best-effort 'YYYY-MM-DD' normalization; '' if unparseable.
+
+        Raw sheets are read with value_render_option='UNFORMATTED_VALUE', so raw Date
+        cells arrive as bare Excel serial numbers (e.g. 45871.0), not date strings.
+        pd.to_datetime() on a bare number defaults to Unix-epoch nanoseconds, which
+        silently produces the wrong date instead of erroring -- so that case must be
+        special-cased before falling back to normal string/datetime parsing.
+        """
+        val = self._coerce_scalar(val)
+        if val is None or val == "":
+            return ""
+
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            if not (20000 <= val <= 90000):
+                return ""
+            dt = pd.to_datetime(val, unit="D", origin="1899-12-30", errors="coerce")
+            return "" if pd.isna(dt) else dt.strftime("%Y-%m-%d")
+
         try:
-            dt = pd.to_datetime(self._coerce_scalar(val), errors="coerce")
+            dt = pd.to_datetime(val, errors="coerce")
         except Exception:
             return ""
         if pd.isna(dt):
@@ -515,6 +532,11 @@ class Reconciler:
             x in client_name_lower for x in ("kzp", "s5", "umber", "kzdw")
         )
         if is_kzo:
+            # A shift is usually just a row or two inserted/deleted near the affected 'No',
+            # so when exact content matching can't place it, look at nearby raw Nos too
+            # (mirrors how an analyst would manually check the neighborhood by hand).
+            NEARBY_NO_WINDOW = 10
+
             transform_date_col = "Payment Date" if entity_type == "Purchase" else "Date"
             transform_date_by_key: dict[int, str] = {}
             if transform_date_col in transform_df.columns:
@@ -525,23 +547,22 @@ class Reconciler:
 
             claimed_nos = {k for k, v in status_map.items() if v == "Matched"}
 
-            if transform_date_by_key and "Date" in raw_clean.columns:
-                raw_lookup = raw_clean.reset_index()
-                raw_lookup["_DateNorm"] = raw_lookup.apply(
-                    lambda r: self._normalize_date_str(self._row_get_scalar(r, "Date", "")), axis=1
-                )
-                raw_lookup["_AmtAbs"] = raw_lookup.apply(
-                    lambda r: abs(self._safe_float(self._row_get_scalar(r, "USD - QBO", 0))), axis=1
-                )
+            raw_lookup = raw_clean.reset_index()
+            raw_lookup["_DateNorm"] = raw_lookup.apply(
+                lambda r: self._normalize_date_str(self._row_get_scalar(r, "Date", "")), axis=1
+            )
+            raw_lookup["_AmtAbs"] = raw_lookup.apply(
+                lambda r: abs(self._safe_float(self._row_get_scalar(r, "USD - QBO", 0))), axis=1
+            )
 
-                for no_val, status in list(status_map.items()):
-                    if not status.startswith("Unmatched"):
-                        continue
-                    t_date = transform_date_by_key.get(no_val, "")
-                    if not t_date:
-                        continue
-                    sheet_abs = abs(self._safe_float(transform_agg.get(no_val, 0)))
+            for no_val, status in list(status_map.items()):
+                if not status.startswith("Unmatched"):
+                    continue
+                sheet_abs = abs(self._safe_float(transform_agg.get(no_val, 0)))
+                t_date = transform_date_by_key.get(no_val, "")
 
+                candidates: list[int] = []
+                if t_date:
                     pool = raw_lookup[
                         (~raw_lookup["_Key"].isin(claimed_nos))
                         & (raw_lookup["_DateNorm"] == t_date)
@@ -549,13 +570,28 @@ class Reconciler:
                     ]
                     candidates = sorted(set(int(x) for x in pool["_Key"].tolist()))
 
-                    if len(candidates) == 1:
-                        status_map[no_val] = f"{status} -> est. No: {candidates[0]}"
-                    elif len(candidates) == 0:
-                        status_map[no_val] = f"{status} -> est. No: not found (row may be deleted)"
-                    else:
-                        preview = ", ".join(str(c) for c in candidates[:5])
-                        status_map[no_val] = f"{status} -> est. No: ambiguous ({preview})"
+                approx = False
+                if not candidates:
+                    # Fallback: same 'No' neighborhood, amount-only match. Covers rows
+                    # whose raw Date is blank/unparseable, or a date that just doesn't
+                    # line up (source data isn't always clean).
+                    nearby_pool = raw_lookup[
+                        (~raw_lookup["_Key"].isin(claimed_nos))
+                        & (raw_lookup["_Key"] != no_val)
+                        & ((raw_lookup["_Key"] - no_val).abs() <= NEARBY_NO_WINDOW)
+                        & ((raw_lookup["_AmtAbs"] - sheet_abs).abs() <= 0.05)
+                    ]
+                    candidates = sorted(set(int(x) for x in nearby_pool["_Key"].tolist()))
+                    approx = bool(candidates)
+
+                suffix = " (nearby match, verify)" if approx else ""
+                if len(candidates) == 1:
+                    status_map[no_val] = f"{status} -> est. No: {candidates[0]}{suffix}"
+                elif len(candidates) == 0:
+                    status_map[no_val] = f"{status} -> est. No: not found (row may be deleted)"
+                else:
+                    preview = ", ".join(str(c) for c in candidates[:5])
+                    status_map[no_val] = f"{status} -> est. No: ambiguous ({preview}){suffix}"
 
         # 4. Broadcast
         for idx, row in transform_df.iterrows():

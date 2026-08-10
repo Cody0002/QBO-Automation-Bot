@@ -609,15 +609,17 @@ def process_client_control_sheet(
                         expected_month = int(parsed_raw_month.month)
 
                     note_parts = []
+                    nearby_window = 3
                     for stale_no in sorted(stale_pending_nos):
                         hint_text = _decode_kzo_no(stale_no, expected_month) or "undecodable"
+                        nearby_range = f"{stale_no - nearby_window}-{stale_no + nearby_window}"
                         logger.warning(
                             f"   ⚠️ [{client_name}] Pending No {stale_no} not found in current raw "
                             f"({tab_prefix}) — decoded as {hint_text}. A row may have been "
-                            f"inserted/removed for that date in the raw tab; it likely shifted to "
-                            f"a nearby No."
+                            f"inserted/removed for that date in the raw tab; check Nos {nearby_range} "
+                            f"for the shifted row."
                         )
-                        note_parts.append(f"{stale_no} ({hint_text}, missing)")
+                        note_parts.append(f"{stale_no} ({hint_text}, missing — check {nearby_range})")
                     pending_nos_note = "; ".join(note_parts)
 
             # ---> B. Identify Ready Rows (method/amount ready and not on hold)

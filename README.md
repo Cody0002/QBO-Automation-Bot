@@ -99,15 +99,19 @@ are unaffected):
   `Reconciler.reconcile_raw_vs_transform` flags a row `Unmatched: Amt Diff (...)` or
   `Unmatched: Missing in Raw`, it searches the current raw tab for an unclaimed row with the
   same Date + Amount as the transform row (which is ground truth, captured before any later
-  shift) and appends a hint, e.g. `-> est. No: 7310132`. If nothing matches it appends
+  shift) and appends a hint, e.g. `-> est. No: 7310132`. Raw is read with
+  `UNFORMATTED_VALUE`, so raw Date cells are Excel serial numbers, not strings — the matcher
+  handles that directly. If the Date can't be matched (blank/unparseable), it falls back to
+  scanning raw Nos within +/-10 of the old No for an amount-only match — the same
+  neighborhood an analyst would check by hand — and tags the result
+  `-> est. No: 7310132 (nearby match, verify)`. If nothing matches at all it appends
   `-> est. No: not found (row may be deleted)`; if more than one row matches it appends
   `-> est. No: ambiguous (101, 102)` and needs a manual look.
 - **Ingestion (`Pending Nos Note` column, Control sheet).** A `No.` held in
   `Pending Amount Nos` (see below) has no snapshot to re-match by content — if it disappears
   from raw entirely between runs, `run_ingestion.py` logs a warning and writes a note like
-  `7310132 (7/31 seq #132, missing)` decoded from the formula's date prefix, so the analyst
-  knows which date to check for an inserted/removed row. The note clears itself once nothing
-  is stale.
+  `7310132 (7/31 seq #132, missing — check 7310129-7310135)`, decoded from the formula's date
+  prefix plus a +/-3 No range to manually check. The note clears itself once nothing is stale.
 
 ### KZDW temporary COY hold
 
