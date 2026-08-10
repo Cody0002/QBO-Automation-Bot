@@ -92,7 +92,7 @@ zero-padded running count of same-date rows above it. Inserting or deleting a ro
 in a KZO country tab therefore renumbers every later row that shares that same date — the
 transaction didn't change, only its `No.` did.
 
-Two places surface this automatically (KZO only; other clients don't use this formula and
+Three places surface this automatically (KZO only; other clients don't use this formula and
 are unaffected):
 
 - **Reconciliation (`Raw Reconcile` column, transform sheet).** When
@@ -105,13 +105,26 @@ are unaffected):
   scanning raw Nos within +/-10 of the old No for an amount-only match — the same
   neighborhood an analyst would check by hand — and tags the result
   `-> est. No: 7310132 (nearby match, verify)`. If nothing matches at all it appends
-  `-> est. No: not found (row may be deleted)`; if more than one row matches it appends
-  `-> est. No: ambiguous (101, 102)` and needs a manual look.
+  `-> est. No: not found (row may be deleted)`. If several rows match on Date+Amount, the
+  one numerically closest to the old No wins (a shift only ever moves a row by a handful of
+  positions) — only a genuine tie (two candidates equally close) falls back to
+  `-> est. No: ambiguous (101, 102)`, which needs a manual look.
 - **Ingestion (`Pending Nos Note` column, Control sheet).** A `No.` held in
   `Pending Amount Nos` (see below) has no snapshot to re-match by content — if it disappears
   from raw entirely between runs, `run_ingestion.py` logs a warning and writes a note like
   `7310132 (7/31 seq #132, missing — check 7310129-7310135)`, decoded from the formula's date
   prefix plus a +/-3 No range to manually check. The note clears itself once nothing is stale.
+- **Reconciliation (`Possibly Skipped Rows` column, Control sheet).** A shift can also push a
+  brand-new, real transaction's `No.` down to or below `Last Processed Row`, where
+  `run_ingestion.py` will never look for it (it only scans above the checkpoint, or Nos
+  already in `Pending Amount Nos`) — the row is silently never posted. Every reconcile run,
+  `Reconciler.find_orphaned_raw_rows` scans "ready" raw rows (real amount, method set) at or
+  below the checkpoint and flags any whose Date+Amount don't appear anywhere in that month's
+  transform tab, e.g. `50 (Journal, 2026-07-10, $1,250.00)`. **To recover a flagged row:**
+  add its `No.` to `Pending Amount Nos` on that Control Sheet row — `run_ingestion.py`'s
+  existing late-filled path picks it up on the next run without touching `Last Processed Row`
+  (which would otherwise reprocess the whole range and risk duplicate postings). The note
+  clears itself once nothing is flagged.
 
 ### KZDW temporary COY hold
 

@@ -44,11 +44,28 @@ class RawVsTransformEstNoTests(unittest.TestCase):
 
         self.assertIn("est. No: not found", updates[0]["status"])
 
-    def test_ambiguous_candidates_are_listed(self):
+    def test_multiple_candidates_prefer_the_closest_no(self):
+        # Row shifts only ever move a row by a handful of positions, so when several raw
+        # rows match on Date+Amount, the one numerically closest to the old No wins instead
+        # of forcing a manual "ambiguous" look.
         raw_rows = [
+            {"No": 7310184, "Date": "2026-07-31", "USD - QBO": 50.00},
+            {"No": 7310193, "Date": "2026-07-31", "USD - QBO": 50.00},
+        ]
+        transform_rows = [
+            {"No": 7310192, "Date": "2026-07-31", "Amount": 50.00, "Account": "Bank"},
+        ]
+
+        updates = self._run(raw_rows, transform_rows)
+
+        self.assertIn("est. No: 7310193", updates[0]["status"])
+        self.assertNotIn("ambiguous", updates[0]["status"])
+
+    def test_equidistant_candidates_are_still_ambiguous(self):
+        raw_rows = [
+            {"No": 99, "Date": "2026-07-31", "USD - QBO": 50.00},
             {"No": 100, "Date": "2026-07-31", "USD - QBO": 999.00},
             {"No": 101, "Date": "2026-07-31", "USD - QBO": 50.00},
-            {"No": 102, "Date": "2026-07-31", "USD - QBO": 50.00},
         ]
         transform_rows = [
             {"No": 100, "Date": "2026-07-31", "Amount": 50.00, "Account": "Bank"},
@@ -56,7 +73,7 @@ class RawVsTransformEstNoTests(unittest.TestCase):
 
         updates = self._run(raw_rows, transform_rows)
 
-        self.assertIn("est. No: ambiguous (101, 102)", updates[0]["status"])
+        self.assertIn("est. No: ambiguous (99, 101)", updates[0]["status"])
 
     def test_matched_raw_row_is_not_offered_as_a_candidate(self):
         # Raw No=101 is already the correct (Matched) destination for transform No=101.
@@ -154,6 +171,87 @@ class RawVsTransformEstNoTests(unittest.TestCase):
         updates = self._run(raw_rows, transform_rows, client_name="")
 
         self.assertEqual(updates[0]["status"], "Unmatched: Amt Diff (999.00 vs 50.00)")
+
+
+class FindOrphanedRawRowsTests(unittest.TestCase):
+    def setUp(self):
+        self.reconciler = Reconciler(MagicMock())
+
+    def _run(self, raw_rows, transform_rows, entity_type="JournalEntry", last_processed_no=100, client_name="KZO"):
+        raw_df = pd.DataFrame(raw_rows)
+        transform_df = pd.DataFrame(transform_rows)
+        return self.reconciler.find_orphaned_raw_rows(raw_df, transform_df, entity_type, last_processed_no, client_name)
+
+    def test_orphaned_row_below_checkpoint_is_flagged(self):
+        # No=50 is below the checkpoint (100) so it looks already-done, but its content
+        # never made it into transform -- exactly the "silently skipped" scenario.
+        raw_rows = [
+            {"No": 50, "Date": "2026-07-10", "USD - QBO": 1250.00, "QBO Method": "Journal"},
+        ]
+        transform_rows = [
+            {"Date": "2026-07-11", "Amount": 999.00},
+        ]
+
+        results = self._run(raw_rows, transform_rows)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["no"], 50)
+        self.assertEqual(results[0]["date"], "2026-07-10")
+        self.assertEqual(results[0]["amount"], 1250.00)
+
+    def test_row_above_checkpoint_is_not_flagged(self):
+        # Still legitimately queued -- normal ingestion will reach it next run.
+        raw_rows = [
+            {"No": 150, "Date": "2026-07-10", "USD - QBO": 1250.00, "QBO Method": "Journal"},
+        ]
+        transform_rows = []
+
+        results = self._run(raw_rows, transform_rows)
+
+        self.assertEqual(results, [])
+
+    def test_row_whose_content_exists_in_transform_is_not_flagged(self):
+        raw_rows = [
+            {"No": 50, "Date": "2026-07-10", "USD - QBO": 1250.00, "QBO Method": "Journal"},
+        ]
+        transform_rows = [
+            {"Date": "2026-07-10", "Amount": 1250.00},
+        ]
+
+        results = self._run(raw_rows, transform_rows)
+
+        self.assertEqual(results, [])
+
+    def test_wrong_method_for_entity_type_is_not_flagged(self):
+        # A Transfer row must not be checked against the Journal transform tab.
+        raw_rows = [
+            {"No": 50, "Date": "2026-07-10", "USD - QBO": 1250.00, "QBO Method": "Transfer"},
+        ]
+        transform_rows = []
+
+        results = self._run(raw_rows, transform_rows, entity_type="JournalEntry")
+
+        self.assertEqual(results, [])
+
+    def test_non_kzo_client_is_a_noop(self):
+        raw_rows = [
+            {"No": 50, "Date": "2026-07-10", "USD - QBO": 1250.00, "QBO Method": "Journal"},
+        ]
+        transform_rows = []
+
+        results = self._run(raw_rows, transform_rows, client_name="KZDW")
+
+        self.assertEqual(results, [])
+
+    def test_zero_checkpoint_is_a_noop(self):
+        raw_rows = [
+            {"No": 50, "Date": "2026-07-10", "USD - QBO": 1250.00, "QBO Method": "Journal"},
+        ]
+        transform_rows = []
+
+        results = self._run(raw_rows, transform_rows, last_processed_no=0)
+
+        self.assertEqual(results, [])
 
 
 if __name__ == "__main__":
