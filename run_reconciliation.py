@@ -163,40 +163,6 @@ def _filter_raw_df_by_month(raw_df: pd.DataFrame, month_str: str, client_name: s
         )
     return filtered
 
-def _summarize_orphan_rows(orphan_rows: list[dict], last_processed_no: int, max_note_len: int = 2000) -> tuple[str, list[str]]:
-    """
-    Groups Reconciler.find_orphaned_raw_rows() results by (entity, date, amount) into one
-    line per group instead of one per row. A single batch of identical rows is almost always
-    the same underlying cause, and listing every row individually both floods the logs and
-    can blow past Sheets' 50,000-char/cell limit for a large batch -- which previously failed
-    the whole control-sheet write and aborted the rest of that client's reconcile run.
-
-    Returns (control_sheet_note, log_lines).
-    """
-    groups: dict[tuple[str, str, float], list[int]] = {}
-    for o in orphan_rows:
-        groups.setdefault((o["entity_type"], o["date"], o["amount"]), []).append(o["no"])
-
-    note_parts = []
-    log_lines = []
-    for (etype, o_date, amount), nos in sorted(groups.items()):
-        nos.sort()
-        no_label = str(nos[0]) if len(nos) == 1 else f"{nos[0]}-{nos[-1]}"
-        count_label = "" if len(nos) == 1 else f" x{len(nos)}"
-        log_lines.append(
-            f"Possible skipped row(s): No {no_label}{count_label} ({etype}, {o_date}, "
-            f"${amount:,.2f}) have no matching entry in transform but are at/below the "
-            f"checkpoint (Last Processed Row {last_processed_no}). Add "
-            f"{'these Nos' if len(nos) > 1 else 'this No'} to 'Pending Amount Nos' to safely "
-            f"reprocess without touching Last Processed Row."
-        )
-        note_parts.append(f"{no_label}{count_label} ({etype}, {o_date}, ${amount:,.2f})")
-
-    note = "; ".join(note_parts)
-    if len(note) > max_note_len:
-        note = note[: max_note_len - 25].rsplit(";", 1)[0] + "; ... (truncated, see logs)"
-    return note, log_lines
-
 # ==============================================================================
 # LOGIC: PROCESS ONE CLIENT
 # ==============================================================================
@@ -229,14 +195,6 @@ def process_client_reconcile(
         logger.info(f"   ⏭️ [{client_name}] No RECONCILE NOW rows. Skipping QBO auth.")
         return
 
-    # KZO ONLY: ensure the "possibly skipped row" note column exists (see
-    # Reconciler.find_orphaned_raw_rows below).
-    is_kzo_client = not any(x in client_name.lower() for x in ("kzp", "s5", "umber", "kzdw"))
-    if is_kzo_client and settings.CTRL_COL_ORPHAN_ROWS_NOTE not in ctrl_df.columns:
-        new_col_idx = len(ctrl_df.columns) + 1
-        gs.update_cell(control_sheet_id, settings.CONTROL_TAB_NAME, 1, new_col_idx, settings.CTRL_COL_ORPHAN_ROWS_NOTE)
-        ctrl_df[settings.CTRL_COL_ORPHAN_ROWS_NOTE] = ""
-
     try:
         logger.info(f"🔐 [{client_name}] Authenticating with Realm ID: {realm_id}")
         qbo_client.set_company(realm_id)
@@ -267,19 +225,13 @@ def process_client_reconcile(
 
         row_updates = {}
         has_issue = False
-        orphan_rows: list[dict] = []
         dt_label = pd.to_datetime(month_str).strftime("%b %y")
-        
+
         # --- NEW: Fetch Raw Data for Comparison ---
         source_url = row.get(settings.CTRL_COL_SOURCE_URL)
         raw_tab_name = row.get(settings.CTRL_COL_TAB_NAME)
-        
+
         raw_df = pd.DataFrame()
-        raw_df_orphan_check = pd.DataFrame()
-        try:
-            last_processed_no = int(float(row.get(settings.CTRL_COL_LAST_PROCESSED_ROW, 0) or 0))
-        except (TypeError, ValueError):
-            last_processed_no = 0
 
         if RECONCILE_ENABLE_RAW_CHECK:
             try:
@@ -327,15 +279,6 @@ def process_client_reconcile(
                     else:
                         logger.info(f"   ⏭️ [{client_name}] Raw month filter skipped (enabled for KZP/S5/Umber only).")
 
-                    # The orphaned-row check (below) compares against a single month's
-                    # transform tab, so unlike raw_df above it always needs month scoping
-                    # -- including for KZO, where an unrelated earlier month's raw 'No'
-                    # could otherwise be numerically <= this month's checkpoint.
-                    if not any(x in str(client_name).lower() for x in ["kzp", "s5", "umber", "kzdw"]):
-                        raw_df_orphan_check = _filter_raw_df_by_month(raw_df, month_str, client_name)
-                    else:
-                        raw_df_orphan_check = raw_df
-
             except Exception as e:
                 logger.error(f"   ⚠️ Failed to read Raw Source: {e}")
         else:
@@ -357,10 +300,6 @@ def process_client_reconcile(
                     # print("RUN")
                     res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "JournalEntry", client_name)
                     write_raw_check_results(gs, transform_url, tab, df, res_raw)
-                if not raw_df_orphan_check.empty:
-                    orphan_rows.extend(reconciler.find_orphaned_raw_rows(
-                        raw_df_orphan_check, df, "JournalEntry", last_processed_no, client_name
-                    ))
 
                 if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):
                     row_updates[COL_QBO_JV] = "QBO MISMATCH"
@@ -386,10 +325,6 @@ def process_client_reconcile(
                 if not raw_df.empty:
                     res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "Purchase", client_name)
                     write_raw_check_results(gs, transform_url, tab, df, res_raw)
-                if not raw_df_orphan_check.empty:
-                    orphan_rows.extend(reconciler.find_orphaned_raw_rows(
-                        raw_df_orphan_check, df, "Purchase", last_processed_no, client_name
-                    ))
 
                 if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):
                     row_updates[COL_QBO_EXP] = "QBO MISMATCH"
@@ -415,10 +350,6 @@ def process_client_reconcile(
                 if not raw_df.empty:
                     res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "Transfer", client_name)
                     write_raw_check_results(gs, transform_url, tab, df, res_raw)
-                if not raw_df_orphan_check.empty:
-                    orphan_rows.extend(reconciler.find_orphaned_raw_rows(
-                        raw_df_orphan_check, df, "Transfer", last_processed_no, client_name
-                    ))
 
                 if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):
                     row_updates[COL_QBO_TR] = "QBO MISMATCH"
@@ -428,15 +359,6 @@ def process_client_reconcile(
         except Exception as e:
             logger.exception(f"   ❌ Trf Reconcile Error: {e}")
             has_issue = True
-
-        if orphan_rows:
-            note, log_lines = _summarize_orphan_rows(orphan_rows, last_processed_no)
-            for line in log_lines:
-                logger.warning(f"   ⚠️ [{client_name}] {line}")
-            row_updates[settings.CTRL_COL_ORPHAN_ROWS_NOTE] = note
-            has_issue = True
-        else:
-            row_updates[settings.CTRL_COL_ORPHAN_ROWS_NOTE] = ""
 
         final = "DONE (Issues Found)" if has_issue else "DONE"
         row_updates[CTRL_COL_RECONCILE] = final

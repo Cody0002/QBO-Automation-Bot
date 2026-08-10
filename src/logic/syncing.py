@@ -215,16 +215,25 @@ class QBOSync:
                     logger.info(f"      ✅ [Sync Map] LEAF: '{search_name}' -> '{name}'")
                     return qbo_id
 
-        # 3. STRICT FUZZY MATCH (90%)
-        # Removed the aggressive "substring" check
-        matches = difflib.get_close_matches(clean_name, list(mapping_dict.keys()), n=1, cutoff=0.80)
-        if matches: 
-            best = matches[0]
-            logger.info(f"      ✨ [Sync Map] FUZZY (80%): '{search_name}' -> '{best}'")
-            return mapping_dict[best]
-            
+        # 3. FUZZY MATCH (80%) -- NOT for accounts.
+        # Accounts are money destinations, and real charts of accounts contain siblings that
+        # differ only by a short code: "Investment in HR Company (ORZ)" vs "(OSR)" scores 0.82
+        # against the fully-qualified names, so fuzzy would silently post to the wrong
+        # account. Accounts must match exactly or by leaf name; anything else fails loudly and
+        # is surfaced as an ERROR remark / raised ValueError for a human to fix in the sheet.
+        if mapping_key != "accounts":
+            matches = difflib.get_close_matches(clean_name, list(mapping_dict.keys()), n=1, cutoff=0.80)
+            if matches:
+                best = matches[0]
+                logger.info(f"      ✨ [Sync Map] FUZZY (80%): '{search_name}' -> '{best}'")
+                return mapping_dict[best]
+
         if warn_on_missing:
-            logger.warning(f"      ❌ [Sync Map] FAILED: Could not find '{search_name}' in {mapping_key}")
+            near = difflib.get_close_matches(clean_name, list(mapping_dict.keys()), n=3, cutoff=0.60)
+            hint = f" Closest QBO names: {near}" if near else ""
+            logger.warning(
+                f"      ❌ [Sync Map] FAILED: Could not find '{search_name}' in {mapping_key}.{hint}"
+            )
         return None
 
     def get_existing_duplicates(self, entity_type: str, doc_nums: list) -> set:

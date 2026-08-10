@@ -31,6 +31,10 @@ COL_ITEM_DESC = "Item Description"
 COL_CO = "CO"
 COL_IN_OUT = "In/Out"
 COL_BANK = "Account Fr"
+COL_ACC_TO = "Account To"
+# Raw 'USD - QBO' captured before any sign flipping, so direction rules can test the value
+# exactly as it appears in the source sheet.
+COL_RAW_USD = "_RawUsdQbo"
 
 def parse_mixed_date(series: pd.Series) -> pd.Series:
     """Parse Excel serial dates and regular date strings safely."""
@@ -73,7 +77,7 @@ def _normalize_df_headers(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=mapping)
 
 # --- UPDATED HELPER FUNCTION ---
-def find_id_in_map(mapping_dict: dict, search_name: str) -> str | None:
+def find_id_in_map(mapping_dict: dict, search_name: str, allow_fuzzy: bool = True) -> str | None:
     if pd.isna(search_name) or str(search_name).strip() == "":
         return None
     
@@ -117,18 +121,23 @@ def find_id_in_map(mapping_dict: dict, search_name: str) -> str | None:
                 # print(f"   ✅ [Mapping] LEAF MATCH: '{search_name}' -> '{qbo_name}'")
                 return qbo_id
 
-    # --- STRATEGY 3: STRICT FUZZY MATCH (90%) ---
-    # Only allows very close matches (typos), rejects partial substrings
+    # --- STRATEGY 3: FUZZY MATCH (80%) -- disabled for accounts ---
+    # Only allows very close matches (typos), rejects partial substrings.
+    # Callers resolving ACCOUNTS pass allow_fuzzy=False: a chart of accounts routinely holds
+    # siblings differing only by a short code ("Investment in HR Company (ORZ)" vs "(OSR)"
+    # scores 0.82 against the fully-qualified names), so a fuzzy guess would silently book to
+    # the wrong account. Better to fail and let a human fix the sheet.
     qbo_names = list(mapping_dict.keys())
-    # cutoff=0.9 ensures "Equipment" does NOT match "Accumulated..."
-    matches = difflib.get_close_matches(clean_name, qbo_names, n=1, cutoff=0.80)
-    
-    if matches:
-        best_match = matches[0]
-        print(f"   ✨ [Mapping] FUZZY (80%): '{search_name}' -> '{best_match}'")
-        return mapping_dict[best_match]
+    if allow_fuzzy:
+        matches = difflib.get_close_matches(clean_name, qbo_names, n=1, cutoff=0.80)
+        if matches:
+            best_match = matches[0]
+            print(f"   ✨ [Mapping] FUZZY (80%): '{search_name}' -> '{best_match}'")
+            return mapping_dict[best_match]
 
-    print(f"   ❌ [Mapping] FAILED: Could not find '{search_name}'")
+    near = difflib.get_close_matches(clean_name, qbo_names, n=3, cutoff=0.60)
+    hint = f" Closest: {near}" if near else ""
+    print(f"   ❌ [Mapping] FAILED: Could not find '{search_name}'.{hint}")
     return None
 
 def _fix_grp_location(df: pd.DataFrame, col_name: str = "Location"):
@@ -398,6 +407,10 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         mask_kzp_reimbursements = (
             type_series.astype(str).str.strip().str.lower() == "reimbursements"
         )
+
+    # Snapshot the source sign BEFORE the Reclass flip below. The KZO Category=Transfer rule
+    # is defined against the value as it appears in the sheet, not the flipped one.
+    df[COL_RAW_USD] = pd.to_numeric(df[COL_USD], errors="coerce").fillna(0.0)
 
     # Keep true Reclass behavior for non-reimbursements only.
     df.loc[(df[SPECIAL_CASE] == 'Reclass') & (~mask_kzp_reimbursements), COL_USD] *= -1
@@ -761,20 +774,89 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
             df_reclass["Currency Exchange"] = ""
         df_reclass["Class"] = ""
         df_reclass["Name"] = df_reclass[COL_ITEM_DESC]
-        df_reclass = df_reclass.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
-        # Reclass follows the same fallback as standard journals.
-        if COL_TYPE in df_reclass.columns:
-            df_reclass["Account"] = df_reclass["Account"].where(
-                df_reclass["Account"].astype(str).str.strip() != "",
-                df_reclass[COL_TYPE],
-            )
-            df_reclass["Account"] = df_reclass["Account"].fillna(df_reclass[COL_TYPE])
-        # Fill NA locations with raw CO value
-        df_reclass["Location"] = df_reclass["Location"].fillna(df_reclass[COL_CO] if COL_CO in df_reclass.columns else "")
+        # Assigned before any split so both subsets keep their original relative order.
         df_reclass["_LineGroupOrder"] = range(len(df_reclass))
-        df_reclass["_LineRole"] = 0
 
-        processed_reclass = df_reclass[["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Currency Exchange", "Class", "_LineGroupOrder", "_LineRole"]]
+        # KZO ONLY: a Reclass row whose Category is Transfer describes a movement between two
+        # accounts, so it must post as a debit/credit pair against From/To Account rather than
+        # the usual single line. UMBER has its own Category=Transfer handling in the standard
+        # journal branch above; KZP/KZDW/S5 keep the plain single-line reclass behavior.
+        rc_transfer_mask = pd.Series(False, index=df_reclass.index)
+        if (
+            _is_kzo_case(client_name)
+            and not _is_kzp_case(client_name)
+            and "Category" in df_reclass.columns
+        ):
+            rc_transfer_mask = (
+                df_reclass["Category"].fillna("").astype(str).str.strip().str.lower()
+                .isin({"transfer", "transfers"})
+            )
+
+        df_rc_transfer = df_reclass[rc_transfer_mask].copy()
+        df_reclass = df_reclass[~rc_transfer_mask].copy()
+
+        reclass_out_cols = [
+            "No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location",
+            "Currency Code", "Currency Exchange", "Class", "_LineGroupOrder", "_LineRole",
+        ]
+        reclass_parts = []
+
+        if not df_reclass.empty:
+            df_reclass = df_reclass.rename(columns={COL_ITEM_DESC: "Memo", COL_BANK: "Account", COL_CO: "Location"})
+            # Reclass follows the same fallback as standard journals.
+            if COL_TYPE in df_reclass.columns:
+                df_reclass["Account"] = df_reclass["Account"].where(
+                    df_reclass["Account"].astype(str).str.strip() != "",
+                    df_reclass[COL_TYPE],
+                )
+                df_reclass["Account"] = df_reclass["Account"].fillna(df_reclass[COL_TYPE])
+            # Fill NA locations with raw CO value
+            df_reclass["Location"] = df_reclass["Location"].fillna(df_reclass[COL_CO] if COL_CO in df_reclass.columns else "")
+            df_reclass["_LineRole"] = 0
+            reclass_parts.append(df_reclass[reclass_out_cols])
+
+        if not df_rc_transfer.empty:
+            raw_usd = pd.to_numeric(df_rc_transfer.get(COL_RAW_USD, 0), errors="coerce").fillna(0.0)
+            amt_abs = pd.to_numeric(df_rc_transfer["Amount"], errors="coerce").fillna(0.0).abs()
+
+            def _acc_series(col: str) -> pd.Series:
+                if col in df_rc_transfer.columns:
+                    return df_rc_transfer[col].fillna("").astype(str).str.strip()
+                return pd.Series("", index=df_rc_transfer.index)
+
+            from_acc = _acc_series(COL_BANK)     # "From Account"
+            to_acc = _acc_series(COL_ACC_TO)     # "To Account"
+
+            # USD - QBO > 0: money leaves From (credit/negative) and lands in To (debit/positive).
+            # USD - QBO < 0: the movement is reversed.
+            # Exactly 0 cannot occur in practice (zero-amount rows are held as pending during
+            # ingestion) and would be dropped by the |Amount| filter below regardless.
+            outbound = raw_usd >= 0
+            neg_acc = pd.Series(np.where(outbound, from_acc, to_acc), index=df_rc_transfer.index)
+            pos_acc = pd.Series(np.where(outbound, to_acc, from_acc), index=df_rc_transfer.index)
+
+            neg_line = df_rc_transfer.copy()
+            neg_line["Amount"] = -amt_abs
+            neg_line["Account"] = neg_acc
+            neg_line["_LineRole"] = 0
+
+            pos_line = df_rc_transfer.copy()
+            pos_line["Amount"] = amt_abs
+            pos_line["Account"] = pos_acc
+            pos_line["_LineRole"] = 1
+
+            for part in (neg_line, pos_line):
+                part.rename(columns={COL_ITEM_DESC: "Memo", COL_CO: "Location"}, inplace=True)
+                if "Location" not in part.columns:
+                    part["Location"] = ""
+                part["Location"] = part["Location"].fillna("")
+                # No Type fallback here: From/To are explicit, and a blank one must fail
+                # validation rather than silently book to a category account.
+                reclass_parts.append(part[reclass_out_cols])
+
+        processed_reclass = (
+            pd.concat(reclass_parts, ignore_index=True) if reclass_parts else pd.DataFrame()
+        )
 
     # --- 3. Safe Combination ---
     total_journals = pd.concat([processed_std, processed_reclass], ignore_index=True)
@@ -824,7 +906,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         if _is_blank(acc_name):
             return f"ERROR | Missing Account Name | Row No: {row_no}"
         
-        acc_id = find_id_in_map(map_acc, acc_name)
+        acc_id = find_id_in_map(map_acc, acc_name, allow_fuzzy=False)
         if not acc_id:
             return f"ERROR | Account not found: '{acc_name}' | Row No: {row_no}"
 
@@ -981,12 +1063,12 @@ def process_expenses(df: pd.DataFrame, country: str,
         src_acc = row["Account (Cr)"]
         exp_acc = row["Expense Account (Dr)"]
         
-        src_acc_id = find_id_in_map(map_acc, src_acc)
+        src_acc_id = find_id_in_map(map_acc, src_acc, allow_fuzzy=False)
         if not src_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | Source Account not in QBO: '{src_acc}' | Available: {available}... | Row No: {row_no}"
              
-        exp_acc_id = find_id_in_map(map_acc, exp_acc)
+        exp_acc_id = find_id_in_map(map_acc, exp_acc, allow_fuzzy=False)
         if not exp_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | Expense Account not in QBO: '{exp_acc}' | Available: {available}... | Row No: {row_no}"
@@ -1118,12 +1200,12 @@ def process_transfers(df: pd.DataFrame, country: str,
         from_acc = row["Transfer Funds From"]
         to_acc = row["Transfer Funds To"]
         
-        from_acc_id = find_id_in_map(map_acc, from_acc)
+        from_acc_id = find_id_in_map(map_acc, from_acc, allow_fuzzy=False)
         if not from_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | 'From' Account not in QBO: '{from_acc}' | Available: {available}... | Row No: {row_no}"
              
-        to_acc_id = find_id_in_map(map_acc, to_acc)
+        to_acc_id = find_id_in_map(map_acc, to_acc, allow_fuzzy=False)
         if not to_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | 'To' Account not in QBO: '{to_acc}' | Available: {available}... | Row No: {row_no}"

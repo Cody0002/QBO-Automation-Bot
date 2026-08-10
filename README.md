@@ -92,7 +92,7 @@ zero-padded running count of same-date rows above it. Inserting or deleting a ro
 in a KZO country tab therefore renumbers every later row that shares that same date — the
 transaction didn't change, only its `No.` did.
 
-Three places surface this automatically (KZO only; other clients don't use this formula and
+Two places surface this automatically (KZO only; other clients don't use this formula and
 are unaffected):
 
 - **Reconciliation (`Raw Reconcile` column, transform sheet).** When
@@ -114,22 +114,57 @@ are unaffected):
   from raw entirely between runs, `run_ingestion.py` logs a warning and writes a note like
   `7310132 (7/31 seq #132, missing — check 7310129-7310135)`, decoded from the formula's date
   prefix plus a +/-3 No range to manually check. The note clears itself once nothing is stale.
-- **Reconciliation (`Possibly Skipped Rows` column, Control sheet).** A shift can also push a
-  brand-new, real transaction's `No.` down to or below `Last Processed Row`, where
-  `run_ingestion.py` will never look for it (it only scans above the checkpoint, or Nos
-  already in `Pending Amount Nos`) — the row is silently never posted. Every reconcile run,
-  `Reconciler.find_orphaned_raw_rows` scans "ready" raw rows (real amount, method set) at or
-  below the checkpoint and flags any whose Date+Amount don't appear anywhere in that month's
-  transform tab, e.g. `50 (Journal, 2026-07-10, $1,250.00)`. Flagged rows sharing the same
-  entity/date/amount are grouped into one line (e.g. `7310039-7310045 x7 (Transfer,
-  2026-07-31, $3,038.82)`) and the note is capped at ~2000 characters — a bare list, one line
-  per row, can blow past Sheets' 50,000-char/cell limit for a large batch and fail the whole
-  write; the run itself never aborts on a control-sheet write failure either way (that write
-  is wrapped separately from the per-entity reconcile steps). **To recover a flagged row:**
-  add its `No.` to `Pending Amount Nos` on that Control Sheet row — `run_ingestion.py`'s
-  existing late-filled path picks it up on the next run without touching `Last Processed Row`
-  (which would otherwise reprocess the whole range and risk duplicate postings). The note
-  clears itself once nothing is flagged.
+
+Note: an earlier version of this reconcile step also flagged raw rows sitting at/below
+`Last Processed Row` with no matching transform content ("possibly skipped rows"), to catch
+rows a shift pushed under the checkpoint before they were ever processed. It was removed —
+in practice it produced far too many false positives against legitimate recurring
+same-amount transactions (e.g. daily fixed-amount transfers) to be useful, and stayed only as
+per-transaction reconcile via `est. No:` above.
+
+### Account matching: no fuzzy guessing for accounts
+
+Account names from the sheet are resolved against QBO by **exact match**, then **leaf match**
+(`Investment:Investment in HR Company (ORZ)` matches a sheet value of
+`Investment in HR Company (ORZ)`), plus the hardcoded `replacements` table for known aliases.
+There is **no fuzzy fallback for accounts** — if neither matches, the row fails with
+`ERROR | Account not found: '<name>'` in `Remarks` and is never synced.
+
+This is deliberate. A real chart of accounts contains siblings that differ only by a short
+code — KZO has `Investment in HR Company`, `(MP)`, `(OSR)` and `(ORZ)` (71002/71006/71004/71009).
+Against their fully-qualified names, `(ORZ)` scores **0.82** similarity to `(OSR)`, above the
+old 0.80 fuzzy cutoff, so a missing or mistyped account was silently booked to whichever
+sibling happened to be closest. A loud failure a human fixes in the sheet beats a wrong
+posting nobody notices.
+
+Fuzzy matching is still used for **vendors, classes, locations and payment methods**, where
+names genuinely vary and a near-miss does not misstate the books. A failed account lookup logs
+the closest QBO names as a hint, but never selects one.
+
+Implemented as `allow_fuzzy` in `find_id_in_map` (`src/logic/transformer.py`) and a
+`mapping_key != "accounts"` guard in `QBOSync.find_id` (`src/logic/syncing.py`).
+
+### KZO: Reclass rows with `Category = Transfer`
+
+A `QBO Method = Reclass` row normally becomes a **single** journal line against
+`From Account` (falling back to `Type`). When its `Category` is `Transfer`, the row instead
+becomes a **debit/credit pair**, because it describes money moving between two accounts.
+Direction follows the sign of `USD - QBO` **as it appears in the raw sheet**, before the
+existing Reclass sign flip:
+
+| raw `USD - QBO` | negative line | positive line |
+|---|---|---|
+| `> 0` | `From Account` | `To Account` |
+| `< 0` | `To Account` | `From Account` |
+
+Both lines share one `Journal No`, and the pair nets to zero. `From Account` / `To Account`
+are the raw columns of those names (standardized as `Account Fr` / `Account To`) — **not** the
+`Transfer from` / `Transfer to` columns used by the Transfer method. The `Type` fallback is
+deliberately not applied here: a blank From/To fails validation rather than silently posting
+to a category account.
+
+KZO only. UMBER has its own `Category = Transfer` handling in the standard-journal branch;
+KZP, KZDW and S5 keep the plain single-line reclass behavior.
 
 ### KZDW temporary COY hold
 

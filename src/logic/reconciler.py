@@ -5,7 +5,6 @@ import re
 import difflib
 from src.connectors.qbo_client import QBOClient
 from src.utils.logger import setup_logger
-from src.logic.raw_adapter import _normalize_qbo_method_series
 
 logger = setup_logger("reconciler")
 
@@ -611,97 +610,4 @@ class Reconciler:
             updates.append({"row_idx": idx, "status": status})
 
         return updates
-
-    # --- 5. RAW ROWS SILENTLY SKIPPED BELOW THE CHECKPOINT (KZO ONLY) ---
-    def find_orphaned_raw_rows(
-        self,
-        raw_df: pd.DataFrame,
-        transform_df: pd.DataFrame,
-        entity_type: str,
-        last_processed_no: int,
-        client_name: str = "",
-    ) -> list[dict]:
-        """
-        A KZO row insertion can shift a real (non-pending) transaction's 'No' down to or
-        below 'Last Processed Row'. run_ingestion.py only ever looks at rows above that
-        checkpoint or already in Pending Amount Nos, so such a row is otherwise invisible
-        and never gets posted. Flags any 'ready' raw row at/below the checkpoint whose
-        content (Date + Amount) doesn't appear anywhere in the already-processed transform
-        data for this entity type.
-        """
-        results: list[dict] = []
-
-        client_name_lower = str(client_name).strip().lower()
-        is_kzo = bool(client_name_lower) and not any(
-            x in client_name_lower for x in ("kzp", "s5", "umber", "kzdw")
-        )
-        if not is_kzo or last_processed_no <= 0:
-            return results
-        if raw_df.empty or "No" not in raw_df.columns:
-            return results
-
-        entity_method = {"JournalEntry": "Journal", "Purchase": "Expenses", "Transfer": "Transfer"}.get(
-            entity_type
-        )
-        if entity_method is None:
-            return results
-
-        raw = raw_df.copy()
-        no_cols = raw.loc[:, raw.columns == "No"]
-        if no_cols.empty:
-            return results
-        raw["_No"] = pd.to_numeric(no_cols.iloc[:, 0], errors="coerce").fillna(0).astype(int)
-
-        if "QBO Method" not in raw.columns:
-            return results
-        method_cols = raw.loc[:, raw.columns == "QBO Method"]
-        raw["_Method"] = _normalize_qbo_method_series(method_cols.iloc[:, 0].fillna(""))
-
-        if "USD - QBO" not in raw.columns:
-            return results
-        amt_cols = raw.loc[:, raw.columns == "USD - QBO"]
-        raw["_AmtAbs"] = amt_cols.iloc[:, 0].apply(self._safe_float).abs()
-
-        candidates = raw[
-            (raw["_No"] > 0)
-            & (raw["_No"] <= last_processed_no)
-            & (raw["_Method"] == entity_method)
-            & (raw["_AmtAbs"] > 0)
-        ]
-        if candidates.empty:
-            return results
-
-        transform_date_col = "Payment Date" if entity_type == "Purchase" else "Date"
-        transform_amt_col = "Amount"
-        if entity_type == "Purchase":
-            transform_amt_col = "Expense Line Amount"
-        elif entity_type == "Transfer":
-            transform_amt_col = "Transfer Amount"
-
-        transform_content: set[tuple[str, float]] = set()
-        if (
-            not transform_df.empty
-            and transform_date_col in transform_df.columns
-            and transform_amt_col in transform_df.columns
-        ):
-            for _, t_row in transform_df.iterrows():
-                t_date = self._normalize_date_str(self._row_get_scalar(t_row, transform_date_col, ""))
-                if not t_date:
-                    continue
-                t_amt = round(abs(self._safe_float(self._row_get_scalar(t_row, transform_amt_col, 0))), 2)
-                transform_content.add((t_date, t_amt))
-
-        for _, row in candidates.iterrows():
-            r_date = self._normalize_date_str(self._row_get_scalar(row, "Date", ""))
-            r_amt = round(abs(self._safe_float(self._row_get_scalar(row, "_AmtAbs", 0))), 2)
-            if r_date and (r_date, r_amt) in transform_content:
-                continue
-            results.append({
-                "no": int(self._row_get_scalar(row, "_No", 0)),
-                "date": r_date or "unknown date",
-                "amount": r_amt,
-                "entity_type": entity_type,
-            })
-
-        return results
 
