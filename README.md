@@ -124,11 +124,26 @@ per-transaction reconcile via `est. No:` above.
 
 ### Account matching: no fuzzy guessing for accounts
 
-Account names from the sheet are resolved against QBO by **exact match**, then **leaf match**
-(`Investment:Investment in HR Company (ORZ)` matches a sheet value of
-`Investment in HR Company (ORZ)`), plus the hardcoded `replacements` table for known aliases.
-There is **no fuzzy fallback for accounts** — if neither matches, the row fails with
+Account names from the sheet are resolved against QBO by **exact match**, then **suffix-path
+match**, plus the hardcoded `replacements` table for known aliases. There is **no fuzzy
+fallback for accounts** — if none match, the row fails with
 `ERROR | Account not found: '<name>'` in `Remarks` and is never synced.
+
+Suffix-path matching compares the sheet value against *every trailing path* of the QBO
+fully-qualified name, so a sheet value may drop any number of leading parent levels:
+
+| QBO account | sheet values that resolve |
+|---|---|
+| `Fixed Assets:Equipment` | `Equipment`, `Fixed Assets:Equipment` |
+| `Marketing:RnD:AI Expenses` | `AI Expenses`, `RnD:AI Expenses`, `Marketing:RnD:AI Expenses` |
+
+Both the "after the last colon" and "after the first colon" forms are accepted, because
+analysts write either one. A bare middle fragment (`RnD`) is deliberately **not** a match.
+
+If one name resolves to **two different accounts** under different parents (e.g.
+`Marketing:Growth` and `Sales:Growth` for a sheet value of `Growth`), accounts **refuse** and
+report `AMBIGUOUS` rather than pick one — same reasoning as the fuzzy ban below. KZO's current
+chart of accounts has no such collisions.
 
 This is deliberate. A real chart of accounts contains siblings that differ only by a short
 code — KZO has `Investment in HR Company`, `(MP)`, `(OSR)` and `(ORZ)` (71002/71006/71004/71009).
@@ -142,7 +157,33 @@ names genuinely vary and a near-miss does not misstate the books. A failed accou
 the closest QBO names as a hint, but never selects one.
 
 Implemented as `allow_fuzzy` in `find_id_in_map` (`src/logic/transformer.py`) and a
-`mapping_key != "accounts"` guard in `QBOSync.find_id` (`src/logic/syncing.py`).
+`mapping_key != "accounts"` guard in `QBOSync.find_id` (`src/logic/syncing.py`). The two
+matchers are intentional duplicates — change both together.
+
+Note the sync log only prints `[Sync Map]` for a **suffix/leaf** match. An exact match is
+silent by design, so a section with no `[Sync Map]` lines means every account matched exactly —
+typically transfers, whose bank accounts sit at the top level of the chart.
+
+### Transfer duplicate check is scoped by month
+
+Journals and expenses are checked for duplicates with `WHERE DocNumber IN (...)`, which QBO
+indexes. Transfers carry their `Ref No` inside `PrivateNote` instead, and **QBO cannot filter
+on that field** — `WHERE PrivateNote LIKE 'KZOTH0726T%'` is rejected with `400 Bad Request` —
+so the notes must be fetched and scanned locally.
+
+That fetch is therefore bounded by the control row's month (`_month_bounds` in
+`run_syncing.py`). Without bounds, `QBOClient.query()` appends its own
+`STARTPOSITION`/`MAXRESULTS` and keeps paging to the end of the table:
+
+| scope | rows | time (KZO) |
+|---|---|---|
+| unscoped | 14,064 | **320s** |
+| one month | 1,498 | **41s** |
+
+The statement carries no `MAXRESULTS` of its own — one previously did, but pagination
+overrode it, so it only looked like a limit. The check runs **once per sync section**, not per
+row, and logs what it scanned (`🔍 Transfer duplicate check scanned N note(s) [start to end]`).
+If the month can't be parsed it still runs unscoped, with a warning.
 
 ### KZO: Reclass rows with `Category = Transfer`
 

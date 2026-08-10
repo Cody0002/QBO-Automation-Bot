@@ -109,17 +109,31 @@ def find_id_in_map(mapping_dict: dict, search_name: str, allow_fuzzy: bool = Tru
             print(f"   ✅ [Mapping] EXACT: '{search_name}' -> '{qbo_name}'")
             return qbo_id
     
-    # --- STRATEGY 2: LEAF NODE MATCH (Split by :) ---
-    # Checks "Equipment" == "Fixed Assets:Equipment" (Splits QBO name)
-    # This solves the "Equipment" vs "Accumulated..." issue
+    # --- STRATEGY 2: SUFFIX PATH MATCH (Split by :) ---
+    # A sheet value may drop any number of leading parent levels, so compare against every
+    # trailing path of the QBO name, not just the final segment:
+    #   "Marketing:RnD:AI Expenses" -> "RnD:AI Expenses" and "AI Expenses"
+    #   "Fixed Assets:Equipment"    -> "Equipment"
+    # Both forms are accepted because analysts write either one.
+    suffix_hits: dict[str, str] = {}
     for qbo_name, qbo_id in mapping_dict.items():
-        # Get the part after the last colon (the actual account name)
-        # e.g. "Fixed Assets:Equipment" -> "Equipment"
-        if ":" in qbo_name:
-            leaf_name = qbo_name.split(":")[-1].strip()
-            if leaf_name.lower() == search_lower:
-                # print(f"   ✅ [Mapping] LEAF MATCH: '{search_name}' -> '{qbo_name}'")
-                return qbo_id
+        if ":" not in qbo_name:
+            continue
+        parts = [p.strip() for p in qbo_name.split(":")]
+        for i in range(1, len(parts)):
+            if ":".join(parts[i:]).lower() == search_lower:
+                suffix_hits.setdefault(qbo_id, qbo_name)
+                break
+
+    if len(suffix_hits) == 1:
+        return next(iter(suffix_hits))
+    if len(suffix_hits) > 1:
+        # The same name lives under two different parents. Picking one is the same class of
+        # error as fuzzy-matching a sibling account, so refuse when guessing is disallowed.
+        if not allow_fuzzy:
+            print(f"   ❌ [Mapping] AMBIGUOUS: '{search_name}' matches {sorted(suffix_hits.values())}")
+            return None
+        return next(iter(suffix_hits))
 
     # --- STRATEGY 3: FUZZY MATCH (80%) -- disabled for accounts ---
     # Only allows very close matches (typos), rejects partial substrings.

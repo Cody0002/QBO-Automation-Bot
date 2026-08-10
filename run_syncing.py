@@ -16,6 +16,7 @@ try:
 except ImportError:
     pass
 
+import calendar
 import pandas as pd
 from datetime import datetime
 from config import settings
@@ -145,6 +146,14 @@ def _should_log_progress(i: int, total: int) -> bool:
         return True
     return (pos % SYNC_PROGRESS_LOG_EVERY) == 0
 
+def _month_bounds(month_str: str) -> tuple[str | None, str | None]:
+    """First/last day of month_str as 'YYYY-MM-DD', or (None, None) if unparseable."""
+    dt = pd.to_datetime(month_str, errors="coerce")
+    if pd.isna(dt):
+        return None, None
+    last_day = calendar.monthrange(int(dt.year), int(dt.month))[1]
+    return f"{dt.year}-{dt.month:02d}-01", f"{dt.year}-{dt.month:02d}-{last_day}"
+
 def _batch_update_control(gs, sheet_id, tab_name, row_num, columns, updates_dict):
     headers = list(columns)
     batch_data = []
@@ -260,6 +269,11 @@ def process_client_sync(
         tab_jv = f"{country} {dt_label} - Journals"
         tab_exp = f"{country} {dt_label} - Expenses"
         tab_tr = f"{country} {dt_label} - Transfers"
+
+        # Bounds for the Transfer duplicate check. QBO can't filter on PrivateNote (where the
+        # Ref No lives), so the check scans notes locally -- scoping the fetch to this month
+        # keeps it from pulling the entire Transfer history on every run.
+        month_start, month_end = _month_bounds(month_str)
 
         # ---------------------------------------------------------
         # 1. SYNC JOURNALS
@@ -399,7 +413,9 @@ def process_client_sync(
                     tr_status = "SYNCED"
                 else:
                     all_tr_nos = to_sync["Ref No"].unique().tolist()
-                    existing_docs = sync_engine.get_existing_duplicates("Transfer", all_tr_nos)
+                    existing_docs = sync_engine.get_existing_duplicates(
+                        "Transfer", all_tr_nos, date_start=month_start, date_end=month_end
+                    )
 
                     updater = AsyncSheetUpdater(gs, transform_url, tab_tr, col_ctx=col_ctx, batch_size=BATCH_SIZE)
                     section_fail = False

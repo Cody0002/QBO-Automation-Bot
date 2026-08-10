@@ -81,6 +81,37 @@ class AccountMatchingTests(unittest.TestCase):
 
         self.assertEqual(find_id_in_map(vendors, "Acme Trading Compny", allow_fuzzy=True), "5")
 
+    def test_nested_account_matches_both_suffix_forms(self):
+        # KZO's only 3-level account. Analysts write either the bare leaf or the
+        # parent-qualified form, so both must resolve.
+        nested = {"Marketing:RnD:AI Expenses": "700", "Marketing:Growth": "701"}
+
+        self.assertEqual(find_id_in_map(nested, "AI Expenses", allow_fuzzy=False), "700")
+        self.assertEqual(find_id_in_map(nested, "RnD:AI Expenses", allow_fuzzy=False), "700")
+        self.assertEqual(find_id_in_map(nested, "Growth", allow_fuzzy=False), "701")
+
+    def test_full_path_still_matches_exactly(self):
+        nested = {"Marketing:RnD:AI Expenses": "700"}
+        self.assertEqual(
+            find_id_in_map(nested, "Marketing:RnD:AI Expenses", allow_fuzzy=False), "700"
+        )
+
+    def test_partial_middle_segment_does_not_match(self):
+        # "RnD" alone is a parent fragment, not a trailing path -- must not resolve.
+        nested = {"Marketing:RnD:AI Expenses": "700"}
+        self.assertIsNone(find_id_in_map(nested, "RnD", allow_fuzzy=False))
+
+    def test_same_leaf_under_two_parents_is_refused_for_accounts(self):
+        ambiguous = {"Marketing:Growth": "1", "Sales:Growth": "2"}
+
+        self.assertIsNone(find_id_in_map(ambiguous, "Growth", allow_fuzzy=False))
+
+    def test_same_leaf_under_two_parents_still_resolves_for_non_accounts(self):
+        # Non-account maps keep the old first-match behavior.
+        ambiguous = {"Marketing:Growth": "1", "Sales:Growth": "2"}
+
+        self.assertEqual(find_id_in_map(ambiguous, "Growth", allow_fuzzy=True), "1")
+
     def test_blank_input_returns_none(self):
         self.assertIsNone(find_id_in_map(KZO_INVESTMENT_ACCOUNTS, "", allow_fuzzy=False))
         self.assertIsNone(find_id_in_map(KZO_INVESTMENT_ACCOUNTS, "   ", allow_fuzzy=False))

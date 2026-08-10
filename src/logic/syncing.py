@@ -206,14 +206,34 @@ class QBOSync:
                 # logger.info(f"      ✅ [Sync Map] EXACT: '{search_name}' -> '{name}'")
                 return qbo_id
         
-        # 2. LEAF MATCH (Split by :)
-        # "Fixed Assets:Equipment" -> Matches "Equipment"
+        # 2. SUFFIX PATH MATCH (Split by :)
+        # A sheet value may drop any number of leading parent levels, so compare against every
+        # trailing path of the QBO name, not just the final segment:
+        #   "Marketing:RnD:AI Expenses" -> "RnD:AI Expenses" and "AI Expenses"
+        #   "Fixed Assets:Equipment"    -> "Equipment"
+        suffix_hits: dict[str, str] = {}
         for name, qbo_id in mapping_dict.items():
-            if ":" in name:
-                leaf = name.split(":")[-1].strip()
-                if leaf.lower() == search_lower:
-                    logger.info(f"      ✅ [Sync Map] LEAF: '{search_name}' -> '{name}'")
-                    return qbo_id
+            if ":" not in name:
+                continue
+            parts = [p.strip() for p in name.split(":")]
+            for i in range(1, len(parts)):
+                if ":".join(parts[i:]).lower() == search_lower:
+                    suffix_hits.setdefault(qbo_id, name)
+                    break
+
+        if len(suffix_hits) == 1:
+            qbo_id, name = next(iter(suffix_hits.items()))
+            logger.info(f"      ✅ [Sync Map] LEAF: '{search_name}' -> '{name}'")
+            return qbo_id
+        if len(suffix_hits) > 1:
+            # Same name under two parents -- guessing is the same class of error as a fuzzy
+            # sibling match, so accounts refuse rather than pick one.
+            if mapping_key == "accounts":
+                logger.error(
+                    f"      ❌ [Sync Map] AMBIGUOUS: '{search_name}' matches {sorted(suffix_hits.values())}"
+                )
+                return None
+            return next(iter(suffix_hits))
 
         # 3. FUZZY MATCH (80%) -- NOT for accounts.
         # Accounts are money destinations, and real charts of accounts contain siblings that
@@ -236,9 +256,18 @@ class QBOSync:
             )
         return None
 
-    def get_existing_duplicates(self, entity_type: str, doc_nums: list) -> set:
+    def get_existing_duplicates(
+        self,
+        entity_type: str,
+        doc_nums: list,
+        date_start: str | None = None,
+        date_end: str | None = None,
+    ) -> set:
         """
         Queries QBO to see which IDs already exist.
+
+        date_start/date_end ('YYYY-MM-DD') scope the Transfer lookup to one period; they are
+        ignored for JournalEntry/Purchase, which are already scoped by DocNumber.
         """
         if not doc_nums: return set()
         existing = set()
@@ -260,11 +289,29 @@ class QBOSync:
                     logger.error(f"⚠️ Failed duplicate check {entity_type}: {e}")
 
         elif entity_type == "Transfer":
+            # Transfers carry their doc ref inside PrivateNote, and QBO cannot filter on that
+            # field (a `PrivateNote LIKE ...` query is rejected with 400), so the notes have to
+            # be pulled down and scanned locally. Scope that pull by TxnDate: without it the
+            # paginating client walks the entire Transfer table -- measured at 14,064 rows /
+            # 320s for KZO, versus 1,498 rows / 36s for a single month. The old
+            # "MAXRESULTS 500" was silently ineffective because query() appends its own
+            # STARTPOSITION/MAXRESULTS and keeps paging until a short page.
             try:
-                query = "SELECT PrivateNote FROM Transfer ORDERBY TxnDate DESC MAXRESULTS 500"
+                query = "SELECT PrivateNote FROM Transfer"
+                if date_start and date_end:
+                    query += f" WHERE TxnDate >= '{date_start}' AND TxnDate <= '{date_end}'"
+                else:
+                    logger.warning(
+                        "⚠️ Transfer duplicate check running unscoped; this pulls the whole "
+                        "Transfer history and is slow."
+                    )
                 results = self.client.query(query)
+                logger.info(
+                    f"   🔍 Transfer duplicate check scanned {len(results)} note(s)"
+                    + (f" [{date_start} to {date_end}]" if date_start and date_end else " [ALL]")
+                )
                 qbo_notes = [str(item.get("PrivateNote", "")) for item in results]
-                
+
                 for doc_ref in clean_docs:
                     if any(doc_ref in note for note in qbo_notes):
                         existing.add(doc_ref)
