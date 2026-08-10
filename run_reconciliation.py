@@ -297,7 +297,7 @@ def process_client_reconcile(
                 # B. Raw vs Transform Reconcile (NEW)
                 if not raw_df.empty:
                     # print("RUN")
-                    res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "JournalEntry")
+                    res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "JournalEntry", client_name)
                     write_raw_check_results(gs, transform_url, tab, df, res_raw)
                 
                 if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):
@@ -322,7 +322,7 @@ def process_client_reconcile(
                 
                 # B. Raw Check
                 if not raw_df.empty:
-                    res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "Purchase")
+                    res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "Purchase", client_name)
                     write_raw_check_results(gs, transform_url, tab, df, res_raw)
                 
                 if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):
@@ -347,7 +347,7 @@ def process_client_reconcile(
                 
                 # B. Raw Check
                 if not raw_df.empty:
-                    res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "Transfer")
+                    res_raw = reconciler.reconcile_raw_vs_transform(raw_df, df, "Transfer", client_name)
                     write_raw_check_results(gs, transform_url, tab, df, res_raw)
                 
                 if any("Mismatch" in r["status"] or "Missing" in r["status"] for r in res_qbo):

@@ -41,5 +41,27 @@ class KzdwForcedPendingTests(unittest.TestCase):
         self.assertEqual(pending_nos, {2, 6, 9, 12})
 
 
+class DecodeKzoNoTests(unittest.TestCase):
+    def test_single_digit_month_decodes_from_the_user_example(self):
+        # No=7310132 -> date_str "731" (Jul 31) + run_cnt "0132" (132nd same-date row).
+        self.assertEqual(run_ingestion._decode_kzo_no(7310132, expected_month=7), "7/31 seq #132")
+
+    def test_two_digit_month_decodes(self):
+        # No=1225045 -> date_str "1225" (Dec 25) + run_cnt "045" (45th same-date row).
+        self.assertEqual(run_ingestion._decode_kzo_no(1225045, expected_month=12), "12/25 seq #45")
+
+    def test_ambiguous_prefix_prefers_expected_month(self):
+        # "1201234": 3-char reading = Jan 20 (run_cnt 1234); 4-char reading = Dec 1 (run_cnt 234).
+        self.assertEqual(run_ingestion._decode_kzo_no(1201234, expected_month=12), "12/1 seq #234")
+        self.assertEqual(run_ingestion._decode_kzo_no(1201234, expected_month=1), "1/20 seq #1234")
+
+    def test_ambiguous_prefix_without_expected_month_uses_first_candidate(self):
+        self.assertEqual(run_ingestion._decode_kzo_no(1201234, expected_month=None), "1/20 seq #1234")
+
+    def test_wrong_length_is_undecodable(self):
+        self.assertIsNone(run_ingestion._decode_kzo_no(123, expected_month=7))
+        self.assertIsNone(run_ingestion._decode_kzo_no(12345678, expected_month=7))
+
+
 if __name__ == "__main__":
     unittest.main()

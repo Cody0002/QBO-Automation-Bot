@@ -97,6 +97,16 @@ class Reconciler:
             return m.group(1)
         return raw
 
+    def _normalize_date_str(self, val) -> str:
+        """Best-effort 'YYYY-MM-DD' normalization; '' if unparseable."""
+        try:
+            dt = pd.to_datetime(self._coerce_scalar(val), errors="coerce")
+        except Exception:
+            return ""
+        if pd.isna(dt):
+            return ""
+        return dt.strftime("%Y-%m-%d")
+
     def _get_month_range(self, date_str: str) -> tuple[str, str]:
         try:
             dt = pd.to_datetime(date_str)
@@ -406,7 +416,9 @@ class Reconciler:
         return updates
 
     # --- 4. RAW vs TRANSFORM RECONCILE (FIXED) ---
-    def reconcile_raw_vs_transform(self, raw_df: pd.DataFrame, transform_df: pd.DataFrame, entity_type: str) -> list[dict]:
+    def reconcile_raw_vs_transform(
+        self, raw_df: pd.DataFrame, transform_df: pd.DataFrame, entity_type: str, client_name: str = ""
+    ) -> list[dict]:
         updates = []
         if raw_df.empty or "No" not in raw_df.columns: 
             logger.warning("⚠️ Raw Comparison Skipped: Empty DataFrame or missing 'No' column")
@@ -460,14 +472,14 @@ class Reconciler:
         # 3. Compare & Assign Status
         status_map = {}
         mismatch_count = 0
-        
+
         for no_val, sheet_amt in transform_agg.items():
             if no_val not in raw_clean.index:
                 status_map[no_val] = "Unmatched: Missing in Raw"
                 continue
 
             raw_row = raw_clean.loc[no_val]
-            
+
             if isinstance(raw_row, pd.DataFrame):
                 usd_cols = raw_row.loc[:, raw_row.columns == "USD - QBO"]
                 if not usd_cols.empty:
@@ -478,7 +490,7 @@ class Reconciler:
             else:
                 # --- FIX: STRICTLY use "USD - QBO" from Raw ---
                 final_raw_val = self._coerce_scalar(raw_row.get("USD - QBO", 0))
-            
+
             raw_abs = abs(self._safe_float(final_raw_val))
             sheet_abs = abs(self._safe_float(sheet_amt))
 
@@ -491,6 +503,59 @@ class Reconciler:
 
         # if mismatch_count > 0:
         #     logger.info(f"   ⚠️ Found {mismatch_count} value mismatches in {entity_type}")
+
+        # 3b. KZO ONLY: estimate the shifted 'No' for Unmatched rows.
+        # KZO's raw 'No' is derived from row position (date + running count of same-date
+        # rows), so inserting a row anywhere in the raw tab shifts every later same-date
+        # 'No'. The transform row's own Date/Amount are ground truth (captured before any
+        # later shift), so we search current raw for an unclaimed row with that same
+        # content instead of trying to reverse the 'No' formula.
+        client_name_lower = str(client_name).strip().lower()
+        is_kzo = bool(client_name_lower) and not any(
+            x in client_name_lower for x in ("kzp", "s5", "umber", "kzdw")
+        )
+        if is_kzo:
+            transform_date_col = "Payment Date" if entity_type == "Purchase" else "Date"
+            transform_date_by_key: dict[int, str] = {}
+            if transform_date_col in transform_df.columns:
+                date_series = transform_df.loc[:, transform_df.columns == transform_date_col]
+                if not date_series.empty:
+                    norm_dates = date_series.iloc[:, 0].apply(self._normalize_date_str)
+                    transform_date_by_key = norm_dates.groupby(transform_df["_Key"]).first().to_dict()
+
+            claimed_nos = {k for k, v in status_map.items() if v == "Matched"}
+
+            if transform_date_by_key and "Date" in raw_clean.columns:
+                raw_lookup = raw_clean.reset_index()
+                raw_lookup["_DateNorm"] = raw_lookup.apply(
+                    lambda r: self._normalize_date_str(self._row_get_scalar(r, "Date", "")), axis=1
+                )
+                raw_lookup["_AmtAbs"] = raw_lookup.apply(
+                    lambda r: abs(self._safe_float(self._row_get_scalar(r, "USD - QBO", 0))), axis=1
+                )
+
+                for no_val, status in list(status_map.items()):
+                    if not status.startswith("Unmatched"):
+                        continue
+                    t_date = transform_date_by_key.get(no_val, "")
+                    if not t_date:
+                        continue
+                    sheet_abs = abs(self._safe_float(transform_agg.get(no_val, 0)))
+
+                    pool = raw_lookup[
+                        (~raw_lookup["_Key"].isin(claimed_nos))
+                        & (raw_lookup["_DateNorm"] == t_date)
+                        & ((raw_lookup["_AmtAbs"] - sheet_abs).abs() <= 0.05)
+                    ]
+                    candidates = sorted(set(int(x) for x in pool["_Key"].tolist()))
+
+                    if len(candidates) == 1:
+                        status_map[no_val] = f"{status} -> est. No: {candidates[0]}"
+                    elif len(candidates) == 0:
+                        status_map[no_val] = f"{status} -> est. No: not found (row may be deleted)"
+                    else:
+                        preview = ", ".join(str(c) for c in candidates[:5])
+                        status_map[no_val] = f"{status} -> est. No: ambiguous ({preview})"
 
         # 4. Broadcast
         for idx, row in transform_df.iterrows():

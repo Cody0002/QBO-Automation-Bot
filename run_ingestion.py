@@ -127,6 +127,39 @@ def _serialize_no_set(vals: set[int]) -> str:
         return ""
     return ";".join(str(x) for x in sorted(vals))
 
+def _decode_kzo_no(no_val: int, expected_month: int | None) -> str | None:
+    """Best-effort reverse of the KZO 'No.' formula's date prefix.
+
+    The sheet formula builds No. as TEXT(date, "MDD") + zero-padded running count of
+    same-date rows, e.g. No=7310132 -> date_str "731" (Jul 31) + run_cnt "0132" (132nd
+    same-date row). The month prefix is 1 digit (Jan-Sep) or 2 digits (Oct-Dec), which is
+    ambiguous for a handful of values, so this is a diagnostic hint, not authoritative.
+    """
+    no_str = str(int(no_val))
+    if len(no_str) != 7:
+        return None
+
+    candidates: list[tuple[int, int, int]] = []  # (month, day, run_cnt)
+
+    month3, day3 = int(no_str[0]), int(no_str[1:3])
+    if 1 <= month3 <= 12 and 1 <= day3 <= 31:
+        candidates.append((month3, day3, int(no_str[3:])))
+
+    month4, day4 = int(no_str[0:2]), int(no_str[2:4])
+    if 10 <= month4 <= 12 and 1 <= day4 <= 31:
+        candidates.append((month4, day4, int(no_str[4:])))
+
+    if not candidates:
+        return None
+
+    if len(candidates) > 1 and expected_month is not None:
+        preferred = [c for c in candidates if c[0] == expected_month]
+        if preferred:
+            candidates = preferred
+
+    month, day, run_cnt = candidates[0]
+    return f"{month}/{day} seq #{run_cnt}"
+
 def _cap_pending_nos(vals: set[int], max_processed_no: int) -> set[int]:
     if max_processed_no <= 0:
         return set()
@@ -349,6 +382,15 @@ def process_client_control_sheet(
     COL_QBO_TR = "QBO Transfer"
     COL_PENDING_AMOUNT_NOS = "Pending Amount Nos"
 
+    # KZO's raw 'No' is derived from row position (see _decode_kzo_no), so a same-date
+    # insertion/deletion elsewhere in the raw tab renumbers later rows. Ensure the
+    # diagnostic note column exists so stale-pending-No hints (below) have somewhere to go.
+    is_kzo_client = not any(x in client_name.lower() for x in ("kzp", "s5", "umber", "kzdw"))
+    if is_kzo_client and settings.CTRL_COL_PENDING_NOS_NOTE not in ctrl_df.columns:
+        new_col_idx = len(ctrl_df.columns) + 1
+        gs.update_cell(control_sheet_id, settings.CONTROL_TAB_NAME, 1, new_col_idx, settings.CTRL_COL_PENDING_NOS_NOTE)
+        ctrl_df[settings.CTRL_COL_PENDING_NOS_NOTE] = ""
+
     # Get the max journal number currently recorded in the sheet
     global_last_jv = ctrl_df[COL_LAST_JV].apply(_safe_int).max()
 
@@ -552,6 +594,32 @@ def process_client_control_sheet(
                 int(x) for x in raw_df.loc[forced_pending_mask, "No"].astype(int).tolist() if int(x) > 0
             )
 
+            # ---> A2. KZO ONLY: flag pending Nos that vanished from raw entirely (row-shift
+            # signal). Pending rows only ever had their integer No stored (no content
+            # snapshot), so a missing No can't be auto-relinked here -- this is a log/note
+            # diagnostic pointing the analyst at the likely date, not a reassignment.
+            pending_nos_note = ""
+            if is_kzo_client:
+                raw_no_set = set(int(x) for x in raw_df["No"].tolist() if int(x) > 0)
+                stale_pending_nos = previous_pending_nos - raw_no_set
+                if stale_pending_nos:
+                    expected_month = None
+                    parsed_raw_month = pd.to_datetime(raw_month, errors="coerce")
+                    if pd.notna(parsed_raw_month):
+                        expected_month = int(parsed_raw_month.month)
+
+                    note_parts = []
+                    for stale_no in sorted(stale_pending_nos):
+                        hint_text = _decode_kzo_no(stale_no, expected_month) or "undecodable"
+                        logger.warning(
+                            f"   ⚠️ [{client_name}] Pending No {stale_no} not found in current raw "
+                            f"({tab_prefix}) — decoded as {hint_text}. A row may have been "
+                            f"inserted/removed for that date in the raw tab; it likely shifted to "
+                            f"a nearby No."
+                        )
+                        note_parts.append(f"{stale_no} ({hint_text}, missing)")
+                    pending_nos_note = "; ".join(note_parts)
+
             # ---> B. Identify Ready Rows (method/amount ready and not on hold)
             ready_mask = method_non_blank & (amt_numeric != 0) & ~forced_pending_mask
             ready_df = raw_df[ready_mask].copy()
@@ -611,8 +679,9 @@ def process_client_control_sheet(
                     current_pending_nos, last_processed, forced_pending_nos
                 )
                 _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {
-                    settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(), 
+                    settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
                     COL_PENDING_AMOUNT_NOS: _serialize_no_set(pending_to_write), # <-- ADDED
+                    settings.CTRL_COL_PENDING_NOS_NOTE: pending_nos_note,
                     settings.CTRL_COL_ACTIVE: "DONE"
                 })
                 continue
@@ -692,6 +761,7 @@ def process_client_control_sheet(
                 COL_LAST_EXP: result.last_expense_no,
                 COL_LAST_TR: result.last_withdraw_no,
                 COL_PENDING_AMOUNT_NOS: _serialize_no_set(pending_to_write), # <-- ADDED
+                settings.CTRL_COL_PENDING_NOS_NOTE: pending_nos_note,
                 settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
                 settings.CTRL_COL_ACTIVE: "DONE"
             }
