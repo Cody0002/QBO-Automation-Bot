@@ -1,9 +1,64 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import pandas as pd
 
 import run_ingestion
+
+
+class KzpSourceHeaderTests(unittest.TestCase):
+    REQUIRED_COLUMNS = ["Date", "From Account", "USD - QBO", "QBO Import", "No"]
+
+    def test_reads_new_kzp_layout_from_row_five(self):
+        expected = pd.DataFrame(columns=self.REQUIRED_COLUMNS)
+        gs = Mock()
+        gs.read_as_df.return_value = expected
+
+        result = run_ingestion._read_source_raw_df(gs, "source", "Aug 26", "KZP")
+
+        self.assertIs(result, expected)
+        gs.read_as_df.assert_called_once_with(
+            "source",
+            "Aug 26",
+            header_row=5,
+            value_render_option="UNFORMATTED_VALUE",
+        )
+
+    def test_falls_back_to_legacy_kzp_header_row_four(self):
+        invalid_row_five = pd.DataFrame(columns=["", "Unnamed"])
+        expected = pd.DataFrame(columns=self.REQUIRED_COLUMNS[:-1])
+        gs = Mock()
+        gs.read_as_df.side_effect = [invalid_row_five, expected]
+
+        result = run_ingestion._read_source_raw_df(gs, "source", "Jul 26", "KZP")
+
+        self.assertIs(result, expected)
+        self.assertEqual(
+            gs.read_as_df.call_args_list,
+            [
+                call(
+                    "source",
+                    "Jul 26",
+                    header_row=5,
+                    value_render_option="UNFORMATTED_VALUE",
+                ),
+                call(
+                    "source",
+                    "Jul 26",
+                    header_row=4,
+                    value_render_option="UNFORMATTED_VALUE",
+                ),
+            ],
+        )
+
+    def test_rejects_unrecognized_kzp_headers(self):
+        gs = Mock()
+        gs.read_as_df.return_value = pd.DataFrame(columns=["", "Unexpected"])
+
+        with self.assertRaisesRegex(ValueError, "KZP raw header not found"):
+            run_ingestion._read_source_raw_df(gs, "source", "Aug 26", "KZP")
+
+        self.assertEqual(gs.read_as_df.call_count, 2)
 
 
 class KzdwForcedPendingTests(unittest.TestCase):

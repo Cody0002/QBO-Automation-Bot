@@ -34,6 +34,10 @@ logger = setup_logger("ingestion")
 # to hold it again. COY=TD was released after its posting logic was confirmed.
 KZDW_FORCED_PENDING_COY_VALUES: set[str] = set()
 
+# KZP added a blank title row in the August 2026 raw layout, moving the actual
+# field names from row 4 to row 5. Keep row 4 as a fallback for older KZP tabs.
+KZP_SOURCE_HEADER_ROWS = (5, 4)
+
 def parse_mixed_date(series: pd.Series) -> pd.Series:
     """Parse Excel serial dates and regular date strings safely."""
     numeric = pd.to_numeric(series, errors="coerce")
@@ -106,6 +110,64 @@ def format_month_name(date_str: str) -> str:
         return pd.to_datetime(date_str).strftime("%b %y")
     except:
         return date_str
+
+
+def _normalized_headers(df: pd.DataFrame) -> set[str]:
+    return {
+        re.sub(r"\s+", " ", str(column).replace("\n", " ").strip()).lower()
+        for column in df.columns
+    }
+
+
+def _has_kzp_source_headers(df: pd.DataFrame) -> bool:
+    """Confirm that a candidate row contains the modern KZP field names."""
+    headers = _normalized_headers(df)
+    return {
+        "date",
+        "from account",
+        "usd - qbo",
+        "qbo import",
+    }.issubset(headers)
+
+
+def _read_source_raw_df(gs, source_url: str, raw_tab_name: str, client_name: str) -> pd.DataFrame:
+    """Read a client's raw tab, allowing both current and legacy KZP headers."""
+    client_name_lower = client_name.lower()
+    if "kzp" in client_name_lower:
+        for header_row in KZP_SOURCE_HEADER_ROWS:
+            raw_df = gs.read_as_df(
+                source_url,
+                raw_tab_name,
+                header_row=header_row,
+                value_render_option="UNFORMATTED_VALUE",
+            )
+            if _has_kzp_source_headers(raw_df):
+                if header_row != KZP_SOURCE_HEADER_ROWS[0]:
+                    logger.info(
+                        f"   [{client_name}] Using legacy KZP source header row {header_row}."
+                    )
+                return raw_df
+
+        raise ValueError(
+            "KZP raw header not found on row 5 or legacy row 4. "
+            "Expected Date, From Account, USD - QBO, and QBO Import columns."
+        )
+
+    if "kzdw" in client_name_lower:
+        source_header_row = 5
+    elif "umber" in client_name_lower:
+        source_header_row = 4
+    elif "s5" in client_name_lower:
+        source_header_row = 19
+    else:
+        source_header_row = 1
+
+    return gs.read_as_df(
+        source_url,
+        raw_tab_name,
+        header_row=source_header_row,
+        value_render_option="UNFORMATTED_VALUE",
+    )
 
 def _parse_no_set(raw_val) -> set[int]:
     if pd.isna(raw_val) or str(raw_val).strip() == "":
@@ -500,22 +562,11 @@ def process_client_control_sheet(
             retry_nos = list(set([k for sub in preserved_ids.values() for k in sub.keys()]))
 
             # 6. Read & Clean Source Data
-            client_name_lower = client_name.lower()
-            if "kzdw" in client_name_lower:
-                source_header_row = 5
-            elif "kzp" in client_name_lower:
-                source_header_row = 4
-            elif "umber" in client_name_lower:
-                source_header_row = 4
-            elif "s5" in client_name_lower:
-                source_header_row = 19
-            else:
-                source_header_row = 1
-            raw_df = gs.read_as_df(
+            raw_df = _read_source_raw_df(
+                gs,
                 source_url,
                 raw_tab_name,
-                header_row=source_header_row,
-                value_render_option='UNFORMATTED_VALUE'
+                client_name,
             )
             raw_df = standardize_raw_df(raw_df, client_name=client_name, raw_month=raw_month)
 

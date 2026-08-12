@@ -5,6 +5,39 @@ import pandas as pd
 from src.logic.raw_adapter import RAW_STANDARD_COLUMNS, standardize_raw_df
 
 
+class KzpAugustRawAdapterTests(unittest.TestCase):
+    """KZP layout with the source ``No`` inserted before the QBO account fields."""
+
+    def test_added_no_column_does_not_shift_qbo_fields(self):
+        raw_df = pd.DataFrame(
+            [[
+                "TH", "KZP", "01/08/2026", "Infra", "Softwares", "Topup",
+                "0xabc", "KZP COY", "Softwares", "USDT TRC", "(560.00)",
+                "USDT TRC", "560.00", "1.00", "560.00", "", "", "",
+                "560.00", "", "(560.00)", "Expenses", "8010001", "",
+                "KZP COY", "Softwares", "USDT TRC", "",
+            ]],
+            columns=[
+                "CO", "COY", "Date", "Category", "Sub Category",
+                "Item Description", "Trx Hash", "From Account", "To Account",
+                "Currency From", "Amount From", "Currency To", "Amount To",
+                "Budget Rate", "USD", "Actual USD Transacted",
+                "Realised Gain/(Loss)", "Pivot", "B/S USD", "", "USD - QBO",
+                "QBO Import", "No", "If Journal/Expense method:\nAnother records",
+                "Transfer from", "Transfer to", "Currency",
+                "Checking ( For our use only )",
+            ],
+        )
+
+        result = standardize_raw_df(raw_df, client_name="KZP", raw_month="2026-08")
+
+        self.assertEqual(result.loc[0, "No"], 8010001)
+        self.assertEqual(result.loc[0, "USD - QBO"], -560.0)
+        self.assertEqual(result.loc[0, "QBO Method"], "Expenses")
+        self.assertEqual(result.loc[0, "QBO Transfer Fr"], "KZP COY")
+        self.assertEqual(result.loc[0, "QBO Transfer To"], "Softwares")
+
+
 class KzoNamedNoHeaderRawAdapterTests(unittest.TestCase):
     """KZO tabs that do carry an explicit ``No.`` header, plus the positional fallback."""
 
