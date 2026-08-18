@@ -169,10 +169,46 @@ class QBOClient:
     def _url(self, path: str) -> str:
         return f"{settings.QBO_BASE_URL}{path}"
 
+    @staticmethod
+    def _fault_detail(resp: requests.Response) -> str:
+        """
+        Unwraps the QBO Fault envelope into one readable line.
+
+        QBO answers a rejected payload with HTTP 400 and a body that names the offending
+        field ('Business Validation Error: You need to choose a different account...').
+        requests' own HTTPError string carries only the URL, so raising it discards the
+        one piece of information that explains the failure.
+        """
+        try:
+            payload = resp.json()
+        except Exception:
+            return (resp.text or "").strip()[:800]
+
+        fault = payload.get("Fault") if isinstance(payload, dict) else None
+        errors = (fault or {}).get("Error") or []
+        parts = []
+        for err in errors:
+            if not isinstance(err, dict):
+                continue
+            message = str(err.get("Message", "")).strip()
+            detail = str(err.get("Detail", "")).strip()
+            code = str(err.get("code", "")).strip()
+            body = " | ".join(p for p in (message, detail) if p)
+            if not body:
+                continue
+            parts.append(f"[code {code}] {body}" if code else body)
+
+        return "; ".join(parts) if parts else (resp.text or "").strip()[:800]
+
     def _request_with_retries(self, method: str, path: str, **kwargs) -> requests.Response:
         url = self._url(path)
         max_attempts = 4
         backoff_base = 1.0
+        # 429/5xx are the only statuses where the same payload can succeed later. A 400 is a
+        # verdict on the body itself, so retrying it burns ~7s of backoff and still reports the
+        # generic 'Bad Request' instead of QBO's reason.
+        retryable_status = {429, 500, 502, 503, 504}
+        refreshed_after_401 = False
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -186,11 +222,19 @@ class QBOClient:
                 if 200 <= resp.status_code < 300:
                     return resp
 
-                # Retry for rate limits and server errors
-                if resp.status_code in {429, 500, 502, 503, 504}:
-                    msg = f"HTTP {resp.status_code} on {method.upper()} {url}: {resp.text}"
+                if resp.status_code in retryable_status:
+                    msg = f"HTTP {resp.status_code} on {method.upper()} {url}: {self._fault_detail(resp)}"
+                elif resp.status_code == 401 and not refreshed_after_401:
+                    # The cached token can be revoked or rotated before its recorded expiry.
+                    refreshed_after_401 = True
+                    self.access_token = None
+                    self.token_expiry = 0.0
+                    msg = f"HTTP 401 on {method.upper()} {url}: token rejected, forcing refresh"
                 else:
-                    resp.raise_for_status()
+                    raise RuntimeError(
+                        f"QBO rejected {method.upper()} {url} with HTTP {resp.status_code}: "
+                        f"{self._fault_detail(resp)}"
+                    )
 
             except requests.RequestException as e:
                 msg = str(e)
@@ -233,13 +277,9 @@ class QBOClient:
         return all_results
 
     def post(self, path: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
+        # A non-2xx never reaches here: _request_with_retries raises with QBO's Fault text,
+        # so the caller sees why the payload was rejected instead of a bare 'Bad Request'.
         resp = self._request_with_retries('post', path, json=json_body)
-
-        # --- NEW: DETAILED ERROR REPORTING ---
-        if resp.status_code >= 400:
-            print(f"❌ QBO API ERROR ({resp.status_code}): {resp.text}")
-            resp.raise_for_status()
-
         return resp.json()
 
     def get_exchange_rate(

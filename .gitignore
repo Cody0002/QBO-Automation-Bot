@@ -26,3 +26,11 @@ initial.ipynb
 
 # bulk delete
 bulk_del.py
+
+# claude code (shared hooks are committed; per-machine state is not)
+.claude/settings.local.json
+.claude/*.local.json
+.claude/shell-snapshots/
+.claude/todos/
+.claude/statsig/
+.claude/projects/

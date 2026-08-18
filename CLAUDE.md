@@ -4,11 +4,17 @@
 
 A Graphify knowledge graph exists in `graphify-out/`.
 
-Before architecture work, refactors, coding optimization, or client-specific logic changes:
+**Before editing any `.py` file in this repo** — not just refactors or architecture work, but any change:
 
 1. Read `graphify-out/GRAPH_REPORT.md`.
-2. Use `graphify-out/graph.json` or run `graphify query "<question>"` to inspect relevant code paths.
+2. Use `graphify-out/graph.json`, or the `graphify` skill (`/graphify query "<question>"`), to inspect relevant code paths. The bare `graphify` CLI is not on PATH here; go through the skill.
 3. For client-specific logic, compare the KZO / KZP / KZDW / S5 / UMBER branches before editing shared logic.
+
+This is enforced, not advisory: the `PreToolUse` hook in `.claude/settings.json` runs
+`.claude/hooks/graph-gate.sh`, which denies the first `Edit`/`Write` to a `.py` file in each
+session until the graph has been consulted. It fires once per session and warns when
+`graph.json` is older than the sources it describes. Rebuild with `/graphify` when that warning
+appears.
 
 Key areas for client-specific behavior:
 

@@ -431,6 +431,17 @@ class QBOSync:
         
         if not from_id or not to_id: raise ValueError("Source or Destination Account missing.")
 
+        # QBO rejects a transfer whose two sides land on one account with a bare 400. The
+        # transform stage already blocks identical *names*, but two different sheet names can
+        # still resolve to one QBO account (explicit replacement, or a leaf name matching a
+        # sub-account), so the check has to run again on the resolved Ids.
+        if from_id == to_id:
+            raise ValueError(
+                f"Transfer From and To resolve to the same QBO account "
+                f"(Id {from_id}): '{from_name}' -> '{to_name}'. "
+                "Money cannot move within one account; fix the From/To columns."
+            )
+
         is_kzdw_workspace = _is_kzdw_workspace(self.client.client_name)
         row_ccy = _normalize_currency_code(row.get("Currency", "USD"))
         from_ccy = "USD"

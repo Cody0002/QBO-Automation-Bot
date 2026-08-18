@@ -1239,6 +1239,16 @@ def process_transfers(df: pd.DataFrame, country: str,
              
         if row["Transfer Funds From"] == row["Transfer Funds To"]: 
             return f"ERROR | 'From' and 'To' Accounts cannot be the same | Row No: {row_no}"
+
+        # Two different names can still resolve to one QBO account -- via the explicit
+        # replacements above ("CBD Z Card" -> "KZO CBD Z") or a leaf name matching a
+        # sub-account. QBO answers such a transfer with a bare 400 Bad Request, so catch it
+        # here where the row can be fixed instead of at sync time.
+        if from_acc_id == to_acc_id:
+            return (
+                f"ERROR | 'From' and 'To' resolve to the same QBO account (Id {from_acc_id}): "
+                f"'{from_acc}' -> '{to_acc}' | Row No: {row_no}"
+            )
             
         if not _is_s5_or_umber_case(client_name):
             loc_name = row.get("Location")

@@ -185,6 +185,57 @@ overrode it, so it only looked like a limit. The check runs **once per sync sect
 row, and logs what it scanned (`🔍 Transfer duplicate check scanned N note(s) [start to end]`).
 If the month can't be parsed it still runs unscoped, with a warning.
 
+### Transfer: From and To must be different QBO accounts
+
+QBO rejects a transfer whose two sides resolve to one account, and its answer is a plain
+`400 Bad Request` on `/v3/company/<realm>/transfer` with no hint in the URL. Only transfers
+can fail this way — journals and expenses have no equivalent constraint.
+
+Blocking identical *text* is not enough: two different names can resolve to the same QBO
+account through the explicit replacements (`CBD Z Card` -> `KZO CBD Z`) or through a leaf name
+matching a sub-account. The check therefore compares the **resolved account Ids**, and runs at
+both stages:
+
+- **Transform** (`process_transfers` -> `validate_transfer_row`) writes the remark into the
+  sheet, so the row is visible as broken before any sync runs:
+
+  ```
+  ERROR | 'From' and 'To' resolve to the same QBO account (Id 77): 'CBD Z Card' -> 'KZO CBD Z' | Row No: 12
+  ```
+
+- **Sync** (`QBOSync.push_transfer`) repeats it, because a row can be marked `Ready to sync`
+  under one chart of accounts and be re-synced after the account is merged or renamed:
+
+  ```
+  ERROR: Transfer From and To resolve to the same QBO account (Id 77):
+  'CBD Z Card' -> 'KZO CBD Z'. Money cannot move within one account; fix the From/To columns.
+  ```
+
+The plain same-text check stays ahead of both and keeps its own shorter message.
+
+### QBO 400s report the reason and are not retried
+
+`QBOClient._request_with_retries` used to hand every non-2xx status to
+`resp.raise_for_status()`, whose `HTTPError` was caught by the transient-error handler. A
+permanent rejection was therefore retried four times with backoff and surfaced as:
+
+```
+ERROR: QBO request failed after 4 attempts: 400 Client Error: Bad Request for url: .../transfer
+```
+
+— the URL, never the reason. QBO does send one, in a `Fault` envelope in the response body.
+Now:
+
+| status | behavior |
+|---|---|
+| 429, 500, 502, 503, 504 | retried with backoff (unchanged) |
+| 401 | cached token cleared, retried **once**, then reported |
+| other 4xx | **no retry**; raised immediately with QBO's own fault text |
+
+`_fault_detail()` unwraps `Fault.Error[]` into `[code 6000] Business Validation Error | You
+need to choose a different account for the transfer.`, which lands in the sheet's status
+column, so a rejected row now says what is wrong with it.
+
 ### KZO: Reclass rows with `Category = Transfer`
 
 A `QBO Method = Reclass` row normally becomes a **single** journal line against
