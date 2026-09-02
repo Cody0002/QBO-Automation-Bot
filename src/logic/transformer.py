@@ -6,6 +6,7 @@ import numpy as np
 import difflib
 from config import settings
 import re
+from src.logic.account_aliases import resolve_account_alias
 
 # --- CONSTANTS ---
 DEFAULT_JV_PREFIX = "KZO-JV"
@@ -77,12 +78,20 @@ def _normalize_df_headers(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=mapping)
 
 # --- UPDATED HELPER FUNCTION ---
-def find_id_in_map(mapping_dict: dict, search_name: str, allow_fuzzy: bool = True) -> str | None:
+def find_id_in_map(
+    mapping_dict: dict,
+    search_name: str,
+    allow_fuzzy: bool = True,
+    client_name: str = "",
+) -> str | None:
     if pd.isna(search_name) or str(search_name).strip() == "":
         return None
     
-    # 1. Clean: Remove double spaces & trim
-    clean_name = re.sub(r'\s+', ' ', str(search_name)).strip()
+    # 1. Clean: collapse whitespace, drop the padding analysts leave around ':' path
+    #    separators, then apply the workspace's account alias table (KZP's duplicated
+    #    'Growth' leaf). Account callers pass client_name; location/vendor callers leave it
+    #    blank and get plain normalization.
+    clean_name = resolve_account_alias(search_name, client_name)
     search_lower = clean_name.lower()
 
     # 2. Explicit Replacements (Hardcoded fixes)
@@ -920,7 +929,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         if _is_blank(acc_name):
             return f"ERROR | Missing Account Name | Row No: {row_no}"
         
-        acc_id = find_id_in_map(map_acc, acc_name, allow_fuzzy=False)
+        acc_id = find_id_in_map(map_acc, acc_name, allow_fuzzy=False, client_name=client_name)
         if not acc_id:
             return f"ERROR | Account not found: '{acc_name}' | Row No: {row_no}"
 
@@ -1077,12 +1086,12 @@ def process_expenses(df: pd.DataFrame, country: str,
         src_acc = row["Account (Cr)"]
         exp_acc = row["Expense Account (Dr)"]
         
-        src_acc_id = find_id_in_map(map_acc, src_acc, allow_fuzzy=False)
+        src_acc_id = find_id_in_map(map_acc, src_acc, allow_fuzzy=False, client_name=client_name)
         if not src_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | Source Account not in QBO: '{src_acc}' | Available: {available}... | Row No: {row_no}"
              
-        exp_acc_id = find_id_in_map(map_acc, exp_acc, allow_fuzzy=False)
+        exp_acc_id = find_id_in_map(map_acc, exp_acc, allow_fuzzy=False, client_name=client_name)
         if not exp_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | Expense Account not in QBO: '{exp_acc}' | Available: {available}... | Row No: {row_no}"
@@ -1214,12 +1223,12 @@ def process_transfers(df: pd.DataFrame, country: str,
         from_acc = row["Transfer Funds From"]
         to_acc = row["Transfer Funds To"]
         
-        from_acc_id = find_id_in_map(map_acc, from_acc, allow_fuzzy=False)
+        from_acc_id = find_id_in_map(map_acc, from_acc, allow_fuzzy=False, client_name=client_name)
         if not from_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | 'From' Account not in QBO: '{from_acc}' | Available: {available}... | Row No: {row_no}"
              
-        to_acc_id = find_id_in_map(map_acc, to_acc, allow_fuzzy=False)
+        to_acc_id = find_id_in_map(map_acc, to_acc, allow_fuzzy=False, client_name=client_name)
         if not to_acc_id:
             available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
             return f"ERROR | 'To' Account not in QBO: '{to_acc}' | Available: {available}... | Row No: {row_no}"

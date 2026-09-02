@@ -5,6 +5,7 @@ import difflib
 from datetime import datetime
 from src.utils.logger import setup_logger
 from src.connectors.qbo_client import QBOClient
+from src.logic.account_aliases import resolve_account_alias
 
 from dotenv import load_dotenv
 load_dotenv("config/secrets.env")
@@ -179,7 +180,13 @@ class QBOSync:
         if not search_name or pd.isna(search_name) or str(search_name).strip() == "": return None
         
         mapping_dict = self.mappings.get(mapping_key, {})
-        clean_name = re.sub(r'\s+', ' ', str(search_name)).strip()
+        if mapping_key == "accounts":
+            # Normalizes ':' spacing and applies the workspace's alias table (KZP's
+            # duplicated 'Growth' leaf) -- same rewrite the transform stage did, so a row
+            # marked 'Ready to sync' resolves to the same account here.
+            clean_name = resolve_account_alias(search_name, getattr(self.client, "client_name", ""))
+        else:
+            clean_name = re.sub(r'\s+', ' ', str(search_name)).strip()
         
         # 2. Explicit Replacements (Hardcoded fixes)
         replacements = {

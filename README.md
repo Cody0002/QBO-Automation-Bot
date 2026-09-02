@@ -143,7 +143,8 @@ analysts write either one. A bare middle fragment (`RnD`) is deliberately **not*
 If one name resolves to **two different accounts** under different parents (e.g.
 `Marketing:Growth` and `Sales:Growth` for a sheet value of `Growth`), accounts **refuse** and
 report `AMBIGUOUS` rather than pick one — same reasoning as the fuzzy ban below. KZO's current
-chart of accounts has no such collisions.
+chart of accounts has no such collisions; KZP's does, and resolves it with the alias table
+described in the next section.
 
 This is deliberate. A real chart of accounts contains siblings that differ only by a short
 code — KZO has `Investment in HR Company`, `(MP)`, `(OSR)` and `(ORZ)` (71002/71006/71004/71009).
@@ -156,9 +157,46 @@ Fuzzy matching is still used for **vendors, classes, locations and payment metho
 names genuinely vary and a near-miss does not misstate the books. A failed account lookup logs
 the closest QBO names as a hint, but never selects one.
 
+#### KZP only: the duplicated `Growth` account
+
+KZP's chart of accounts holds **two** accounts named `Growth` — one under `Marketing Income`,
+one under `Marketing Expense` — so the bare leaf name no longer identifies an account and
+suffix-path matching alone reports `AMBIGUOUS`. What tells them apart in the source sheet is
+the sub-category, so the sheet convention keeps it: the expense one carries its parent as a
+` - <parent>` suffix, and the bare name means income.
+
+| Sheet / Transform value | Resolves to |
+|---|---|
+| `Growth` | `Marketing Income:Growth` |
+| `Growth - Marketing Income` | `Marketing Income:Growth` |
+| `Growth - Marketing Expense` | `Marketing Expense:Growth` |
+| `Marketing Expense: Growth` (spaces around `:` allowed) | `Marketing Expense:Growth` |
+
+Rules:
+
+- **KZP only.** KZO / KZDW / S5 / UMBER still refuse `Growth` as `AMBIGUOUS` — the convention
+  does not leak between workspaces.
+- The **Account column keeps whatever the analyst wrote** (`Growth - Marketing Expense`), in the
+  raw *and* the Transform file. The alias is applied at lookup time, in all three stages, so
+  the sub-category hint stays visible to a human reading either sheet.
+- The alias target is still a *name*, so it goes through normal exact + suffix-path matching
+  afterwards. If QBO nests the pair deeper (`Income:Marketing Income:Growth`), it keeps working.
+- For an aliased account, the **reconciler drops its fuzzy fallback** and requires an exact or
+  suffix-path match. `Marketing Income:Growth` scores **0.81** against `Marketing Expense:Growth`,
+  so the fuzzy check would have passed the exact wrong-parent posting the alias exists to catch.
+  The one exception: when QBO reports a **bare** account name (no `:` path) the payload carries
+  no parent to compare, so the reconciler falls back to a leaf comparison rather than raise a
+  mismatch it cannot prove.
+- Anything else — accounts not in the table, other clients — is untouched.
+
+The table lives in `src/logic/account_aliases.py` (`KZP_ACCOUNT_ALIASES`), shared by all three
+matchers. Add a new collision there rather than loosening a matcher.
+
 Implemented as `allow_fuzzy` in `find_id_in_map` (`src/logic/transformer.py`) and a
-`mapping_key != "accounts"` guard in `QBOSync.find_id` (`src/logic/syncing.py`). The two
-matchers are intentional duplicates — change both together.
+`mapping_key != "accounts"` guard in `QBOSync.find_id` (`src/logic/syncing.py`), with a third
+copy in `Reconciler._is_account_match` (`src/logic/reconciler.py`). The three matchers are
+intentional duplicates — change them together. Only the alias table is shared
+(`src/logic/account_aliases.py`).
 
 Note the sync log only prints `[Sync Map]` for a **suffix/leaf** match. An exact match is
 silent by design, so a section with no `[Sync Map]` lines means every account matched exactly —

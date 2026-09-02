@@ -1,5 +1,8 @@
 import unittest
+from unittest.mock import MagicMock, patch
 
+from src.logic.reconciler import Reconciler
+from src.logic.syncing import QBOSync
 from src.logic.transformer import find_id_in_map
 
 # Real KZO fully-qualified account names (as stored in the QBO mappings dict), trimmed to the
@@ -115,6 +118,133 @@ class AccountMatchingTests(unittest.TestCase):
     def test_blank_input_returns_none(self):
         self.assertIsNone(find_id_in_map(KZO_INVESTMENT_ACCOUNTS, "", allow_fuzzy=False))
         self.assertIsNone(find_id_in_map(KZO_INVESTMENT_ACCOUNTS, "   ", allow_fuzzy=False))
+
+
+# KZP's chart of accounts grew a second "Growth" leaf, so the bare name is ambiguous. The
+# sheet convention is: bare = income, " - Marketing Expense" suffix = expense.
+KZP_GROWTH_ACCOUNTS = {
+    "Marketing Income:Growth": "5010",
+    "Marketing Expense:Growth": "6010",
+    "Marketing Income:Affiliates": "5011",
+}
+
+
+class KzpGrowthAliasTests(unittest.TestCase):
+    def test_bare_growth_resolves_to_marketing_income(self):
+        self.assertEqual(
+            find_id_in_map(KZP_GROWTH_ACCOUNTS, "Growth", allow_fuzzy=False, client_name="KZP"),
+            "5010",
+        )
+
+    def test_suffixed_growth_resolves_to_marketing_expense(self):
+        self.assertEqual(
+            find_id_in_map(
+                KZP_GROWTH_ACCOUNTS,
+                "Growth - Marketing Expense",
+                allow_fuzzy=False,
+                client_name="KZP",
+            ),
+            "6010",
+        )
+
+    def test_qualified_form_with_analyst_spacing_resolves(self):
+        # QBO's FullyQualifiedName has no spaces around ':', analysts type them anyway.
+        self.assertEqual(
+            find_id_in_map(
+                KZP_GROWTH_ACCOUNTS, "Marketing Expense: Growth", allow_fuzzy=False, client_name="KZP"
+            ),
+            "6010",
+        )
+
+    def test_alias_survives_a_deeper_parent_in_qbo(self):
+        # The alias target still goes through suffix-path matching, so QBO nesting the pair one
+        # level deeper does not break it.
+        deeper = {
+            "Income:Marketing Income:Growth": "5010",
+            "Expenses:Marketing Expense:Growth": "6010",
+        }
+        self.assertEqual(
+            find_id_in_map(deeper, "Growth", allow_fuzzy=False, client_name="KZP"), "5010"
+        )
+        self.assertEqual(
+            find_id_in_map(
+                deeper, "Growth - Marketing Expense", allow_fuzzy=False, client_name="KZP"
+            ),
+            "6010",
+        )
+
+    def test_other_kzp_accounts_are_untouched_by_the_alias_table(self):
+        self.assertEqual(
+            find_id_in_map(KZP_GROWTH_ACCOUNTS, "Affiliates", allow_fuzzy=False, client_name="KZP"),
+            "5011",
+        )
+
+    def test_alias_does_not_leak_into_other_workspaces(self):
+        # KZO/KZDW/S5/UMBER keep the AMBIGUOUS refusal -- the convention is KZP's alone.
+        for workspace in ("KZO", "KZDW", "S5", "UMBER", ""):
+            with self.subTest(workspace=workspace):
+                self.assertIsNone(
+                    find_id_in_map(
+                        KZP_GROWTH_ACCOUNTS, "Growth", allow_fuzzy=False, client_name=workspace
+                    )
+                )
+
+
+class KzpGrowthAliasSyncTests(unittest.TestCase):
+    """The sync stage must resolve the same way, or a 'Ready to sync' row posts elsewhere."""
+
+    def _sync(self, client_name: str) -> QBOSync:
+        client = MagicMock()
+        client.client_name = client_name
+        with patch.object(QBOSync, "_get_qbo_mappings", return_value={}):
+            sync = QBOSync(client)
+        sync.mappings = {"accounts": KZP_GROWTH_ACCOUNTS, "accounts_meta": {}}
+        return sync
+
+    def test_sync_resolves_both_growth_forms_for_kzp(self):
+        sync = self._sync("KZP")
+        self.assertEqual(sync.find_id("accounts", "Growth"), "5010")
+        self.assertEqual(sync.find_id("accounts", "Growth - Marketing Expense"), "6010")
+
+    def test_sync_still_refuses_ambiguous_growth_for_kzo(self):
+        sync = self._sync("KZO")
+        self.assertIsNone(sync.find_id("accounts", "Growth"))
+
+
+class KzpGrowthAliasReconcileTests(unittest.TestCase):
+    def _reconciler(self, client_name: str) -> Reconciler:
+        client = MagicMock()
+        client.client_name = client_name
+        return Reconciler(client)
+
+    def test_each_growth_form_matches_only_its_own_account(self):
+        rec = self._reconciler("KZP")
+
+        self.assertTrue(rec._is_account_match("Growth", "Marketing Income:Growth"))
+        self.assertFalse(rec._is_account_match("Growth", "Marketing Expense:Growth"))
+        self.assertTrue(
+            rec._is_account_match("Growth - Marketing Expense", "Marketing Expense:Growth")
+        )
+        self.assertFalse(
+            rec._is_account_match("Growth - Marketing Expense", "Marketing Income:Growth")
+        )
+
+    def test_bare_qbo_name_falls_back_to_a_leaf_comparison(self):
+        # QBO does not always report the fully qualified path. With no parent in the payload the
+        # two 'Growth' leaves cannot be told apart, so compare leaves instead of raising a
+        # mismatch the payload cannot prove.
+        rec = self._reconciler("KZP")
+
+        self.assertTrue(rec._is_account_match("Growth", "Growth"))
+        self.assertTrue(rec._is_account_match("Growth - Marketing Expense", "Growth"))
+        self.assertFalse(rec._is_account_match("Growth - Marketing Expense", "Affiliates"))
+
+    def test_unaliased_accounts_keep_suffix_and_fuzzy_matching(self):
+        rec = self._reconciler("KZP")
+
+        self.assertTrue(rec._is_account_match("Equipment", "Fixed Assets:Equipment"))
+        self.assertTrue(rec._is_account_match("Fixed Assets:Equipment", "Fixed Assets:Equipment"))
+        self.assertTrue(rec._is_account_match("Affiliate", "Marketing Income:Affiliates"))
 
 
 if __name__ == "__main__":

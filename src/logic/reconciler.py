@@ -4,6 +4,7 @@ import calendar
 import re
 import difflib
 from src.connectors.qbo_client import QBOClient
+from src.logic.account_aliases import resolve_account_alias_ex
 from src.utils.logger import setup_logger
 
 logger = setup_logger("reconciler")
@@ -170,15 +171,18 @@ class Reconciler:
     def _is_account_match(self, sheet_acc: str, qbo_acc: str) -> bool:
         """
         Returns True if sheet_acc matches qbo_acc using:
-        1. Explicit Replacements
+        1. Workspace account aliases + Explicit Replacements
         2. Exact Match
-        3. Leaf Match
+        3. Suffix-path Match
         4. Fuzzy Match (>80%)
         """
         if not sheet_acc or not qbo_acc: return False
         
-        # 0. Basic Clean
-        sheet_clean = re.sub(r'\s+', ' ', str(sheet_acc)).strip()
+        # 0. Basic Clean + workspace account aliases (KZP's duplicated 'Growth' leaf), so
+        #    the sheet value is compared in the same qualified form the sync stage posted.
+        sheet_clean, sheet_aliased = resolve_account_alias_ex(
+            sheet_acc, getattr(self.client, "client_name", "")
+        )
         qbo_clean = re.sub(r'\s+', ' ', str(qbo_acc)).strip()
         
         # 1. Replacements (Hardcoded fixes)
@@ -197,12 +201,27 @@ class Reconciler:
         # 2. EXACT MATCH
         if s_lower == q_lower: return True
 
-        # 3. LEAF MATCH (e.g. Sheet="Equipment" == QBO="Fixed Assets:Equipment")
+        # 3. SUFFIX-PATH MATCH -- every trailing path of the QBO name, matching the
+        #    transform/sync matchers: Sheet="Equipment" or "Fixed Assets:Equipment"
+        #    both match QBO="Fixed Assets:Equipment".
         if ":" in q_lower:
-            q_leaf = q_lower.split(":")[-1].strip()
-            if s_lower == q_leaf: return True
+            q_parts = [part.strip() for part in q_lower.split(":")]
+            for i in range(1, len(q_parts)):
+                if ":".join(q_parts[i:]) == s_lower:
+                    return True
         
-        # 4. FUZZY MATCH (80%)
+        # 4. FUZZY MATCH (80%) -- never for an alias-disambiguated account. Two 'Growth'
+        #    leaves under different parents score 0.81 against each other, so fuzzy here
+        #    would pass the exact wrong-parent posting the alias table exists to catch.
+        if sheet_aliased:
+            # QBO sometimes reports a bare account Name where a fully qualified path was
+            # expected. With no parent to compare against, the two same-named leaves are
+            # indistinguishable -- compare leaves rather than report a mismatch that the
+            # QBO payload cannot actually prove.
+            if ":" not in q_lower:
+                return s_lower.split(":")[-1].strip() == q_lower
+            return False
+
         # Check against full name
         if difflib.SequenceMatcher(None, s_lower, q_lower).ratio() >= 0.80:
             return True
