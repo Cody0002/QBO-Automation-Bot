@@ -69,6 +69,43 @@ A raw row is held in `Pending Amount Nos` (not pushed to QBO) when it has a `QBO
 but `USD - QBO` is 0. Once the amount is filled in, the next run picks the row up
 automatically, even though its `No.` is already below `Last Processed Row`.
 
+### Duplicate protection: the Transform file outranks `Last Processed Row`
+
+`Last Processed Row` is a checkpoint, not a record. Rows are appended to the Transform file
+**before** the checkpoint is written back to the control sheet, so anything that interrupts a
+run in that window — a Sheets 5xx on the control write, an expired token, a killed process, a
+restarted webhook worker — leaves the work done but the checkpoint stale. Every one of those
+rows then looks new on the next run and is transformed a **second** time under a fresh Ref No.
+A hand-edited or undone checkpoint cell does exactly the same thing. Once synced, that means
+duplicate transactions in QuickBooks.
+
+`preserved_ids` does not save you here: `get_transform_tab_state()` only maps `No -> Ref No`
+for rows flagged **ERROR**, so an already-synced row that gets re-selected is not recognised —
+it is appended again with a new Ref No.
+
+Two guards, both in `run_ingestion.py`:
+
+1. **Checkpoint self-heal** (step 5b). Each Transform tab is read once anyway for the retry
+   context, so that read also reports every `No` the tab already holds. `_heal_last_processed()`
+   raises the checkpoint to `max(cell, max(No in Transform file))`. It only ever moves
+   **forward**, and logs a warning naming both values when it corrects one.
+2. **Append guard** (step 11b). After the ERROR-retry deletions, `_already_transformed_nos()`
+   drops from the batch any `No` still present in the Transform file. Retry `No`s are exempt —
+   their rows were just deleted, so rebuilding them is the intent. Skipped `No`s are logged and
+   appended to the `Pending Nos Note` column.
+
+Consequences worth knowing:
+
+- **Rewinding `Last Processed Row` by hand no longer forces a re-transform.** It never worked
+  the way it appeared to — it duplicated rather than rebuilt. To rebuild a row on purpose, put
+  `ERROR` in its Transform row's `Remarks`: the retry path deletes that row and re-creates it
+  under the **same** Ref No.
+- The guards only move the checkpoint forward, so they cannot recover rows **deleted** from the
+  Transform file while the checkpoint stayed high — those are silently behind the checkpoint and
+  will never be rebuilt. If you delete Transform rows, lower `Last Processed Row` to the highest
+  `No` you kept, then re-run. The raw-vs-transform reconciliation ("possibly skipped rows") is
+  what catches this case.
+
 ### KZO source tabs (all countries)
 
 KZO country tabs (BR, TH, …) share one header set and are mapped **by header name**, not by

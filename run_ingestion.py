@@ -16,7 +16,7 @@ load_dotenv("config/secrets.env")
 import calendar
 import re
 from datetime import datetime
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Set
 import pandas as pd
 from config import settings
 from src.connectors.gsheets_client import GSheetsClient
@@ -290,31 +290,51 @@ def _get_successfully_processed_nos(gs: GSheetsClient, spreadsheet_url: str, tab
 
     return processed
 
-def get_retry_context(
+def get_transform_tab_state(
     gs: GSheetsClient,
     spreadsheet_url: str,
     tab_name: str,
     id_col_name: str,
     include_doc_id_match: bool = True,
-) -> Tuple[List[int], Dict[int, str]]:
-    """Identifies rows marked as 'ERROR' in the Transform file to re-process them."""
+) -> Tuple[List[int], Dict[int, str], Set[int]]:
+    """Read one Transform tab once and report what it already holds.
+
+    Returns (rows_to_delete, preserved_ids, present_nos):
+      * rows_to_delete / preserved_ids -- the ERROR-retry context: rows flagged
+        ERROR/Unbalanced, to be deleted and rebuilt under their existing document id.
+      * present_nos -- every raw 'No' already written to the tab, whatever its status.
+
+    present_nos exists because rows are appended to the Transform file (step 13) *before*
+    'Last Processed Row' is written back to the control sheet (step 15). A run that dies in
+    that window leaves the work done but the checkpoint stale, and every one of those rows
+    then looks new again on the next run and is transformed a second time under a fresh Ref
+    No. The Transform file is the durable record of what was actually produced, so callers
+    trust it over the checkpoint cell.
+    """
     try:
         # Use read_as_df to keep row positions aligned with sheet rows.
         df = gs.read_as_df(spreadsheet_url, tab_name)
-        if df.empty or "Remarks" not in df.columns or id_col_name not in df.columns:
-            return [], {}
+        if df.empty or "No" not in df.columns:
+            return [], {}, set()
 
         work_df = df.copy()
         work_df["_sheet_row"] = work_df.index + 2  # +2 for header + 0-indexed DataFrame
+        work_df["_no"] = pd.to_numeric(work_df.get("No"), errors="coerce")
+        present_nos = {
+            int(x) for x in work_df["_no"].dropna().astype(int).tolist() if int(x) > 0
+        }
+
+        if "Remarks" not in df.columns or id_col_name not in df.columns:
+            return [], {}, present_nos
+
         work_df["_remarks"] = work_df["Remarks"].astype(str)
         work_df["_doc_id"] = work_df[id_col_name].astype(str).str.strip()
-        work_df["_no"] = pd.to_numeric(work_df.get("No"), errors="coerce")
 
         # Any row flagged as error/unbalanced should trigger full cleanup for its document/no.
         error_mask = work_df["_remarks"].str.contains("ERROR|Unbalance", case=False, na=False)
         bad_rows = work_df[error_mask]
         if bad_rows.empty:
-            return [], {}
+            return [], {}, present_nos
 
         bad_ids = set()
         if include_doc_id_match:
@@ -335,7 +355,7 @@ def get_retry_context(
 
         target_df = work_df[target_mask].copy()
         if target_df.empty:
-            return [], {}
+            return [], {}, present_nos
 
         rows_to_delete = sorted(target_df["_sheet_row"].astype(int).unique().tolist(), reverse=True)
         existing_id_map = {}
@@ -349,10 +369,35 @@ def get_retry_context(
             except Exception:
                 pass
 
-        return rows_to_delete, existing_id_map
+        return rows_to_delete, existing_id_map, present_nos
     except Exception as e:
-        logger.exception(f"get_retry_context crashed on tab '{tab_name}': {e}")
+        logger.exception(f"get_transform_tab_state crashed on tab '{tab_name}': {e}")
         raise
+
+
+def _heal_last_processed(last_processed: int, transformed_nos: set[int]) -> int:
+    """Raise the checkpoint to cover rows the Transform file already holds.
+
+    The control-sheet cell can lag behind reality (a run that appended rows then failed
+    before step 15, or a hand-edit that rewound it). Rows in the Transform file are finished
+    work, so the checkpoint may only ever move forward to include them.
+    """
+    if not transformed_nos:
+        return last_processed
+    return max(int(last_processed), max(transformed_nos))
+
+
+def _already_transformed_nos(
+    processing_nos: set[int],
+    transformed_nos: set[int],
+    retry_nos: set[int],
+) -> set[int]:
+    """Nos selected for processing that the Transform file already holds.
+
+    Retry Nos are excluded: their rows are deleted before the append, so rebuilding them is
+    the intended behavior. Everything else would be a second copy under a new Ref No.
+    """
+    return {n for n in processing_nos if n in transformed_nos and n not in retry_nos}
 
 def _get_sheet_rows_for_nos(
     gs: GSheetsClient,
@@ -513,10 +558,8 @@ def process_client_control_sheet(
             
             last_exp = _safe_int(row.get(COL_LAST_EXP, 0))
             last_tr = _safe_int(row.get(COL_LAST_TR, 0))
-            previous_pending_nos = _cap_pending_nos(
-                _parse_no_set(row.get(COL_PENDING_AMOUNT_NOS, "")),
-                last_processed
-            )
+            pending_nos_from_control = _parse_no_set(row.get(COL_PENDING_AMOUNT_NOS, ""))
+            previous_pending_nos = _cap_pending_nos(pending_nos_from_control, last_processed)
 
             # If this run created a brand-new transform file, treat it as a fresh row state.
             # This avoids accidental skipping when a duplicated control row carries old counters.
@@ -532,34 +575,57 @@ def process_client_control_sheet(
             tab_prefix = f"{country} {month}"
             tab_jv, tab_exp, tab_tr = f"{tab_prefix} - Journals", f"{tab_prefix} - Expenses", f"{tab_prefix} - Transfers"
         
-            # 5. Build retry context from existing transform ERROR rows.
+            # 5. Read each Transform tab once: ERROR-retry context + the raw Nos it already
+            #    holds (the durable record of what was actually produced).
             preserved_ids = {'journals': {}, 'expenses': {}, 'transfers': {}}
             deletions: Dict[str, List[int]] = {}
             retry_nos: list[int] = []
+            transformed_nos: set[int] = set()
 
             # Retry by raw No only (avoid broad doc-id expansion).
-            d_jv, ids_jv = get_retry_context(
+            d_jv, ids_jv, nos_jv = get_transform_tab_state(
                 gs, transform_url, tab_jv, "Journal No", include_doc_id_match=False
             )
             if d_jv:
                 deletions[tab_jv] = d_jv
                 preserved_ids['journals'] = ids_jv
+            transformed_nos |= nos_jv
 
-            d_exp, ids_exp = get_retry_context(
+            d_exp, ids_exp, nos_exp = get_transform_tab_state(
                 gs, transform_url, tab_exp, "Exp Ref. No", include_doc_id_match=False
             )
             if d_exp:
                 deletions[tab_exp] = d_exp
                 preserved_ids['expenses'] = ids_exp
+            transformed_nos |= nos_exp
 
-            d_tr, ids_tr = get_retry_context(
+            d_tr, ids_tr, nos_tr = get_transform_tab_state(
                 gs, transform_url, tab_tr, "Ref No", include_doc_id_match=False
             )
             if d_tr:
                 deletions[tab_tr] = d_tr
                 preserved_ids['transfers'] = ids_tr
+            transformed_nos |= nos_tr
 
             retry_nos = list(set([k for sub in preserved_ids.values() for k in sub.keys()]))
+
+            # 5b. Self-heal the checkpoint. Rows are appended to the Transform file (step 13)
+            #     before Last Processed Row is written back (step 15), so a run that broke in
+            #     that window left the work done but the cell stale -- and every one of those
+            #     rows would look new again here and be transformed a second time under a
+            #     fresh Ref No. Same effect if the cell was rewound by hand. The Transform
+            #     file is the record of truth, so the checkpoint only moves forward.
+            healed_last_processed = _heal_last_processed(last_processed, transformed_nos)
+            if healed_last_processed > last_processed:
+                logger.warning(
+                    f"   ⚠️ [{client_name}] '{settings.CTRL_COL_LAST_PROCESSED_ROW}' "
+                    f"({last_processed}) is behind the Transform file (max No "
+                    f"{healed_last_processed}). A previous run wrote rows without saving the "
+                    f"checkpoint, or the cell was edited. Using {healed_last_processed} so "
+                    f"those rows are not transformed twice."
+                )
+                last_processed = healed_last_processed
+                previous_pending_nos = _cap_pending_nos(pending_nos_from_control, last_processed)
 
             # 6. Read & Clean Source Data
             raw_df = _read_source_raw_df(
@@ -754,6 +820,34 @@ def process_client_control_sheet(
             
             # 11. Execute Deletions (Clean up bad rows before appending new ones)
             for tab, rows in deletions.items(): gs.delete_rows(transform_url, tab, rows)
+
+            # 11b. Last line of defence: whatever the checkpoint said, a No still present in
+            #      the Transform file after the deletions above is finished work. Appending it
+            #      again would mint a second Ref No for the same source row and (once synced)
+            #      double-post it to QBO.
+            processing_nos = (
+                pd.to_numeric(processing_df["No"], errors="coerce").fillna(0).astype(int)
+            )
+            duplicate_nos = _already_transformed_nos(
+                set(processing_nos.tolist()), transformed_nos, retry_selected_nos
+            )
+            if duplicate_nos:
+                dup_mask = processing_nos.isin(duplicate_nos)
+                preview = sorted(duplicate_nos)
+                logger.warning(
+                    f"   ⚠️ [{client_name}] Skipping {int(dup_mask.sum())} row(s) already in the "
+                    f"Transform file: {preview[:20]}{' ...' if len(preview) > 20 else ''}. "
+                    f"To rebuild one on purpose, mark its Transform row ERROR so the retry path "
+                    f"deletes it and reuses its Ref No."
+                )
+                skip_note = (
+                    f"skipped {len(duplicate_nos)} already-transformed No(s): "
+                    f"{_serialize_no_set(duplicate_nos)}"
+                )
+                pending_nos_note = (
+                    f"{pending_nos_note}; {skip_note}" if pending_nos_note else skip_note
+                )
+                processing_df = processing_df[~dup_mask.values].copy()
 
             logger.info(f"   [{client_name}] Transforming {len(processing_df)} rows...")
 
