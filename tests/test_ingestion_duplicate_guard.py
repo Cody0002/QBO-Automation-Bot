@@ -3,11 +3,23 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 
+from config import settings
 from run_ingestion import (
     _already_transformed_nos,
+    _control_cell_ref,
     _heal_last_processed,
+    _kzo_checkpoint_cell,
+    _kzo_last_processed_formula,
+    format_month_name,
     get_transform_tab_state,
 )
+
+# Control tab header order, as laid out in the live JOBS CONTROL sheet.
+CONTROL_COLUMNS = [
+    "Client", "Country", "Month", "Last Month Date", "Source File", "Transform File",
+    "Tab Name", "Transform", "QBO Sync", "Last Journal No", "Last Expense No",
+    "Last Processed Row",
+]
 
 
 def _gs_with_tab(rows, columns=None):
@@ -115,6 +127,53 @@ class AlreadyTransformedNosTests(unittest.TestCase):
         self.assertEqual(
             _already_transformed_nos({8240001, 8240002}, {8170001}, retry_nos=set()),
             set(),
+        )
+
+
+class KzoCheckpointFormulaTests(unittest.TestCase):
+    """KZO stores 'Last Processed Row' as a live formula over its Transform tabs."""
+
+    def test_transform_file_column_resolves_to_its_a1_ref(self):
+        # 'Transform File' is column F in the live control sheet.
+        self.assertEqual(
+            _control_cell_ref(CONTROL_COLUMNS, settings.CTRL_COL_TRANSFORM_URL, 54), "F54"
+        )
+        self.assertEqual(
+            _control_cell_ref(CONTROL_COLUMNS, settings.CTRL_COL_TRANSFORM_URL, 53), "F53"
+        )
+
+    def test_missing_column_has_no_ref(self):
+        self.assertIsNone(_control_cell_ref(["Country"], settings.CTRL_COL_TRANSFORM_URL, 54))
+
+    def test_formula_reads_all_three_tabs_of_the_row_month(self):
+        formula = _kzo_last_processed_formula("F54", "PH Aug 26")
+
+        self.assertTrue(formula.startswith("=IFERROR(MAX(UNIQUE(VSTACK("))
+        for tab in ("Journals", "Expenses", "Transfers"):
+            self.assertIn(f'IMPORTRANGE(F54, "PH Aug 26 - {tab}!A2:A")', formula)
+        # Every range is guarded, so a tab that does not exist yet reads 0, not #REF!.
+        self.assertEqual(formula.count("IFERROR("), 4)
+
+    def test_tab_names_follow_the_month_and_year(self):
+        # The prefix comes from the row's own Country + Month, so Sep and a year roll are
+        # picked up with no edit to the formula.
+        self.assertEqual(format_month_name("2026-09-01"), "Sep 26")
+        self.assertEqual(format_month_name("2027-01-01"), "Jan 27")
+        self.assertIn(
+            'IMPORTRANGE(F60, "PH Jan 27 - Journals!A2:A")',
+            _kzo_last_processed_formula("F60", "PH Jan 27"),
+        )
+
+    def test_kzo_gets_the_formula_and_others_keep_the_number(self):
+        kzo = _kzo_checkpoint_cell(True, CONTROL_COLUMNS, 54, "PH Aug 26", 8230025)
+        other = _kzo_checkpoint_cell(False, CONTROL_COLUMNS, 7, "TH Aug 26", 8230146)
+
+        self.assertTrue(str(kzo).startswith("="))
+        self.assertEqual(other, 8230146)  # KZP / S5 / UMBER / KZDW keep the snapshot
+
+    def test_falls_back_to_the_number_without_a_transform_file_column(self):
+        self.assertEqual(
+            _kzo_checkpoint_cell(True, ["Country", "Month"], 54, "PH Aug 26", 8230025), 8230025
         )
 
 

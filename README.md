@@ -106,6 +106,45 @@ Consequences worth knowing:
   `No` you kept, then re-run. The raw-vs-transform reconciliation ("possibly skipped rows") is
   what catches this case.
 
+#### KZO: `Last Processed Row` is a live formula
+
+For **KZO only**, the pipeline writes a formula into `Last Processed Row` instead of the number
+the run happened to reach, so the cell reads the Transform file rather than remembering it:
+
+```
+=IFERROR(MAX(UNIQUE(VSTACK(
+  IFERROR(IMPORTRANGE(F54, "PH Aug 26 - Journals!A2:A"),  0),
+  IFERROR(IMPORTRANGE(F54, "PH Aug 26 - Expenses!A2:A"),  0),
+  IFERROR(IMPORTRANGE(F54, "PH Aug 26 - Transfers!A2:A"), 0)
+))), 0)
+```
+
+Written on every run (including runs with nothing to transform), so it installs and repairs
+itself — no manual formula maintenance per month. Both parts are derived from the row:
+
+- `F54` — the `Transform File` cell of *this* control row, from the header position and row
+  number, so it follows column moves and row inserts.
+- `PH Aug 26` — the row's own `Country` + `Month`, formatted `%b %y`. September 2027 becomes
+  `PH Sep 27` with no edit.
+- `A2:A` is the `No` column: all three Transform tabs start with it.
+
+Each `IMPORTRANGE` is wrapped in `IFERROR` so a month whose tabs don't all exist yet reads `0`
+rather than poisoning the whole formula with `#REF!`. A `0` is safe — the self-heal above
+recovers the real checkpoint straight from the tabs and step 11b still refuses to re-append
+anything already there. A non-numeric checkpoint cell is logged as a warning naming the value.
+
+Two things to know:
+
+- **The first run against a new month's Transform file returns `#REF!` until someone opens the
+  control sheet and approves the IMPORTRANGE link once.** That approval is per
+  (source, destination) pair, so each new monthly Transform file needs it. Until then the row
+  falls back to the Transform-file scan, which is correct but does an extra read.
+- `IMPORTRANGE` results are cached for a few minutes, so back-to-back runs can see a stale
+  value. Harmless here: the checkpoint is only ever a hint, and the two guards above decide
+  what actually gets appended.
+
+Other clients (KZP / S5 / UMBER / KZDW) keep the plain number.
+
 ### KZO source tabs (all countries)
 
 KZO country tabs (BR, TH, …) share one header set and are mapped **by header name**, not by

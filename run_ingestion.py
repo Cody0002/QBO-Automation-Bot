@@ -26,6 +26,7 @@ from src.logic.transformer import transform_raw
 from src.utils.logger import setup_logger
 from src.logic.raw_adapter import standardize_raw_df, RAW_STANDARD_COLUMNS
 from src.utils.run_lock import single_instance_lock
+from gspread.utils import rowcol_to_a1
 
 logger = setup_logger("ingestion")
 
@@ -188,6 +189,58 @@ def _serialize_no_set(vals: set[int]) -> str:
     if not vals:
         return ""
     return ";".join(str(x) for x in sorted(vals))
+
+def _control_cell_ref(columns, col_name: str, row_num: int) -> str | None:
+    """A1 reference of `col_name` on `row_num` of the control tab (e.g. 'F54')."""
+    headers = list(columns)
+    if col_name not in headers:
+        return None
+    return rowcol_to_a1(row_num, headers.index(col_name) + 1)
+
+
+# The 'No' the transformer writes is column A of every Transform tab (Journals, Expenses and
+# Transfers all start with it), which is what the formula below reads.
+TRANSFORM_NO_COLUMN_RANGE = "A2:A"
+
+
+def _kzo_last_processed_formula(transform_url_ref: str, tab_prefix: str) -> str:
+    """Live 'Last Processed Row' for KZO: max raw No across the month's three Transform tabs.
+
+    Stored as a formula rather than a snapshot so the checkpoint tracks the Transform file
+    itself. A run that appends rows and then dies before step 15 no longer leaves the cell
+    behind reality, because the cell was never the record in the first place.
+
+    Each IMPORTRANGE is wrapped in IFERROR so a month whose tabs do not all exist yet (or an
+    IMPORTRANGE link still awaiting its one-time approval) reads 0 instead of poisoning the
+    whole formula with #REF!. A 0 is safe: `_heal_last_processed` then recovers the real
+    checkpoint from the tabs directly, and step 11b refuses to append anything already there.
+    """
+    ranges = ", ".join(
+        f'IFERROR(IMPORTRANGE({transform_url_ref}, "{tab_prefix} - {tab}!{TRANSFORM_NO_COLUMN_RANGE}"), 0)'
+        for tab in ("Journals", "Expenses", "Transfers")
+    )
+    return f"=IFERROR(MAX(UNIQUE(VSTACK({ranges}))), 0)"
+
+
+def _kzo_checkpoint_cell(
+    is_kzo_client: bool,
+    columns,
+    row_num: int,
+    tab_prefix: str,
+    fallback,
+):
+    """What to write into 'Last Processed Row': KZO's live formula, else the snapshot.
+
+    Returns `fallback` for non-KZO clients, or when the control tab has no Transform File
+    column to point IMPORTRANGE at.
+    """
+    if not is_kzo_client:
+        return fallback
+    transform_cell = _control_cell_ref(columns, settings.CTRL_COL_TRANSFORM_URL, row_num)
+    if not transform_cell:
+        return fallback
+    return _kzo_last_processed_formula(transform_cell, tab_prefix)
+
 
 def _decode_kzo_no(no_val: int, expected_month: int | None) -> str | None:
     """Best-effort reverse of the KZO 'No.' formula's date prefix.
@@ -539,7 +592,15 @@ def process_client_control_sheet(
                     raise e
             
             # 4. Prepare ID Counters
-            last_processed = _safe_int(row.get(settings.CTRL_COL_LAST_PROCESSED_ROW, 0))
+            last_processed_raw = row.get(settings.CTRL_COL_LAST_PROCESSED_ROW, 0)
+            last_processed = _safe_int(last_processed_raw)
+            if last_processed == 0 and str(last_processed_raw).strip() not in ("", "0", "nan", "<NA>"):
+                logger.warning(
+                    f"   ⚠️ [{client_name}] '{settings.CTRL_COL_LAST_PROCESSED_ROW}' did not parse as "
+                    f"a number (value: {str(last_processed_raw).strip()!r}); treating it as 0 and "
+                    f"recovering the checkpoint from the Transform file. If that is #REF!, the "
+                    f"IMPORTRANGE link needs its one-time approval in the control sheet."
+                )
             
             # Fetch latest QBO Journal No to prevent overlap.
             client_lower = client_name.lower()
@@ -797,12 +858,20 @@ def process_client_control_sheet(
                 pending_to_write = _pending_nos_for_control(
                     current_pending_nos, last_processed, forced_pending_nos
                 )
-                _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {
+                idle_updates = {
                     settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
                     COL_PENDING_AMOUNT_NOS: _serialize_no_set(pending_to_write), # <-- ADDED
                     settings.CTRL_COL_PENDING_NOS_NOTE: pending_nos_note,
                     settings.CTRL_COL_ACTIVE: "DONE"
-                })
+                }
+                # Install/repair KZO's live checkpoint formula even on a run with nothing to
+                # transform, so it does not wait for the next batch to appear.
+                idle_checkpoint = _kzo_checkpoint_cell(
+                    is_kzo_client, ctrl_df.columns, row_num, tab_prefix, None
+                )
+                if idle_checkpoint is not None:
+                    idle_updates[settings.CTRL_COL_LAST_PROCESSED_ROW] = idle_checkpoint
+                _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, idle_updates)
                 continue
 
             # Delete only rows that are actually being retried from ERROR state.
@@ -901,9 +970,14 @@ def process_client_control_sheet(
             pending_to_write = _pending_nos_for_control(
                 current_pending_nos, final_last_row, forced_pending_nos
             )
+            # KZO stores the checkpoint as a live formula over the Transform tabs rather than
+            # the number this run happened to reach; everyone else keeps the snapshot.
+            last_processed_cell = _kzo_checkpoint_cell(
+                is_kzo_client, ctrl_df.columns, row_num, tab_prefix, final_last_row
+            )
 
             updates = {
-                settings.CTRL_COL_LAST_PROCESSED_ROW: final_last_row,
+                settings.CTRL_COL_LAST_PROCESSED_ROW: last_processed_cell,
                 COL_LAST_JV: result.last_journal_no,
                 COL_LAST_EXP: result.last_expense_no,
                 COL_LAST_TR: result.last_withdraw_no,
