@@ -2,7 +2,11 @@ import unittest
 
 import pandas as pd
 
-from src.logic.raw_adapter import RAW_STANDARD_COLUMNS, standardize_raw_df
+from src.logic.raw_adapter import (
+    RAW_STANDARD_COLUMNS,
+    _resolve_kzo_co_col,
+    standardize_raw_df,
+)
 
 
 class KzpAugustRawAdapterTests(unittest.TestCase):
@@ -244,6 +248,83 @@ class KzoCountryRawAdapterTests(unittest.TestCase):
         result = standardize_raw_df(raw_df, client_name="KZO", raw_month="2025-12")
 
         self.assertEqual(result.loc[0, "No"], 2)
+
+
+class KzoBlankCoHeaderRawAdapterTests(unittest.TestCase):
+    """The PH country tab: column A's header cell is blank, and "No" IS named at AA.
+
+    Requiring the literal "CO" header used to knock this whole tab into the legacy
+    positional layout, which reads "No" from index 24 ("Transfer to"). Every No came out 0,
+    so raw-vs-transform reconciliation reported every transformed row as "Missing in Raw".
+    """
+
+    HEADER = [
+        "  ",  # A -> CO, header cell left blank on the PH tab
+        "COY", "Date", "Category", "Sub Category", "Item Description", "TrxHash",
+        "From Account", "To Account", "Currency From", "Amount From", "Currency To",
+        "Amount To", "Budget\nRate", "USD", "Actual USD\nTransacted", "Realised\nLoss",
+        "Transacted Amount Check", "Variance Check ", "USD - QBO", "Reclass/To check",
+        "QBO Import Method \n (Journal/Expenses/Transfer)",
+        "If Journal/Expense method:\n Another records",
+        "Transfer from", "Transfer to", "Checking ( For our use only )",
+        "No",   # AA -> named here, unlike the other country tabs
+        "",     # AB.. -> dropdown helper values, blank headers
+        "",
+    ]
+
+    ROW = [
+        "PH", "KZO", "23-Aug", "Transfer", "Settlement",
+        "PH KZO settlement", "", "Payment Gateway - PH", "KZO PH SETTLE TRC 1",
+        "PHP", "-16,259.89", "USDT TRC", "2,978.00", "5.21", "-3,121.35",
+        "2,978.00", "-143.35", "-3,121.35", "0", "2,978.00", "",
+        "Transfer", "", "Payment Gateway - PH", "KZO PH SETTLE TRC 1", "",
+        "8230025", "B2B", "Fund In",
+    ]
+
+    def _standardize(self):
+        return standardize_raw_df(
+            pd.DataFrame([self.ROW], columns=self.HEADER),
+            client_name="KZO",
+            raw_month="2026-08",
+        )
+
+    def test_blank_co_header_still_takes_the_kzo_layout(self):
+        result = self._standardize()
+
+        self.assertEqual(result.columns.tolist(), RAW_STANDARD_COLUMNS)
+        # The legacy positional fallback would put "Transfer to" text here -> No == 0.
+        self.assertEqual(result.loc[0, "No"], 8230025)
+
+    def test_co_is_read_from_the_blank_headed_column(self):
+        # CO drives Location/Class downstream, so losing it is not cosmetic.
+        self.assertEqual(self._standardize().loc[0, "CO"], "PH")
+
+    def test_the_rest_of_the_row_is_not_shifted(self):
+        result = self._standardize()
+
+        self.assertEqual(result.loc[0, "COY"], "KZO")
+        self.assertEqual(result.loc[0, "USD - QBO"], 2978.0)
+        self.assertEqual(result.loc[0, "QBO Method"], "Transfer")
+        self.assertEqual(result.loc[0, "QBO Transfer Fr"], "Payment Gateway - PH")
+        self.assertEqual(result.loc[0, "QBO Transfer To"], "KZO PH SETTLE TRC 1")
+
+
+class ResolveKzoCoColumnTests(unittest.TestCase):
+    def test_named_header_wins(self):
+        df = pd.DataFrame(columns=["CO", "COY", "Date"])
+        self.assertEqual(_resolve_kzo_co_col(df), "CO")
+
+    def test_blank_header_resolves_to_the_column_left_of_coy(self):
+        df = pd.DataFrame(columns=["", "COY", "Date"])
+        self.assertEqual(_resolve_kzo_co_col(df), "")
+
+    def test_no_coy_anchor_means_no_co(self):
+        df = pd.DataFrame(columns=["", "Date", "Category"])
+        self.assertIsNone(_resolve_kzo_co_col(df))
+
+    def test_coy_in_the_first_position_has_nothing_to_its_left(self):
+        df = pd.DataFrame(columns=["COY", "Date"])
+        self.assertIsNone(_resolve_kzo_co_col(df))
 
 
 if __name__ == "__main__":

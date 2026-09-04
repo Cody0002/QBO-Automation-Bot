@@ -19,7 +19,7 @@ from src.connectors.gsheets_client import GSheetsClient
 from src.connectors.qbo_client import QBOClient
 from src.logic.reconciler import Reconciler
 from src.utils.logger import setup_logger
-from src.logic.raw_adapter import standardize_raw_df
+from src.logic.raw_adapter import standardize_raw_df, RAW_STANDARD_COLUMNS
 from src.utils.run_lock import single_instance_lock
 
 logger = setup_logger("reconciliation_runner")
@@ -255,18 +255,12 @@ def process_client_reconcile(
                         value_render_option='UNFORMATTED_VALUE'
                     )
                     raw_df = standardize_raw_df(raw_df, client_name=client_name, raw_month=raw_month)
-                    # Apply Standard Columns
-                    raw_df = raw_df.iloc[:, :25]  # Keep first 25 columns
+                    # standardize_raw_df already returns the canonical schema, so reindex by
+                    # name (as run_ingestion does) instead of renaming the first 25 columns by
+                    # position -- a positional rename silently mislabels every column if the
+                    # canonical order ever changes.
+                    raw_df = raw_df.reindex(columns=RAW_STANDARD_COLUMNS, fill_value="")
 
-                    raw_df.columns = [
-                        "CO", "COY", "Date", "Category", "Type", "Item Description", 
-                        "TrxHarsh", "Account Fr", "Account To", "Currency", "Amount Fr", 
-                        "Currency To", "Amount To", "Budget", "USD - Raw", "USD - Actual", 
-                        "USD - Loss", "USD - QBO", "Reclass", "QBO Method", 
-                        "If Journal/Expense Method", "QBO Transfer Fr", "QBO Transfer To", 
-                        "Check (Internal use)", "No",# <--- ADD THIS
-                    ]
-                    
                     # 8. Numeric Cleanup
                     for col in ["No", "USD - QBO", "Amount Fr", "Amount To"]:
                         if col in raw_df.columns:

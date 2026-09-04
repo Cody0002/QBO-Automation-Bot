@@ -5,6 +5,10 @@ from typing import Iterable
 
 import pandas as pd
 
+from src.utils.logger import setup_logger
+
+logger = setup_logger("raw_adapter")
+
 RAW_STANDARD_COLUMNS = [
     "CO",
     "COY",
@@ -197,6 +201,28 @@ def _resolve_kzo_no_col(df: pd.DataFrame) -> str | None:
     return columns[position]
 
 
+def _resolve_kzo_co_col(df: pd.DataFrame) -> str | None:
+    """Locate the country column of a KZO country tab.
+
+    Some country tabs ship column A with an empty header cell -- the PH tab does -- exactly
+    like the row-number column. CO always sits immediately left of COY, so anchor on that
+    rather than requiring the header text.
+    """
+    named = _find_col(df, ["CO"])
+    if named is not None:
+        return named
+
+    columns = list(df.columns)
+    anchor = _find_col(df, ["COY"])
+    if anchor is None or anchor not in columns:
+        return None
+
+    position = columns.index(anchor) - 1
+    if position < 0:
+        return None
+    return columns[position]
+
+
 def _standardize_kzo(df: pd.DataFrame) -> pd.DataFrame:
     """Map the header-based KZO country layout (BR/TH/... share the same headers)."""
     idx = df.index
@@ -205,6 +231,9 @@ def _standardize_kzo(df: pd.DataFrame) -> pd.DataFrame:
     for canonical_name, source_aliases in KZO_COLUMN_ALIASES.items():
         source_col = _find_col(df, source_aliases)
         out[canonical_name] = df[source_col] if source_col is not None else ""
+
+    co_col = _resolve_kzo_co_col(df)
+    out["CO"] = df[co_col] if co_col is not None else ""
 
     no_col = _resolve_kzo_no_col(df)
     out["No"] = df[no_col] if no_col is not None else ""
@@ -505,10 +534,14 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
     is_umber_client = "umber" in client_lower
     is_kzo_client = "kzo" in client_lower
     # All KZO country tabs share one header set, so map them by name rather than by
-    # position. "No" is deliberately not required here: its header cell is usually blank
-    # and it is resolved positionally from the "Checking" anchor instead.
+    # position. "No" and "CO" are deliberately not required by header text: their header
+    # cells are often blank (No on most tabs, CO on PH), so both are resolved positionally
+    # from a neighbouring anchor instead. Requiring the literal "CO" header here used to
+    # drop the whole PH tab into the legacy positional layout, which reads "No" from column
+    # 24 ("Transfer to") -- every No came out 0 and every transformed row reconciled as
+    # "Missing in Raw".
     has_kzo_header_shape = (
-        _find_col(cleaned, ["CO"]) is not None
+        _resolve_kzo_co_col(cleaned) is not None
         and _find_col(cleaned, ["COY"]) is not None
         and _find_col(cleaned, ["USD - QBO"]) is not None
         and _find_col(cleaned, KZO_METHOD_ALIASES) is not None
@@ -548,6 +581,17 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
         return _standardize_kzdw(cleaned)
     if is_kzo_client and has_kzo_header_shape:
         return _standardize_kzo(cleaned)
+    if is_kzo_client:
+        # The legacy positional layout maps columns by index, so a KZO tab that lands here
+        # by accident produces silently wrong data (most visibly No=0 for every row) rather
+        # than an error. Say so.
+        logger.warning(
+            "⚠️ [%s] KZO header shape not recognised; falling back to the legacy positional "
+            "layout. Check the raw tab headers: CO/COY, USD - QBO, the QBO Import Method "
+            "column and 'Checking ( For our use only )'. Columns found: %s",
+            client_name,
+            list(cleaned.columns)[:28],
+        )
     if is_umber_client:
         # Umber exports have two "Date" columns; Q (the second Date) is the source-of-truth date.
         return _standardize_s5(cleaned, prefer_secondary_date=True, preserve_source_currency=True)
