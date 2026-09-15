@@ -160,6 +160,49 @@ Pre-2026 KZO tabs (same headers, without the two check columns) work unchanged. 
 `src/logic/raw_adapter.py` (`_standardize_kzo`, `_resolve_kzo_no_col`) and the
 "KZO source layout" section in `DOCUMENTATION.md`.
 
+### S5: the header row is found, not assumed
+
+S5 is the only client whose raw tab keeps a **wallet-balance block above the transaction
+grid**, so its header row moves down (or up) whenever an analyst adds or removes a wallet
+line. It sat on row 19 until Sep 2026, when an inserted line pushed it to row 20.
+
+Both stages used to hardcode row 19, and reading the wrong row failed **silently**: the row
+above the header is a `Follow Invoice Date / Follow Payment Date / Cr / Dr` legend, so every
+column came out mislabelled, `_standardize_s5` found no `Date` and no `Category`, its
+end-of-function filter dropped all 4,879 rows, and `run_ingestion.py` wrote `DONE (Empty)` as
+though the tab had no data at all.
+
+`read_s5_raw_df()` in `src/logic/raw_adapter.py` now locates the header by content. It scans
+the first 40 rows for a row carrying one alias from each of:
+
+| Group | Accepted headers |
+|---|---|
+| Country | `CO` |
+| Date | `Date` |
+| Category | `Category` |
+| Bank | `Bank`, `Bank/Crypto` |
+| Method | `QBO Import`, `QBO Way` |
+| Amount | `Final Amount to be take (different currency)`, `Final Amount` |
+
+`Date` and `Category` are required precisely because `_standardize_s5` filters on them — a row
+this accepts cannot produce the silent empty frame. Matching ignores case, newlines and
+repeated spaces, so `P&L (Actual)\nMonth`-style headers are fine.
+
+Behavior:
+
+- Header on row 19 → used silently, as before.
+- Header anywhere else in the first 40 rows → used, with an INFO line naming the row it moved
+  to (`S5 source header found on row 20 (was row 19)`).
+- No header found → **`ValueError`**, so the run fails loudly instead of reporting `Empty`.
+- Tab missing → empty frame, unchanged.
+
+The grid is fetched once via `GSheetsClient.read_values()` and the frame built with
+`GSheetsClient.df_from_values()`, so discovery costs no extra API call. `read_as_df()` is now a
+thin wrapper over those two and behaves exactly as before.
+
+Both `run_ingestion.py` and `run_reconciliation.py` go through `read_s5_raw_df()`. **KZO, KZP,
+KZDW and UMBER are unchanged** and keep their fixed header rows (1, 5/4, 5, 4 respectively).
+
 ### KZO: blank header cells in the country tabs
 
 Two columns in the KZO country layout routinely ship with an **empty header cell**, so neither

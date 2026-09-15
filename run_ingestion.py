@@ -24,7 +24,7 @@ from src.connectors.qbo_client import QBOClient
 from src.logic.syncing import QBOSync
 from src.logic.transformer import transform_raw
 from src.utils.logger import setup_logger
-from src.logic.raw_adapter import standardize_raw_df, RAW_STANDARD_COLUMNS
+from src.logic.raw_adapter import standardize_raw_df, read_s5_raw_df, RAW_STANDARD_COLUMNS
 from src.utils.run_lock import single_instance_lock
 from gspread.utils import rowcol_to_a1
 
@@ -154,12 +154,15 @@ def _read_source_raw_df(gs, source_url: str, raw_tab_name: str, client_name: str
             "Expected Date, From Account, USD - QBO, and QBO Import columns."
         )
 
+    if "s5" in client_name_lower:
+        # S5's header row moves with the wallet-balance block above the grid, so it is
+        # located by content rather than fixed at row 19. See read_s5_raw_df.
+        return read_s5_raw_df(gs, source_url, raw_tab_name, client_name)
+
     if "kzdw" in client_name_lower:
         source_header_row = 5
     elif "umber" in client_name_lower:
         source_header_row = 4
-    elif "s5" in client_name_lower:
-        source_header_row = 19
     else:
         source_header_row = 1
 

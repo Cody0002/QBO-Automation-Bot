@@ -1,10 +1,15 @@
 import unittest
+from unittest.mock import Mock
 
 import pandas as pd
 
 from src.logic.raw_adapter import (
     RAW_STANDARD_COLUMNS,
+    S5_DEFAULT_HEADER_ROW,
     _resolve_kzo_co_col,
+    find_s5_header_row,
+    read_s5_raw_df,
+    row_is_s5_header,
     standardize_raw_df,
 )
 
@@ -325,6 +330,98 @@ class ResolveKzoCoColumnTests(unittest.TestCase):
     def test_coy_in_the_first_position_has_nothing_to_its_left(self):
         df = pd.DataFrame(columns=["COY", "Date"])
         self.assertIsNone(_resolve_kzo_co_col(df))
+
+
+class S5HeaderDiscoveryTests(unittest.TestCase):
+    """The S5 header row moves as the wallet-balance block above it grows or shrinks."""
+
+    # Verbatim from the live S5 tab, including the newlines and the blank spacer cells.
+    HEADER = [
+        "CO", "P&L (Actual)\nMonth", "P&L (Cashflow) \nMonth", "Date", "Category",
+        "Type", "Item Description", "Project Name", "Currency", "BS/PL",
+        "Fund Transfer From", "Bank", "In/Out (USD)", "", "QBO Way",
+        "Transfer Fund To", "QBO Post", "Optional: \nDr or Cr", "", "QBO Import",
+        "Final Amount to be take (different currency)",
+        "If Journal/Expense method:\nAnother records", "Transfer from", "Transfer to",
+        "Currency", "No",
+    ]
+    # The legend row that sits directly above the header and used to be mistaken for it.
+    BANNER = ["Follow Invoice Date", "Follow Payment Date", "Cr", "Dr"]
+    # get_all_values pads every row to the width of the grid, so real rows are full width.
+    DATA_ROW = ["S5", 45901, 45931, 45931, "Misc", "Fraudulent Loss", "Compensation"] + [""] * 19
+
+    def _grid(self, header_row: int) -> list[list]:
+        """A sheet grid with balances filler, the banner, then the header on `header_row`."""
+        filler = [["Wallets", "Address", "Opening Balances"]] * (header_row - 2)
+        return filler + [self.BANNER, self.HEADER, self.DATA_ROW]
+
+    def test_finds_the_header_where_it_has_always_been(self):
+        self.assertEqual(find_s5_header_row(self._grid(19)), 19)
+
+    def test_finds_the_header_after_a_wallet_line_pushed_it_down(self):
+        self.assertEqual(find_s5_header_row(self._grid(20)), 20)
+
+    def test_finds_the_header_after_a_wallet_line_was_removed(self):
+        self.assertEqual(find_s5_header_row(self._grid(17)), 17)
+
+    def test_the_banner_above_the_header_is_not_mistaken_for_it(self):
+        self.assertFalse(row_is_s5_header(self.BANNER))
+
+    def test_header_is_matched_regardless_of_newlines_and_spacing(self):
+        spaced = ["  co ", "date", "CATEGORY", "bank", "qbo  import", "Final Amount"]
+        self.assertTrue(row_is_s5_header(spaced))
+
+    def test_a_row_missing_date_or_category_is_not_the_header(self):
+        # Exactly the failure this guards: without these two, _standardize_s5 drops
+        # every row and the run reports "DONE (Empty)" instead of an error.
+        for dropped in ("Date", "Category"):
+            with self.subTest(dropped=dropped):
+                row = [c for c in self.HEADER if c != dropped]
+                self.assertFalse(row_is_s5_header(row))
+
+    def test_no_header_anywhere_returns_none(self):
+        self.assertIsNone(find_s5_header_row([self.BANNER, self.DATA_ROW]))
+
+    def test_search_stops_after_the_scan_window(self):
+        self.assertIsNone(find_s5_header_row(self._grid(19), search_rows=5))
+
+
+class S5RawReadTests(unittest.TestCase):
+    HEADER = S5HeaderDiscoveryTests.HEADER
+    BANNER = S5HeaderDiscoveryTests.BANNER
+    DATA_ROW = S5HeaderDiscoveryTests.DATA_ROW
+
+    def _gs(self, values: list[list]) -> Mock:
+        from src.connectors.gsheets_client import GSheetsClient
+
+        gs = Mock()
+        gs.read_values.return_value = values
+        gs.df_from_values.side_effect = GSheetsClient.df_from_values
+        return gs
+
+    def test_reads_the_grid_once_and_builds_from_the_located_header(self):
+        grid = [[""] * 26] * 19 + [self.BANNER, self.HEADER, self.DATA_ROW]
+        gs = self._gs(grid)
+
+        df = read_s5_raw_df(gs, "source", "Transaction Records (NEW)", "S5")
+
+        gs.read_values.assert_called_once_with(
+            "source", "Transaction Records (NEW)", value_render_option="UNFORMATTED_VALUE"
+        )
+        self.assertEqual(list(df.columns), self.HEADER)
+        self.assertEqual(len(df), 1)
+
+    def test_missing_tab_yields_an_empty_frame_rather_than_raising(self):
+        self.assertTrue(read_s5_raw_df(self._gs([]), "source", "Gone", "S5").empty)
+
+    def test_an_unrecognisable_layout_fails_loudly(self):
+        gs = self._gs([self.BANNER, self.DATA_ROW])
+
+        with self.assertRaisesRegex(ValueError, "S5 raw header not found"):
+            read_s5_raw_df(gs, "source", "Transaction Records (NEW)", "S5")
+
+    def test_default_row_is_still_the_documented_one(self):
+        self.assertEqual(S5_DEFAULT_HEADER_ROW, 19)
 
 
 if __name__ == "__main__":

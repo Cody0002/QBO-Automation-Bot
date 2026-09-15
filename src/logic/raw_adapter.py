@@ -411,6 +411,87 @@ def _standardize_kzdw(df: pd.DataFrame) -> pd.DataFrame:
     return _coerce_standard_numeric_cols(out)
 
 
+# --- S5 header discovery -----------------------------------------------------------
+# S5 alone keeps a wallet-balance block above its transaction grid, so its header row
+# drifts by a row or two whenever an analyst adds or removes a wallet line. It sat on
+# row 19 until Sep 2026, when an inserted wallet line pushed it to row 20. Because
+# _standardize_s5 drops every row that has no Date and no Category, reading the wrong
+# row does not fail loudly -- it yields zero rows, which run_ingestion reports as
+# "DONE (Empty)" as though the tab had no data. So find the row by its content.
+#
+# Only S5 uses this. KZO / KZP / KZDW / UMBER keep their own header handling.
+
+S5_DEFAULT_HEADER_ROW = 19
+
+# The header has always been in the high teens / low twenties; scan well past that so a
+# larger edit to the balances block above it is still found.
+S5_HEADER_SEARCH_ROWS = 40
+
+# A row must carry one alias from every group to be the header. Date and Category are
+# required because _standardize_s5 filters on them -- requiring them here is what stops
+# a wrong row from silently emptying the frame. The rest mirror the `has_s5_shape` test
+# in standardize_raw_df, so a row this accepts is one that path will also recognise.
+# (has_s5_shape itself is deliberately left looser: it also classifies non-S5 clients
+# that happen to arrive in the S5 layout, and must not start demanding Date/Category.)
+S5_HEADER_ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("CO",),
+    ("Date",),
+    ("Category",),
+    ("Bank", "Bank/Crypto"),
+    ("QBO Import", "QBO Way"),
+    ("Final Amount to be take (different currency)", "Final Amount"),
+)
+
+
+def row_is_s5_header(cells: Iterable) -> bool:
+    """True when a row of raw cell values reads as the S5 transaction-grid header."""
+    names = {_norm_name(c) for c in cells if str(c).strip() != ""}
+    return all(
+        any(_norm_name(alias) in names for alias in group)
+        for group in S5_HEADER_ALIAS_GROUPS
+    )
+
+
+def find_s5_header_row(values: list[list], search_rows: int = S5_HEADER_SEARCH_ROWS) -> int | None:
+    """1-based row number of the S5 header in a raw cell grid, or None if not found."""
+    for row_number, row in enumerate(values[:search_rows], start=1):
+        if row_is_s5_header(row):
+            return row_number
+    return None
+
+
+def read_s5_raw_df(gs, source_url: str, raw_tab_name: str, client_name: str = "S5") -> pd.DataFrame:
+    """Read the S5 raw tab, locating its header row rather than assuming row 19.
+
+    Takes the sheets handle rather than living in the connector because where the S5
+    header sits is S5 domain knowledge, not a Sheets concern. The grid is fetched once
+    and the frame built from it, so finding the header costs no extra API call.
+    """
+    values = gs.read_values(source_url, raw_tab_name, value_render_option="UNFORMATTED_VALUE")
+    if not values:
+        return pd.DataFrame()
+
+    header_row = find_s5_header_row(values)
+    if header_row is None:
+        raise ValueError(
+            f"S5 raw header not found in the first {S5_HEADER_SEARCH_ROWS} rows of "
+            f"'{raw_tab_name}'. Expected one row carrying CO, Date, Category, Bank, "
+            f"QBO Import (or QBO Way) and Final Amount. Check that the transaction grid "
+            f"header is intact and no column was renamed."
+        )
+
+    if header_row != S5_DEFAULT_HEADER_ROW:
+        logger.info(
+            "   [%s] S5 source header found on row %s (was row %s); the balances block "
+            "above the grid has changed height.",
+            client_name,
+            header_row,
+            S5_DEFAULT_HEADER_ROW,
+        )
+
+    return gs.df_from_values(values, header_row)
+
+
 def _standardize_s5(
     df: pd.DataFrame,
     prefer_secondary_date: bool = False,

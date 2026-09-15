@@ -61,6 +61,36 @@ class KzpSourceHeaderTests(unittest.TestCase):
         self.assertEqual(gs.read_as_df.call_count, 2)
 
 
+class SourceHeaderRoutingTests(unittest.TestCase):
+    """S5 locates its header row; every other client keeps its fixed row."""
+
+    def test_s5_is_routed_to_the_dynamic_header_reader(self):
+        expected = pd.DataFrame(columns=["CO", "Date", "Category"])
+        gs = Mock()
+
+        with patch.object(run_ingestion, "read_s5_raw_df", return_value=expected) as reader:
+            result = run_ingestion._read_source_raw_df(gs, "source", "Records", "S5")
+
+        self.assertIs(result, expected)
+        reader.assert_called_once_with(gs, "source", "Records", "S5")
+        gs.read_as_df.assert_not_called()
+
+    def test_other_clients_keep_their_fixed_header_rows(self):
+        for client_name, header_row in (("KZDW", 5), ("UMBER", 4), ("KZO", 1)):
+            with self.subTest(client=client_name):
+                gs = Mock()
+                gs.read_as_df.return_value = pd.DataFrame()
+
+                run_ingestion._read_source_raw_df(gs, "source", "Aug 26", client_name)
+
+                gs.read_as_df.assert_called_once_with(
+                    "source",
+                    "Aug 26",
+                    header_row=header_row,
+                    value_render_option="UNFORMATTED_VALUE",
+                )
+
+
 class KzdwForcedPendingTests(unittest.TestCase):
     def test_no_coy_values_are_held_by_default(self):
         raw_df = pd.DataFrame({"COY": ["TD", " td ", "Td"]})

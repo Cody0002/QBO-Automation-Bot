@@ -19,7 +19,7 @@ from src.connectors.gsheets_client import GSheetsClient
 from src.connectors.qbo_client import QBOClient
 from src.logic.reconciler import Reconciler
 from src.utils.logger import setup_logger
-from src.logic.raw_adapter import standardize_raw_df, RAW_STANDARD_COLUMNS
+from src.logic.raw_adapter import standardize_raw_df, read_s5_raw_df, RAW_STANDARD_COLUMNS
 from src.utils.run_lock import single_instance_lock
 
 logger = setup_logger("reconciliation_runner")
@@ -238,22 +238,25 @@ def process_client_reconcile(
                 if source_url and raw_tab_name:
                     logger.info(f"   📥 [{client_name}] Fetching Raw Source for Validation...")
                     client_name_lower = str(client_name).lower()
-                    if "kzdw" in client_name_lower:
-                        source_header_row = 5
-                    elif "kzp" in client_name_lower:
-                        source_header_row = 4
-                    elif "umber" in client_name_lower:
-                        source_header_row = 4
-                    elif "s5" in client_name_lower:
-                        source_header_row = 19
+                    if "s5" in client_name_lower:
+                        # S5's header row moves with the wallet-balance block above the
+                        # grid, so it is located by content rather than fixed at row 19.
+                        raw_df = read_s5_raw_df(gs, source_url, raw_tab_name, client_name)
                     else:
-                        source_header_row = 1
-                    raw_df = gs.read_as_df(
-                        source_url,
-                        raw_tab_name,
-                        header_row=source_header_row,
-                        value_render_option='UNFORMATTED_VALUE'
-                    )
+                        if "kzdw" in client_name_lower:
+                            source_header_row = 5
+                        elif "kzp" in client_name_lower:
+                            source_header_row = 4
+                        elif "umber" in client_name_lower:
+                            source_header_row = 4
+                        else:
+                            source_header_row = 1
+                        raw_df = gs.read_as_df(
+                            source_url,
+                            raw_tab_name,
+                            header_row=source_header_row,
+                            value_render_option='UNFORMATTED_VALUE'
+                        )
                     raw_df = standardize_raw_df(raw_df, client_name=client_name, raw_month=raw_month)
                     # standardize_raw_df already returns the canonical schema, so reindex by
                     # name (as run_ingestion does) instead of renaming the first 25 columns by

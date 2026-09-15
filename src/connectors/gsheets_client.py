@@ -149,15 +149,25 @@ class GSheetsClient:
         return self.gc.open_by_key(sid)
 
     @retry_with_backoff()
-    def read_as_df(self, spreadsheet_url_or_id: str, tab_name: str, header_row: int = 1, value_render_option: str = 'FORMATTED_VALUE') -> pd.DataFrame:
+    def read_values(self, spreadsheet_url_or_id: str, tab_name: str, value_render_option: str = 'FORMATTED_VALUE') -> list[list]:
+        """Raw cell grid of a tab, as a list of rows. [] when the tab is missing.
+
+        Callers that must locate their header row by content (the S5 raw tab moves it
+        whenever a wallet line is added above the grid) read the grid once with this and
+        then build the frame with df_from_values, instead of paying for a second fetch.
+        """
         sh = self.open(spreadsheet_url_or_id)
         try:
             ws = sh.worksheet(tab_name)
         except Exception:
             print(f"⚠️ Warning: Tab '{tab_name}' not found. Returning empty DataFrame.")
-            return pd.DataFrame()
+            return []
 
-        values = ws.get_all_values(value_render_option=value_render_option)
+        return ws.get_all_values(value_render_option=value_render_option)
+
+    @staticmethod
+    def df_from_values(values: list[list], header_row: int = 1) -> pd.DataFrame:
+        """Build a DataFrame from a raw cell grid, taking `header_row` (1-based) as headers."""
         if not values: return pd.DataFrame()
 
         header_idx = header_row - 1
@@ -165,11 +175,15 @@ class GSheetsClient:
 
         header = values[header_idx]
         data = values[header_idx + 1 :]
-        
+
         df = pd.DataFrame(data, columns=header)
         df = df.replace("", pd.NA).dropna(how="all")
         return df
-    
+
+    def read_as_df(self, spreadsheet_url_or_id: str, tab_name: str, header_row: int = 1, value_render_option: str = 'FORMATTED_VALUE') -> pd.DataFrame:
+        values = self.read_values(spreadsheet_url_or_id, tab_name, value_render_option=value_render_option)
+        return self.df_from_values(values, header_row)
+
     @retry_with_backoff()
     def read_as_df_sync(self, spreadsheet_url_or_id: str, tab_name: str) -> pd.DataFrame:
         sh = self.open(spreadsheet_url_or_id)
