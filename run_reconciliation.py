@@ -243,7 +243,7 @@ def process_client_reconcile(
                         # grid, so it is located by content rather than fixed at row 19.
                         raw_df = read_s5_raw_df(gs, source_url, raw_tab_name, client_name)
                     else:
-                        if "kzdw" in client_name_lower:
+                        if settings.is_kzdw_family(client_name):
                             source_header_row = 5
                         elif "kzp" in client_name_lower:
                             source_header_row = 4

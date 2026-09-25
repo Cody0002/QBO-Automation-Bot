@@ -19,6 +19,8 @@ S5_JV_PREFIX = "S5-JV"
 S5_DOC_PREFIX = "S5"
 KZDW_JV_PREFIX = "KZDW-JV"
 KZDW_DOC_PREFIX = "KZDW"
+TDP_JV_PREFIX = "TDP-JV"
+TDP_DOC_PREFIX = "TDP"
 
 COL_NO = "No"
 COL_DATE = "Date"
@@ -197,7 +199,8 @@ def _is_kzo_case(client_name: str = "") -> bool:
 
 
 def _is_kzdw_case(client_name: str = "") -> bool:
-    return "kzdw" in str(client_name).lower()
+    # TINDERPAY shares KZDW's layout and currency rules; only its prefixes differ.
+    return settings.is_kzdw_family(client_name)
 
 def _should_check_currency_transfer_only(client_name: str = "") -> bool:
     """
@@ -398,6 +401,8 @@ def _build_id_prefixes(client_name: str = "") -> tuple[str, str]:
         return KZP_JV_PREFIX, KZP_DOC_PREFIX
     if _is_s5_case(client_name):
         return S5_JV_PREFIX, S5_DOC_PREFIX
+    if settings.is_tinderpay_workspace(client_name):
+        return TDP_JV_PREFIX, TDP_DOC_PREFIX
     if _is_kzdw_case(client_name):
         return KZDW_JV_PREFIX, KZDW_DOC_PREFIX
     return DEFAULT_JV_PREFIX, DEFAULT_DOC_PREFIX

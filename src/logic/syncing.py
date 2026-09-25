@@ -3,6 +3,7 @@ import pandas as pd
 import re
 import difflib
 from datetime import datetime
+from config import settings
 from src.utils.logger import setup_logger
 from src.connectors.qbo_client import QBOClient
 from src.logic.account_aliases import resolve_account_alias
@@ -89,7 +90,8 @@ def _infer_currency_from_text(val) -> str | None:
 
 
 def _is_kzdw_workspace(client_name: str | None) -> bool:
-    return "kzdw" in str(client_name or "").lower()
+    # TINDERPAY posts KZDW-style multicurrency transfers from its own QBO company.
+    return settings.is_kzdw_family(client_name)
 
 class QBOSync:
     def __init__(self, client: QBOClient):

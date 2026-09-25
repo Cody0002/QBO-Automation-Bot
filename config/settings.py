@@ -79,6 +79,17 @@ def is_allowed_workspace(name: str) -> bool:
     allowed = {normalize_workspace_name(x) for x in ALLOWED_QBO_WORKSPACES}
     return normalized in allowed
 
+# TINDERPAY is KZDW's COY=TD business in its own QBO company: same raw layout and
+# posting rules as KZDW, but its own document prefixes (TDP) and no TD hold.
+TINDERPAY_WORKSPACE = "TINDERPAY"
+
+def is_tinderpay_workspace(name: str) -> bool:
+    return normalize_workspace_name(name) == normalize_workspace_name(TINDERPAY_WORKSPACE)
+
+def is_kzdw_family(name: str) -> bool:
+    """KZDW (matched by substring, as the KZDW branches always were) or TINDERPAY."""
+    return "kzdw" in normalize_workspace_name(name) or is_tinderpay_workspace(name)
+
 @dataclass(frozen=True)
 class ControlRow:
     country: str

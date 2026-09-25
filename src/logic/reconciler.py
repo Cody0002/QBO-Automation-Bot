@@ -3,6 +3,7 @@ import pandas as pd
 import calendar
 import re
 import difflib
+from config import settings
 from src.connectors.qbo_client import QBOClient
 from src.logic.account_aliases import resolve_account_alias_ex
 from src.utils.logger import setup_logger
@@ -547,8 +548,9 @@ class Reconciler:
         # later shift), so we search current raw for an unclaimed row with that same
         # content instead of trying to reverse the 'No' formula.
         client_name_lower = str(client_name).strip().lower()
-        is_kzo = bool(client_name_lower) and not any(
-            x in client_name_lower for x in ("kzp", "s5", "umber", "kzdw")
+        is_kzo = bool(client_name_lower) and not (
+            any(x in client_name_lower for x in ("kzp", "s5", "umber"))
+            or settings.is_kzdw_family(client_name)
         )
         if is_kzo:
             # A shift is usually just a row or two inserted/deleted near the affected 'No',

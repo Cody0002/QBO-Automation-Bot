@@ -40,7 +40,7 @@ This repo has a Graphify knowledge graph in `graphify-out/`.
 
 For AI-assisted architecture work, refactors, or coding optimization, ask the AI to read `graphify-out/GRAPH_REPORT.md` and use `graphify-out/graph.json` or `graphify query "<question>"` before changing code.
 
-Client-specific logic differs across KZO, KZP, KZDW, S5, and UMBER. Future optimization should compare those branches in:
+Client-specific logic differs across KZO, KZP, KZDW, S5, and UMBER (TINDERPAY runs on the KZDW branches — see [TINDERPAY](#tinderpay-kzdws-td-business-in-its-own-qbo-company)). Future optimization should compare those branches in:
 
 - `run_ingestion.py`
 - `src/logic/raw_adapter.py`
@@ -444,22 +444,63 @@ to a category account.
 KZO only. UMBER has its own `Category = Transfer` handling in the standard-journal branch;
 KZP, KZDW and S5 keep the plain single-line reclass behavior.
 
-### KZDW temporary COY hold
+### KZDW COY hold
 
-`run_ingestion.py` has a manual switch for holding KZDW rows by `COY` value:
+`run_ingestion.py` has a switch for holding KZDW rows by `COY` value:
 
 ```python
-KZDW_FORCED_PENDING_COY_VALUES: set[str] = set()
+KZDW_FORCED_PENDING_COY_VALUES: set[str] = {"TD"}
 ```
 
 Any `COY` listed there (case-insensitive, whitespace-trimmed) stays in `Pending Amount Nos`
 for KZDW regardless of amount or method, and is skipped by new/late-filled/retry processing.
 Emptying the set releases those rows on the next run — they come back through the
-late-filled path and post normally.
+late-filled path and post normally. The hold applies to the `KZDW` workspace only, never to
+TINDERPAY.
 
-Status: **`COY = TD` is released and processing normally** (held from 2026-07-22, released
-2026-07-30 after its posting logic was confirmed). To hold it again, set the value back to
-`{"TD"}`.
+Status: **`COY = TD` is held in KZDW** because it posts to its own QBO company, TINDERPAY
+(below), from 2026-09-25. History: held 2026-07-22, released 2026-07-30 once its posting logic
+was confirmed, held again 2026-09-25 when TINDERPAY went live. TD rows KZDW posted before
+2026-09-25 stay in KZDW's QBO. Releasing the hold now would post TD rows in both companies.
+
+### TINDERPAY: KZDW's TD business in its own QBO company
+
+TINDERPAY (Master Sheet `Client Name` = `TINDERPAY`, QBO company "KZDW Tinderpay") reads the
+**KZDW raw layout** and follows every KZDW rule: header row 5, `_standardize_kzdw`, currency
+per row, date+currency journal grouping, multicurrency transfers with FX. The switch is
+`settings.is_kzdw_family(name)`, which every KZDW branch now calls (KZDW is still matched by
+the `kzdw` substring, as before).
+
+What differs from KZDW:
+
+| | KZDW | TINDERPAY |
+|---|---|---|
+| Journal No | `KZDW-JV0001` | `TDP-JV0001` |
+| Expense / Transfer ref | `KZDW0926E0001` / `KZDW0926T0001` | `TDP0926E0001` / `TDP0926T0001` |
+| COY=TD hold | held | posted |
+
+The QBO journal-number lookup in `run_ingestion.py` takes its prefix from the transformer's
+`_build_id_prefixes()`, so it always queries the prefix actually minted.
+
+The QBO company must be set up like KZDW's before a sync can succeed: USD home currency,
+multicurrency on, location tracking on, and the accounts and locations the raw rows name.
+Accounts are matched exactly, so a missing account fails the row with
+`ERROR | Account not found` rather than posting.
+
+#### Adding a new QBO company
+
+1. `python setup_qbo_company.py --save-master --client-name "<NAME>" --spreadsheet-id "<control sheet id>"`
+   runs the Intuit OAuth flow and writes Realm ID + Refresh Token into the Master Sheet.
+2. Add `<NAME>` to `ALLOWED_QBO_WORKSPACES` in `config/secrets.env` locally **and** on the
+   server, then restart `qbo-bot.service`. Unlisted workspaces are skipped and their QBO calls
+   refused.
+3. Give the control sheet its own Transform File. A control row copied from another client
+   carries that client's Transform File, `Last Processed Row` and `Last Journal/Expense/Transfer
+   No`; clear them. Note that a blank Transform File makes the next run create a fresh one and
+   reset `Last Processed Row` to 0, so if the new company takes over rows another company
+   already posted, create the Transform File first and set the checkpoint yourself.
+4. A new client family (a raw layout none of the existing branches reads) needs code in the
+   files listed under [AI Codebase Graph](#ai-codebase-graph).
 
 ### Monthly deployment (new month tab)
 Create a new row in Control sheet with:

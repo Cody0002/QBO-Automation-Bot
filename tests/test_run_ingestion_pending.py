@@ -76,7 +76,7 @@ class SourceHeaderRoutingTests(unittest.TestCase):
         gs.read_as_df.assert_not_called()
 
     def test_other_clients_keep_their_fixed_header_rows(self):
-        for client_name, header_row in (("KZDW", 5), ("UMBER", 4), ("KZO", 1)):
+        for client_name, header_row in (("KZDW", 5), ("TINDERPAY", 5), ("UMBER", 4), ("KZO", 1)):
             with self.subTest(client=client_name):
                 gs = Mock()
                 gs.read_as_df.return_value = pd.DataFrame()
@@ -92,13 +92,14 @@ class SourceHeaderRoutingTests(unittest.TestCase):
 
 
 class KzdwForcedPendingTests(unittest.TestCase):
-    def test_no_coy_values_are_held_by_default(self):
-        raw_df = pd.DataFrame({"COY": ["TD", " td ", "Td"]})
+    def test_only_td_is_held_by_default(self):
+        # COY=TD posts to its own QBO company (TINDERPAY), so KZDW holds it.
+        raw_df = pd.DataFrame({"COY": ["TD", " td ", "DPP"]})
 
         mask = run_ingestion._get_kzdw_forced_pending_mask(raw_df, "KZDW")
 
-        self.assertEqual(run_ingestion.KZDW_FORCED_PENDING_COY_VALUES, set())
-        self.assertEqual(mask.tolist(), [False, False, False])
+        self.assertEqual(run_ingestion.KZDW_FORCED_PENDING_COY_VALUES, {"TD"})
+        self.assertEqual(mask.tolist(), [True, True, False])
 
     def test_held_coy_values_are_matched_case_insensitively(self):
         raw_df = pd.DataFrame({"COY": ["TD", " td ", "Td", "TDD", "", None]})

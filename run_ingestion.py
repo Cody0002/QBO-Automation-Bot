@@ -22,7 +22,7 @@ from config import settings
 from src.connectors.gsheets_client import GSheetsClient
 from src.connectors.qbo_client import QBOClient
 from src.logic.syncing import QBOSync
-from src.logic.transformer import transform_raw
+from src.logic.transformer import transform_raw, _build_id_prefixes
 from src.utils.logger import setup_logger
 from src.logic.raw_adapter import standardize_raw_df, read_s5_raw_df, RAW_STANDARD_COLUMNS
 from src.utils.run_lock import single_instance_lock
@@ -30,10 +30,11 @@ from gspread.utils import rowcol_to_a1
 
 logger = setup_logger("ingestion")
 
-# Temporary KZDW hold: keep these COY values in Pending Amount Nos until their
-# posting logic is confirmed. Empty = nothing held; add a COY value (e.g. "TD")
-# to hold it again. COY=TD was released after its posting logic was confirmed.
-KZDW_FORCED_PENDING_COY_VALUES: set[str] = set()
+# KZDW hold: keep these COY values in KZDW's Pending Amount Nos instead of posting
+# them. COY=TD moved to its own QBO company (TINDERPAY) on 2026-09-25, so KZDW holds
+# it and the two companies never both post a TD row. Applies to KZDW only, never to
+# TINDERPAY. Empty = nothing held.
+KZDW_FORCED_PENDING_COY_VALUES: set[str] = {"TD"}
 
 # KZP added a blank title row in the August 2026 raw layout, moving the actual
 # field names from row 4 to row 5. Keep row 4 as a fallback for older KZP tabs.
@@ -159,7 +160,7 @@ def _read_source_raw_df(gs, source_url: str, raw_tab_name: str, client_name: str
         # located by content rather than fixed at row 19. See read_s5_raw_df.
         return read_s5_raw_df(gs, source_url, raw_tab_name, client_name)
 
-    if "kzdw" in client_name_lower:
+    if settings.is_kzdw_family(client_name):
         source_header_row = 5
     elif "umber" in client_name_lower:
         source_header_row = 4
@@ -548,7 +549,10 @@ def process_client_control_sheet(
     # KZO's raw 'No' is derived from row position (see _decode_kzo_no), so a same-date
     # insertion/deletion elsewhere in the raw tab renumbers later rows. Ensure the
     # diagnostic note column exists so stale-pending-No hints (below) have somewhere to go.
-    is_kzo_client = not any(x in client_name.lower() for x in ("kzp", "s5", "umber", "kzdw"))
+    is_kzo_client = not (
+        any(x in client_name.lower() for x in ("kzp", "s5", "umber"))
+        or settings.is_kzdw_family(client_name)
+    )
     if is_kzo_client and settings.CTRL_COL_PENDING_NOS_NOTE not in ctrl_df.columns:
         new_col_idx = len(ctrl_df.columns) + 1
         gs.update_cell(control_sheet_id, settings.CONTROL_TAB_NAME, 1, new_col_idx, settings.CTRL_COL_PENDING_NOS_NOTE)
@@ -605,18 +609,9 @@ def process_client_control_sheet(
                     f"IMPORTRANGE link needs its one-time approval in the control sheet."
                 )
             
-            # Fetch latest QBO Journal No to prevent overlap.
-            client_lower = client_name.lower()
-            if "kzp" in client_lower:
-                journal_prefix = "KZP-JV"
-            elif "s5" in client_lower:
-                journal_prefix = "S5-JV"
-            elif "umber" in client_lower:
-                journal_prefix = "UMBER-"
-            elif "kzdw" in client_lower:
-                journal_prefix = "KZDW-JV"
-            else:
-                journal_prefix = "KZO-JV"
+            # Fetch latest QBO Journal No to prevent overlap. Same prefix the transformer
+            # mints, so the lookup can never drift from the numbers actually written.
+            journal_prefix, _ = _build_id_prefixes(client_name)
             qbo_last_jv = qbo_client.get_max_journal_number(journal_prefix)
             final_start_jv = max(global_last_jv, qbo_last_jv)
             

@@ -5,6 +5,7 @@ from typing import Iterable
 
 import pandas as pd
 
+from config import settings
 from src.utils.logger import setup_logger
 
 logger = setup_logger("raw_adapter")
@@ -611,7 +612,7 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
     client_lower = str(client_name).lower()
     is_kzp_client = "kzp" in client_lower
     is_s5_client = "s5" in client_lower
-    is_kzdw_client = "kzdw" in client_lower
+    is_kzdw_client = settings.is_kzdw_family(client_name)  # KZDW or TINDERPAY
     is_umber_client = "umber" in client_lower
     is_kzo_client = "kzo" in client_lower
     # All KZO country tabs share one header set, so map them by name rather than by
